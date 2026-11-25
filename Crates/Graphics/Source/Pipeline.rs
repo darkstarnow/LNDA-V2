@@ -199,7 +199,7 @@ impl ShaderStore {
         });
         let translated = shader.translated().is_some();
         let made = (translated && compute)
-            .then(|| make::warm(vec![shader]))
+            .then(|| make::PipelineMaker::warm(vec![shader]))
             .flatten();
         (translated, made)
     }
@@ -328,7 +328,11 @@ impl BvhBuilder {
         if b.whole {
             return true;
         }
-        let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
+        let missing = b
+            .pipelines
+            .iter()
+            .filter(|p| !make::PipelineMaker::now(p))
+            .count();
         if missing > 0 {
             b.off = true;
             tracing::warn!(
@@ -422,7 +426,7 @@ impl PipelineState {
         if this.is_null() {
             return None;
         }
-        make::ready(&PipelineState::from_this(this).host)
+        make::PipelineMaker::ready(&PipelineState::from_this(this).host)
     }
 
     fn hand_out_new(
@@ -435,7 +439,7 @@ impl PipelineState {
         #[cfg(windows)]
         let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
         #[cfg(windows)]
-        make::early(&host);
+        make::PipelineMaker::early(&host);
         #[cfg(windows)]
         let builder = BvhBuilder::built_from(&shaders);
         #[cfg(windows)]
@@ -588,27 +592,27 @@ impl PipelineState {
 impl PipelineCache {
     #[cfg(windows)]
     pub(crate) fn making() -> u64 {
-        make::waiting()
+        make::PipelineMaker::waiting()
     }
 
     #[cfg(windows)]
     pub(crate) fn trim() {
-        library::trim();
+        library::PipelineLibrary::trim();
     }
 
     #[cfg(windows)]
     pub(crate) fn removal_note() -> String {
-        library::removal_note()
+        library::PipelineLibrary::removal_note()
     }
 
     #[cfg(windows)]
     pub fn use_dir(dir: std::path::PathBuf) {
-        library::use_pipeline_cache(dir);
+        library::PipelineLibrary::use_pipeline_cache(dir);
     }
 
     #[cfg(windows)]
     pub fn save() {
-        library::save(true);
+        library::PipelineLibrary::save(true);
     }
 }
 
@@ -656,7 +660,7 @@ impl PipelineDrops {
             let p = PipelineState::from_this(this);
             PipelineDrops::skipped_by(p)
                 .map(|hash| format!("skipped shader {hash}"))
-                .or_else(|| make::missing(&p.host))
+                .or_else(|| make::PipelineMaker::missing(&p.host))
         };
         if let Some(why) = why {
             PipelineDrops::note_why(why);

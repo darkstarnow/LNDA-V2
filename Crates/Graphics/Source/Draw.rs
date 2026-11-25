@@ -1400,7 +1400,7 @@ impl State {
                         }
                         continue;
                     }
-                    let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                    let tabled = srv && crate::pipeline::host::PipelineBuild::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -1508,7 +1508,7 @@ impl State {
                 s.gpu_writes(list, a, len);
             }
         };
-        if !crate::pipeline::host::bounded_root_srvs() {
+        if !crate::pipeline::host::PipelineBuild::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
                 once!("a root UAV with nothing to bind: the draw is dropped");
                 return false;

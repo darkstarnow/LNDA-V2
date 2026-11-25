@@ -17,36 +17,310 @@ pub(crate) struct Pending {
     begun: OnceLock<Instant>,
 }
 
-fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    if without_structures(shaders) {
-        Some("shades ray-tracing hits, left out")
-    } else if too_dear(shaders) {
-        Some("too dear to compile, left out")
-    } else {
-        None
+pub(crate) struct PipelineMaker;
+
+pub(crate) struct WaitBudget;
+
+impl PipelineMaker {
+    fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+        if PipelineMaker::without_structures(shaders) {
+            Some("shades ray-tracing hits, left out")
+        } else if PipelineMaker::too_dear(shaders) {
+            Some("too dear to compile, left out")
+        } else {
+            None
+        }
+    }
+
+    fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+        shaders
+            .iter()
+            .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+    }
+
+    fn too_dear(shaders: &[Arc<Shader>]) -> bool {
+        static OUT: OnceLock<bool> = OnceLock::new();
+        let out = *OUT
+            .get_or_init(|| std::env::var_os("LEONIDA_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
+        out && PipelineMaker::named(shaders, b"CS_ScreenProbes_ActivateRays")
+    }
+
+    fn without_structures(shaders: &[Arc<Shader>]) -> bool {
+        static OUT: OnceLock<bool> = OnceLock::new();
+        let out = *OUT.get_or_init(|| {
+            let builder = std::env::var_os("LEONIDA_BVH_BUILDER").is_some_and(|v| v == "1");
+            std::env::var_os("LEONIDA_RT_RESOLVE").is_some_and(|v| v == "0") && !builder
+        });
+        out && PipelineMaker::named(shaders, b"CS_RaytracingResolve")
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn missing(p: &Pending) -> Option<String> {
+        match p.made.get() {
+            Some(Some(_)) => None,
+            None => Some(
+                p.left_out
+                    .map_or_else(|| format!("being made {:?}", p.shaders), str::to_owned),
+            ),
+            Some(None) => {
+                let failed: Vec<String> = p
+                    .shaders
+                    .iter()
+                    .filter(|s| matches!(s.translated.get(), Some(None)))
+                    .map(|s| format!("{} {}", s.stage, s.hash))
+                    .collect();
+                Some(if failed.is_empty() {
+                    format!("refused {:?}", p.shaders)
+                } else {
+                    failed.join(" + ")
+                })
+            }
+        }
+    }
+
+    pub(crate) fn waiting() -> u64 {
+        WAITING.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+        if p.left_out.is_some() {
+            return None;
+        }
+        if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+            super::library::PipelineLibrary::note_used(&p.key);
+        }
+        if p.made.get().is_none() {
+            PipelineMaker::start(p, REQUESTED);
+            PipelineMaker::wait(p, crate::frame::FramePacer::frame());
+        }
+        p.made.get()?.as_ref()
+    }
+
+    pub(crate) fn now(p: &Arc<Pending>) -> bool {
+        if p.left_out.is_some() {
+            return false;
+        }
+        p.make();
+        p.made.get().is_some_and(|made| made.is_some())
+    }
+
+    pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
+        let p = Pending::new(shaders, None);
+        if p.left_out.is_some() {
+            return None;
+        }
+        Some(HostPipeline::new(&p.shaders, None).is_some())
+    }
+
+    pub(crate) fn early(p: &Arc<Pending>) {
+        if p.left_out.is_none()
+            && !p.shaders.is_empty()
+            && super::library::PipelineLibrary::wanted_early(&p.key)
+        {
+            super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+            PipelineMaker::start(p, EARLY);
+        }
+    }
+
+    fn wait(p: &Pending, frame: u64) {
+        let base = WaitBudget::base();
+        if base.is_zero() || p.slow() {
+            return;
+        }
+        static PAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        let compute = p.computes();
+        let past = &PAST[usize::from(compute)];
+        let budget = WaitBudget::for_frame(
+            base,
+            compute,
+            WaitBudget::loading(),
+            Duration::from_millis(past.load(Ordering::Relaxed)),
+        );
+        static FRAMES: [Mutex<FrameWait>; 2] = [const { Mutex::new(FrameWait::new()) }; 2];
+        let frame_wait = &FRAMES[usize::from(compute)];
+        let sharing = WaitBudget::sharing();
+        let started = Instant::now();
+        let left = frame_wait
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin(sharing, frame, budget, started);
+        if left.is_zero() {
+            return;
+        }
+        let (lock, done) = &DONE;
+        let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while p.made.get().is_none() && !p.slow() {
+            let rest = left.saturating_sub(started.elapsed());
+            if rest.is_zero() {
+                break;
+            }
+            let rest = rest.min(Duration::from_millis(250));
+            held = done
+                .wait_timeout(held, rest)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        drop(held);
+        let waited = started.elapsed().min(left);
+        past.fetch_add(
+            waited.saturating_sub(base).as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        frame_wait.lock().unwrap_or_else(|e| e.into_inner()).end(
+            sharing,
+            frame,
+            left,
+            waited,
+            Instant::now(),
+        );
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::C::add(
+            crate::copystat::C::PipelineWaitUs,
+            started.elapsed().as_micros() as u64,
+        );
+    }
+
+    fn start(p: &Arc<Pending>, priority: u8) {
+        if p.queue_state.load(Ordering::Relaxed) >= priority {
+            return;
+        }
+        if !PipelineMaker::workers() {
+            if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
+                p.make();
+            }
+            return;
+        }
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(new) = queue.push(p, priority) {
+            if new {
+                PEAK.fetch_max(
+                    WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+                    Ordering::Relaxed,
+                );
+            }
+            AVAILABLE.notify_one();
+        }
+    }
+
+    fn next() -> Arc<Pending> {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(p) = queue.pop() {
+                return p;
+            }
+            queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn workers() -> bool {
+        static RUNNING: OnceLock<bool> = OnceLock::new();
+        *RUNNING.get_or_init(|| {
+            let mut running = false;
+            let workers =
+                std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+            for i in 0..workers {
+                let spawned = std::thread::Builder::new()
+                    .name(format!("leonida-pipelines-{i}"))
+                    .spawn(|| {
+                        unsafe {
+                            use windows::Win32::System::Threading::*;
+                            let _ =
+                                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
+                        loop {
+                            PipelineMaker::next().make();
+                            if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                                PipelineMaker::drained();
+                            } else {
+                                super::library::PipelineLibrary::save(false);
+                            }
+                        }
+                    });
+                if let Err(e) = spawned {
+                    tracing::warn!(error = %e, "no pipeline worker");
+                } else {
+                    running = true;
+                }
+            }
+            running
+        })
+    }
+
+    fn drained() {
+        use super::library::{EARLY, LOADED, MADE};
+        if PEAK.swap(0, Ordering::Relaxed) >= 10 {
+            tracing::info!(
+                made = MADE.load(Ordering::Relaxed),
+                loaded = LOADED.load(Ordering::Relaxed),
+                started_early = EARLY.load(Ordering::Relaxed),
+                "host pipelines all made"
+            );
+        }
+        super::library::PipelineLibrary::save(false);
     }
 }
 
-fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
-    shaders
-        .iter()
-        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
-}
+impl WaitBudget {
+    fn base() -> Duration {
+        #[cfg(test)]
+        if let Some(budget) = TEST_BUDGET.get() {
+            return budget;
+        }
+        static BUDGET: OnceLock<Duration> = OnceLock::new();
+        *BUDGET.get_or_init(|| {
+            let millis = std::env::var("LEONIDA_PIPELINE_WAIT_MS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(DEFAULT_WAIT_MS);
+            tracing::info!(millis, "host pipeline wait budget per frame, per kind");
+            Duration::from_millis(millis)
+        })
+    }
 
-fn too_dear(shaders: &[Arc<Shader>]) -> bool {
-    static OUT: OnceLock<bool> = OnceLock::new();
-    let out =
-        *OUT.get_or_init(|| std::env::var_os("LEONIDA_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
-    out && named(shaders, b"CS_ScreenProbes_ActivateRays")
-}
+    fn loading() -> Duration {
+        static TOTAL: OnceLock<Duration> = OnceLock::new();
+        *TOTAL.get_or_init(|| {
+            let seconds = std::env::var("LEONIDA_PIPELINE_GATE_S")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(120);
+            tracing::info!(seconds, "host pipeline loading allowance per kind");
+            Duration::from_secs(seconds)
+        })
+    }
 
-fn without_structures(shaders: &[Arc<Shader>]) -> bool {
-    static OUT: OnceLock<bool> = OnceLock::new();
-    let out = *OUT.get_or_init(|| {
-        let builder = std::env::var_os("LEONIDA_BVH_BUILDER").is_some_and(|v| v == "1");
-        std::env::var_os("LEONIDA_RT_RESOLVE").is_some_and(|v| v == "0") && !builder
-    });
-    out && named(shaders, b"CS_RaytracingResolve")
+    fn for_frame(base: Duration, compute: bool, allowance: Duration, spent: Duration) -> Duration {
+        let loading = if compute {
+            LOADING_FRAME_COMPUTE
+        } else {
+            LOADING_FRAME
+        };
+        base.max(loading.min(allowance.saturating_sub(spent)))
+    }
+
+    fn held_too_long(held: Duration, compute: bool, base: Duration) -> bool {
+        let most = Duration::from_secs(if compute { 10 } else { 3 });
+        base < most && held > most
+    }
+
+    fn sharing() -> Sharing {
+        static ON: OnceLock<Sharing> = OnceLock::new();
+        *ON.get_or_init(|| {
+            WaitBudget::sharing_from(
+                std::env::var("LEONIDA_PIPELINE_WAIT_SHARED")
+                    .ok()
+                    .as_deref(),
+            )
+        })
+    }
+
+    fn sharing_from(value: Option<&str>) -> Sharing {
+        match value.map(str::trim) {
+            Some("0") => Sharing::PerThread,
+            Some("reserve") => Sharing::Reserve,
+            _ => Sharing::Window,
+        }
+    }
 }
 
 unsafe impl Send for Pending {}
@@ -66,7 +340,7 @@ impl Pending {
                 .unwrap_or_default()
                 .as_bytes(),
         );
-        let left_out = left_out(&shaders);
+        let left_out = PipelineMaker::left_out(&shaders);
         Pending {
             shaders,
             graphics,
@@ -84,9 +358,9 @@ impl Pending {
     }
 
     fn slow(&self) -> bool {
-        self.begun
-            .get()
-            .is_some_and(|at| held_too_long(at.elapsed(), self.computes(), wait_budget()))
+        self.begun.get().is_some_and(|at| {
+            WaitBudget::held_too_long(at.elapsed(), self.computes(), WaitBudget::base())
+        })
     }
 
     fn make(&self) {
@@ -99,47 +373,7 @@ impl Pending {
     }
 }
 
-#[cfg(feature = "diagnostics")]
-pub(crate) fn missing(p: &Pending) -> Option<String> {
-    match p.made.get() {
-        Some(Some(_)) => None,
-        None => Some(
-            p.left_out
-                .map_or_else(|| format!("being made {:?}", p.shaders), str::to_owned),
-        ),
-        Some(None) => {
-            let failed: Vec<String> = p
-                .shaders
-                .iter()
-                .filter(|s| matches!(s.translated.get(), Some(None)))
-                .map(|s| format!("{} {}", s.stage, s.hash))
-                .collect();
-            Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
-            } else {
-                failed.join(" + ")
-            })
-        }
-    }
-}
-
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
-
-fn wait_budget() -> Duration {
-    #[cfg(test)]
-    if let Some(budget) = TEST_BUDGET.get() {
-        return budget;
-    }
-    static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        let millis = std::env::var("LEONIDA_PIPELINE_WAIT_MS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_WAIT_MS);
-        tracing::info!(millis, "host pipeline wait budget per frame, per kind");
-        Duration::from_millis(millis)
-    })
-}
 
 const DEFAULT_WAIT_MS: u64 = 12_000;
 
@@ -155,99 +389,13 @@ thread_local! {
 const LOADING_FRAME: Duration = Duration::from_secs(4);
 const LOADING_FRAME_COMPUTE: Duration = Duration::from_secs(12);
 
-fn loading_allowance() -> Duration {
-    static TOTAL: OnceLock<Duration> = OnceLock::new();
-    *TOTAL.get_or_init(|| {
-        let seconds = std::env::var("LEONIDA_PIPELINE_GATE_S")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(120);
-        tracing::info!(seconds, "host pipeline loading allowance per kind");
-        Duration::from_secs(seconds)
-    })
-}
-
-fn frame_budget(base: Duration, compute: bool, allowance: Duration, spent: Duration) -> Duration {
-    let loading = if compute {
-        LOADING_FRAME_COMPUTE
-    } else {
-        LOADING_FRAME
-    };
-    base.max(loading.min(allowance.saturating_sub(spent)))
-}
-
-fn held_too_long(held: Duration, compute: bool, base: Duration) -> bool {
-    let most = Duration::from_secs(if compute { 10 } else { 3 });
-    base < most && held > most
-}
-
 static WAITING: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn waiting() -> u64 {
-    WAITING.load(Ordering::Relaxed)
-}
-
-pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    if p.left_out.is_some() {
-        return None;
-    }
-    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
-    }
-    if p.made.get().is_none() {
-        start(p, REQUESTED);
-        wait(p, crate::frame::FramePacer::frame());
-    }
-    p.made.get()?.as_ref()
-}
-
-pub(crate) fn now(p: &Arc<Pending>) -> bool {
-    if p.left_out.is_some() {
-        return false;
-    }
-    p.make();
-    p.made.get().is_some_and(|made| made.is_some())
-}
-
-pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
-    let p = Pending::new(shaders, None);
-    if p.left_out.is_some() {
-        return None;
-    }
-    Some(HostPipeline::new(&p.shaders, None).is_some())
-}
-
-pub(crate) fn early(p: &Arc<Pending>) {
-    if p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
-        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, EARLY);
-    }
-}
-
-fn shared_budget() -> Sharing {
-    static ON: OnceLock<Sharing> = OnceLock::new();
-    *ON.get_or_init(|| {
-        sharing_from(
-            std::env::var("LEONIDA_PIPELINE_WAIT_SHARED")
-                .ok()
-                .as_deref(),
-        )
-    })
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sharing {
     Window,
     Reserve,
     PerThread,
-}
-
-fn sharing_from(value: Option<&str>) -> Sharing {
-    match value.map(str::trim) {
-        Some("0") => Sharing::PerThread,
-        Some("reserve") => Sharing::Reserve,
-        _ => Sharing::Window,
-    }
 }
 
 #[derive(Debug)]
@@ -321,64 +469,6 @@ impl FrameWait {
     }
 }
 
-fn wait(p: &Pending, frame: u64) {
-    let base = wait_budget();
-    if base.is_zero() || p.slow() {
-        return;
-    }
-    static PAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-    let compute = p.computes();
-    let past = &PAST[usize::from(compute)];
-    let budget = frame_budget(
-        base,
-        compute,
-        loading_allowance(),
-        Duration::from_millis(past.load(Ordering::Relaxed)),
-    );
-    static FRAMES: [Mutex<FrameWait>; 2] = [const { Mutex::new(FrameWait::new()) }; 2];
-    let frame_wait = &FRAMES[usize::from(compute)];
-    let sharing = shared_budget();
-    let started = Instant::now();
-    let left = frame_wait
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .begin(sharing, frame, budget, started);
-    if left.is_zero() {
-        return;
-    }
-    let (lock, done) = &DONE;
-    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() && !p.slow() {
-        let rest = left.saturating_sub(started.elapsed());
-        if rest.is_zero() {
-            break;
-        }
-        let rest = rest.min(Duration::from_millis(250));
-        held = done
-            .wait_timeout(held, rest)
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
-    }
-    drop(held);
-    let waited = started.elapsed().min(left);
-    past.fetch_add(
-        waited.saturating_sub(base).as_millis() as u64,
-        Ordering::Relaxed,
-    );
-    frame_wait.lock().unwrap_or_else(|e| e.into_inner()).end(
-        sharing,
-        frame,
-        left,
-        waited,
-        Instant::now(),
-    );
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::C::add(
-        crate::copystat::C::PipelineWaitUs,
-        started.elapsed().as_micros() as u64,
-    );
-}
-
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
@@ -436,96 +526,16 @@ impl Queue {
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
 
-fn start(p: &Arc<Pending>, priority: u8) {
-    if p.queue_state.load(Ordering::Relaxed) >= priority {
-        return;
-    }
-    if !workers() {
-        if p.queue_state.swap(MAKING, Ordering::Relaxed) == NOT_QUEUED {
-            p.make();
-        }
-        return;
-    }
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(new) = queue.push(p, priority) {
-        if new {
-            PEAK.fetch_max(
-                WAITING.fetch_add(1, Ordering::Relaxed) + 1,
-                Ordering::Relaxed,
-            );
-        }
-        AVAILABLE.notify_one();
-    }
-}
-
-fn next() -> Arc<Pending> {
-    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    loop {
-        if let Some(p) = queue.pop() {
-            return p;
-        }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
-    }
-}
-
-fn workers() -> bool {
-    static RUNNING: OnceLock<bool> = OnceLock::new();
-    *RUNNING.get_or_init(|| {
-        let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        for i in 0..workers {
-            let spawned = std::thread::Builder::new()
-                .name(format!("leonida-pipelines-{i}"))
-                .spawn(|| {
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
-                    loop {
-                        next().make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            } else {
-                running = true;
-            }
-        }
-        running
-    })
-}
-
 static PEAK: AtomicU64 = AtomicU64::new(0);
-
-fn drained() {
-    use super::library::{EARLY, LOADED, MADE};
-    if PEAK.swap(0, Ordering::Relaxed) >= 10 {
-        tracing::info!(
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            "host pipelines all made"
-        );
-    }
-    super::library::save(false);
-}
 
 #[cfg(test)]
 mod loading_tests {
-    use super::{
-        FrameWait, LOADING_FRAME, LOADING_FRAME_COMPUTE, Sharing, frame_budget, held_too_long,
-        sharing_from,
-    };
+    use super::{FrameWait, LOADING_FRAME, LOADING_FRAME_COMPUTE, Sharing, WaitBudget};
     use std::time::{Duration, Instant};
 
     #[test]
     fn two_threads_in_one_frame_both_wait_inside_the_window() {
-        let sharing = sharing_from(None);
+        let sharing = WaitBudget::sharing_from(None);
         let (budget, t0, ms) = (
             Duration::from_secs(12),
             Instant::now(),
@@ -589,36 +599,36 @@ mod loading_tests {
             w.begin(Sharing::PerThread, 1, budget, t0),
             Duration::from_secs(9)
         );
-        assert_eq!(sharing_from(Some("0")), Sharing::PerThread);
-        assert_eq!(sharing_from(Some("reserve")), Sharing::Reserve);
+        assert_eq!(WaitBudget::sharing_from(Some("0")), Sharing::PerThread);
+        assert_eq!(WaitBudget::sharing_from(Some("reserve")), Sharing::Reserve);
     }
 
     #[test]
     fn a_frame_waits_longer_while_the_loading_allowance_lasts() {
         let (base, allowance) = (Duration::from_millis(500), Duration::from_secs(120));
         assert_eq!(
-            frame_budget(base, false, allowance, Duration::ZERO),
+            WaitBudget::for_frame(base, false, allowance, Duration::ZERO),
             LOADING_FRAME
         );
         assert_eq!(
-            frame_budget(base, true, allowance, Duration::ZERO),
+            WaitBudget::for_frame(base, true, allowance, Duration::ZERO),
             LOADING_FRAME_COMPUTE
         );
         assert_eq!(
-            frame_budget(base, true, allowance, Duration::from_secs(119)),
+            WaitBudget::for_frame(base, true, allowance, Duration::from_secs(119)),
             Duration::from_secs(1)
         );
         assert_eq!(
-            frame_budget(base, true, allowance, Duration::from_secs(130)),
+            WaitBudget::for_frame(base, true, allowance, Duration::from_secs(130)),
             base
         );
         assert_eq!(
-            frame_budget(base, false, Duration::ZERO, Duration::ZERO),
+            WaitBudget::for_frame(base, false, Duration::ZERO, Duration::ZERO),
             base,
             "LEONIDA_PIPELINE_GATE_S=0"
         );
         assert_eq!(
-            frame_budget(Duration::from_secs(20), true, allowance, Duration::ZERO),
+            WaitBudget::for_frame(Duration::from_secs(20), true, allowance, Duration::ZERO),
             Duration::from_secs(20)
         );
     }
@@ -626,16 +636,48 @@ mod loading_tests {
     #[test]
     fn a_pipeline_held_too_long_is_not_waited_for() {
         let base = Duration::from_millis(500);
-        assert!(!held_too_long(Duration::from_secs(10), true, base));
-        assert!(held_too_long(Duration::from_millis(10_001), true, base));
-        assert!(!held_too_long(Duration::from_secs(3), false, base));
-        assert!(held_too_long(Duration::from_millis(3_001), false, base));
+        assert!(!WaitBudget::held_too_long(
+            Duration::from_secs(10),
+            true,
+            base
+        ));
+        assert!(WaitBudget::held_too_long(
+            Duration::from_millis(10_001),
+            true,
+            base
+        ));
+        assert!(!WaitBudget::held_too_long(
+            Duration::from_secs(3),
+            false,
+            base
+        ));
+        assert!(WaitBudget::held_too_long(
+            Duration::from_millis(3_001),
+            false,
+            base
+        ));
         let long = Duration::from_secs(12);
-        assert!(!held_too_long(Duration::from_secs(60), true, long));
-        assert!(!held_too_long(Duration::from_secs(60), false, long));
+        assert!(!WaitBudget::held_too_long(
+            Duration::from_secs(60),
+            true,
+            long
+        ));
+        assert!(!WaitBudget::held_too_long(
+            Duration::from_secs(60),
+            false,
+            long
+        ));
         let between = Duration::from_secs(5);
-        assert!(held_too_long(Duration::from_secs(60), true, between));
-        assert!(!held_too_long(Duration::from_secs(60), false, between));
+        assert!(WaitBudget::held_too_long(
+            Duration::from_secs(60),
+            true,
+            between
+        ));
+        assert!(!WaitBudget::held_too_long(
+            Duration::from_secs(60),
+            false,
+            between
+        ));
     }
 }
 
@@ -646,7 +688,7 @@ mod tests {
     #[test]
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(Vec::new(), None));
-        assert!(ready(&p).is_none());
+        assert!(PipelineMaker::ready(&p).is_none());
         assert_ne!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         let started = Instant::now();
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
@@ -663,10 +705,12 @@ mod tests {
         let p = Arc::new(p);
         super::TEST_BUDGET.set(Some(std::time::Duration::ZERO));
 
-        assert!(!super::super::library::wanted_early(&p.key));
-        assert!(ready(&p).is_none());
+        assert!(!super::super::library::PipelineLibrary::wanted_early(
+            &p.key
+        ));
+        assert!(PipelineMaker::ready(&p).is_none());
         assert!(p.made.get().is_none());
-        assert!(super::super::library::wanted_early(&p.key));
+        assert!(super::super::library::PipelineLibrary::wanted_early(&p.key));
     }
 
     #[test]
