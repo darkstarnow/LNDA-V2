@@ -145,7 +145,7 @@ impl Fence {
     pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
         Self::advance(this, value);
         #[cfg(windows)]
-        crate::queue::release_held(false);
+        crate::queue::Scheduler::release_held(false);
         S_OK
     }
 

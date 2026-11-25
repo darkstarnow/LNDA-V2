@@ -77,7 +77,7 @@ fn heavy_listed(n: u64) -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     use std::io::Write;
-    let frame = crate::queue::presented() + 1;
+    let frame = crate::queue::Presenter::presented() + 1;
     if !listed(frame) {
         if world_on() && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX {
             static IN_FRAME: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
@@ -197,7 +197,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
 }
 
 pub(crate) fn recording_listed() -> bool {
-    folder().is_some() && listed(crate::queue::presented() + 1)
+    folder().is_some() && listed(crate::queue::Presenter::presented() + 1)
 }
 
 pub(crate) enum Records<'a> {
@@ -455,7 +455,7 @@ pub(crate) fn dump_with_input(
     };
     let frame = input
         .as_ref()
-        .map_or_else(|| crate::queue::presented() + 1, |i| i.frame);
+        .map_or_else(|| crate::queue::Presenter::presented() + 1, |i| i.frame);
     static SEEN: std::sync::Mutex<Vec<(u64, String, u32)>> = std::sync::Mutex::new(Vec::new());
     let k = nth_after(
         &mut SEEN.lock().unwrap_or_else(|e| e.into_inner()),
@@ -484,7 +484,7 @@ pub(crate) fn dump_with_input(
         if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
             continue;
         }
-        crate::list::ensure_state(
+        crate::list::CommandList::ensure_state(
             list,
             resource as crate::object::This,
             D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
@@ -718,7 +718,7 @@ fn dump_on() -> bool {
 }
 
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() || !dump_on() || !listed(crate::queue::Presenter::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());

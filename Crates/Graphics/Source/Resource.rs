@@ -2534,7 +2534,7 @@ mod tests {
         };
         let mut allocator = null;
         assert_eq!(
-            crate::list::create_allocator(null, 0, &PAGEABLE_IIDS[1], &mut allocator),
+            crate::list::CommandAllocator::create(null, 0, &PAGEABLE_IIDS[1], &mut allocator),
             S_OK
         );
         for (mips, flags) in [(1, 0), (2, 0), (1, 1)] {
@@ -2570,7 +2570,15 @@ mod tests {
             unsafe { out.write_bytes(0xcd, size) };
             let mut list = null;
             assert_eq!(
-                crate::list::create_list(null, 0, 0, allocator, null, &PAGEABLE_IIDS[1], &mut list),
+                crate::list::CommandList::create(
+                    null,
+                    0,
+                    0,
+                    allocator,
+                    null,
+                    &PAGEABLE_IIDS[1],
+                    &mut list
+                ),
                 S_OK
             );
             let footprint = PlacedFootprint {
@@ -2601,7 +2609,7 @@ mod tests {
                 slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
                 S_OK
             );
-            host.execute(&[crate::list::host_list(list).unwrap()]);
+            host.execute(&[crate::list::CommandList::host_list(list).unwrap()]);
             if expected {
                 let mapped = unsafe { std::slice::from_raw_parts(out, size) };
                 for (y, (actual, wanted)) in mapped
@@ -2768,15 +2776,20 @@ mod tests {
         let (mut queue, mut allocator, mut list) = (null, null, null);
         let queue_desc = [0u32; 4];
         assert_eq!(
-            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            crate::queue::CommandQueue::create(
+                null,
+                queue_desc.as_ptr().cast(),
+                &queue_iid,
+                &mut queue
+            ),
             S_OK
         );
         assert_eq!(
-            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            crate::list::CommandAllocator::create(null, 0, &allocator_iid, &mut allocator),
             S_OK
         );
         assert_eq!(
-            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            crate::list::CommandList::create(null, 0, 0, allocator, null, &list_iid, &mut list),
             S_OK
         );
 
@@ -3468,7 +3481,7 @@ float4 lit() : SV_Target { return 1.0; }
                 ..Default::default()
             }),
         );
-        crate::list::ensure_state(&back, depth, tested.0 as u32);
+        crate::list::CommandList::ensure_state(&back, depth, tested.0 as u32);
         unsafe {
             let l = &back.list;
             l.ClearRenderTargetView(colour, &[0.0; 4], None);
@@ -3581,7 +3594,11 @@ float4 lit() : SV_Target { return 1.0; }
                     },
                 },
             };
-            crate::list::ensure_state(&list, title, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            crate::list::CommandList::ensure_state(
+                &list,
+                title,
+                D3D12_RESOURCE_STATE_COPY_DEST.0 as u32,
+            );
             assert!(list.read_bound_input(&host.device, &texture).is_none());
             unsafe {
                 for offset in [0, 4, 256, 260] {
@@ -3590,7 +3607,7 @@ float4 lit() : SV_Target { return 1.0; }
                 list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
             }
             list.keep(&upload);
-            crate::list::ensure_state(&list, title, read_state);
+            crate::list::CommandList::ensure_state(&list, title, read_state);
             let (buffer, footprint) = list.read_bound_input(&host.device, &texture).unwrap();
             assert!(
                 list.transition(title, read_state).is_none(),
@@ -3676,7 +3693,11 @@ float4 lit() : SV_Target { return 1.0; }
             let (upload, data) = host.upload_buffer(total).unwrap();
             let pattern = unsafe { std::slice::from_raw_parts_mut(data, total as usize) };
             let list = host.new_list().unwrap();
-            crate::list::ensure_state(&list, title, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            crate::list::CommandList::ensure_state(
+                &list,
+                title,
+                D3D12_RESOURCE_STATE_COPY_DEST.0 as u32,
+            );
             for (index, footprint) in placed.iter().enumerate() {
                 let mip = index as u32 % u32::from(desc.mip_levels);
                 let slice = index as u32 / u32::from(desc.mip_levels);

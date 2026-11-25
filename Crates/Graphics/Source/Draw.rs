@@ -831,7 +831,7 @@ impl State {
         }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+            crate::list::CommandList::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
             list.twin_use(self.depth as This, false, true);
@@ -845,7 +845,7 @@ impl State {
             } else {
                 DEPTH_WRITE
             };
-            crate::list::ensure_state(list, self.depth as This, state);
+            crate::list::CommandList::ensure_state(list, self.depth as This, state);
         }
         true
     }
@@ -1812,7 +1812,7 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn trace_builder_args(&self, list: &HostList, dispatch: std::fmt::Arguments<'_>) {
         crate::pipeline::trace_builder_args(self.pipeline as This, |hash, ordinal| {
-            tracing::info!(hash, ordinal, frame = crate::queue::presented() + 1,
+            tracing::info!(hash, ordinal, frame = crate::queue::Presenter::presented() + 1,
                 list = ?std::ptr::from_ref(list), buffer_generation = crate::shadow::buffer_generation(),
                 %dispatch, roots = %self.compute_root_text(), "ray-tracing builder dispatch arguments at record attempt");
         });
@@ -1943,7 +1943,7 @@ impl State {
         }
         let stage = p.stages.first()?;
         let selector = selectors.iter().find(|s| s.hash == stage.shader.hash)?;
-        let frame = crate::queue::presented() + 1;
+        let frame = crate::queue::Presenter::presented() + 1;
         if !crate::capture::listed(frame) {
             return None;
         }
@@ -2561,7 +2561,7 @@ impl State {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
-        let listed = crate::capture::listed(crate::queue::presented() + 1);
+        let listed = crate::capture::listed(crate::queue::Presenter::presented() + 1);
         let logged = listed || TRACED.fetch_add(1, Ordering::Relaxed) < 64;
         let targets: Vec<String> = self
             .targets
@@ -3193,7 +3193,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            crate::list::CommandList::ensure_state(list, *resource as This, state);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 let d = unsafe { t.GetDesc() };
@@ -3213,7 +3213,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             crate::capture::note_written(std::ptr::from_ref(list) as usize, *resource as This);
             list.texture_written(*resource as This);
             if !list.twin_use(*resource as This, true, true) {
-                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+                crate::list::CommandList::ensure_state(list, *resource as This, UNORDERED_ACCESS);
             }
         }
         _ => {}

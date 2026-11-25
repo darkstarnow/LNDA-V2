@@ -169,7 +169,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     if !first && before.is_none() {
         return true;
     }
-    crate::list::ensure_state(list, placed, COPY_DEST);
+    crate::list::CommandList::ensure_state(list, placed, COPY_DEST);
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
         pResource: unsafe { std::mem::transmute_copy(texture) },
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -211,7 +211,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     if let Some(before) = before
         && before & TARGET_OR_UNORDERED != 0
     {
-        crate::list::ensure_state(list, source, before);
+        crate::list::CommandList::ensure_state(list, source, before);
     }
     true
 }
@@ -459,7 +459,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     const COPY_DEST: u32 = 0x400;
-    crate::list::ensure_state(list, resource, COPY_DEST);
+    crate::list::CommandList::ensure_state(list, resource, COPY_DEST);
     for (i, footprint) in staging.footprints.iter().enumerate() {
         #[cfg(feature = "diagnostics")]
         {

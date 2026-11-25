@@ -8,7 +8,7 @@ pub(crate) fn after_dispatch(list: &HostList, pipeline: &HostPipeline) {
     if !ray_probe_enabled() || pipeline.stages[0].shader.hash != RAY_PROBE_HASH {
         return;
     }
-    let frame = crate::queue::presented() + 1;
+    let frame = crate::queue::Presenter::presented() + 1;
     if !pipeline.stages[0]
         .translated()
         .host

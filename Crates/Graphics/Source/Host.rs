@@ -2024,7 +2024,7 @@ pub(crate) fn settle_for_fence() {
 fn land() {
     let landed = std::mem::take(&mut line().landed);
     for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
+        crate::list::ListPool::recycle(lists, &order);
     }
 }
 
@@ -2052,7 +2052,7 @@ fn late_helper() {
         };
         let Some(target) = target else {
             land();
-            crate::queue::release_held(false);
+            crate::queue::Scheduler::release_held(false);
             continue;
         };
         unsafe {
@@ -2068,7 +2068,7 @@ fn late_helper() {
             host.settle(&mut submitted, WHY_CARD_DONE);
         }
         land();
-        crate::queue::release_held(false);
+        crate::queue::Scheduler::release_held(false);
     }
 }
 
@@ -3578,7 +3578,7 @@ impl Host {
 
     pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, mut order: Vec<usize>) {
         if order.is_empty() {
-            crate::list::recycle(lists, &order);
+            crate::list::ListPool::recycle(lists, &order);
             return;
         }
         late_threads();
@@ -3587,7 +3587,7 @@ impl Host {
             self.submit(&runs, true)
         };
         let Some((mut submitted, sent, already_run)) = sent else {
-            crate::list::recycle(lists, &order);
+            crate::list::ListPool::recycle(lists, &order);
             return;
         };
         order.drain(..already_run);
@@ -5857,7 +5857,7 @@ impl Meter {
         let [back_ms, back_mb] =
             [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
-        let indirect = crate::list::take_indirect() as f64 / frames;
+        let indirect = crate::list::WorkCounters::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
