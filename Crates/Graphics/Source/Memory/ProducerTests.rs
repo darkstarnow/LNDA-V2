@@ -73,14 +73,14 @@ fn a_raw_gpu_write_follows_the_recorded_owner_of_a_reused_page() {
         list.close();
         list
     };
-    crate::shadow::register(old_owner, page, PAGE);
-    let retired = crate::shadow::find(field, 1).unwrap();
+    crate::shadow::ShadowRegistry::register(old_owner, page, PAGE);
+    let retired = crate::shadow::ShadowRegistry::find(field, 1).unwrap();
     let first = record(&mut memory, cpu_pointer);
     memory.copies.resize(1023, retired.clone());
     memory.ranges.resize_with(1023, Vec::new);
-    crate::shadow::unregister(old_owner, page);
-    crate::shadow::register(new_owner, page, PAGE);
-    let current = crate::shadow::find(field, 1).unwrap();
+    crate::shadow::ShadowRegistry::unregister(old_owner, page);
+    crate::shadow::ShadowRegistry::register(new_owner, page, PAGE);
+    let current = crate::shadow::ShadowRegistry::find(field, 1).unwrap();
     assert_ne!(retired.id(), current.id());
     let bvh_word = 0x1220_1260;
     let second = record(&mut memory, bvh_word);
@@ -118,7 +118,7 @@ fn a_raw_gpu_write_follows_the_recorded_owner_of_a_reused_page() {
         words
     };
     let cpu_word = unsafe { (field as *const u32).read() };
-    crate::shadow::unregister(new_owner, page);
+    crate::shadow::ShadowRegistry::unregister(new_owner, page);
     assert_ne!(unsafe { VirtualFree(page as _, 0, MEM_RELEASE) }, 0);
     assert_eq!(
         cpu_word, cpu_pointer,

@@ -149,9 +149,9 @@ impl Memory {
             return None;
         }
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
-        let shadow = crate::shadow::find(start, 1)
+        let shadow = crate::shadow::ShadowRegistry::find(start, 1)
             .filter(whole)
-            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))?;
+            .or_else(|| crate::shadow::ShadowRegistry::find(start, PAGE).filter(whole))?;
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return None;
@@ -531,14 +531,14 @@ mod tests {
         let slot = |m: &Memory, at| unsafe { m.directory.1.add((at / PAGE * 2) as usize).read() };
         for i in 0..SPECULATIVE_COPIES as u64 - 1 {
             let at = start + i * PAGE;
-            crate::shadow::register(at as usize, at, PAGE);
+            crate::shadow::ShadowRegistry::register(at as usize, at, PAGE);
             assert!(memory.map(at));
         }
         let last = start + (SPECULATIVE_COPIES as u64 - 1) * PAGE;
-        crate::shadow::register(last as usize, last, 3 * PAGE);
+        crate::shadow::ShadowRegistry::register(last as usize, last, 3 * PAGE);
         for i in [1, 3, 4, 5] {
             let at = last + i * PAGE;
-            crate::shadow::register(at as usize, at, PAGE);
+            crate::shadow::ShadowRegistry::register(at as usize, at, PAGE);
         }
         memory.name_constant(last);
         assert_eq!(memory.copies.len(), SPECULATIVE_COPIES);
@@ -635,7 +635,7 @@ mod tests {
         drop(heap);
         for i in 0..pages {
             let at = start + i * PAGE;
-            crate::shadow::unregister(at as usize, at);
+            crate::shadow::ShadowRegistry::unregister(at as usize, at);
         }
         assert_ne!(unsafe { VirtualFree(start as _, 0, MEM_RELEASE) }, 0);
     }
@@ -691,7 +691,7 @@ mod tests {
                 unsafe { VirtualAlloc(at as _, PAGE as usize, MEM_COMMIT, PAGE_READWRITE) } as u64,
                 at
             );
-            crate::shadow::register(at as usize, at, PAGE);
+            crate::shadow::ShadowRegistry::register(at as usize, at, PAGE);
         }
         let directory_slot =
             |m: &Memory, at| unsafe { m.directory.1.add((at / PAGE * 2) as usize).read() };
@@ -755,7 +755,7 @@ mod tests {
         assert_eq!(memory.from_constants, 3);
         drop(memory);
         for at in [start, start + CELL, start + 2 * CELL] {
-            crate::shadow::unregister(at as usize, at);
+            crate::shadow::ShadowRegistry::unregister(at as usize, at);
         }
         assert_ne!(unsafe { VirtualFree(start as _, 0, MEM_RELEASE) }, 0);
     }

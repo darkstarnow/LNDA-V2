@@ -36,26 +36,1091 @@ struct Card {
     size: u64,
 }
 
-pub(crate) fn cards() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_CARD_BUFFERS").is_none_or(|v| v != "0"))
-}
+pub(crate) struct ShadowCards;
 
-fn card_limits() -> (u64, u64) {
-    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-    *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name)
+pub(crate) struct ShadowRelay;
+
+pub(crate) struct ByteDiff;
+
+pub(crate) struct WideCopy;
+
+pub(crate) struct ShadowMemory;
+
+pub(crate) struct ShadowRegistry;
+
+impl ShadowCards {
+    pub(crate) fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_CARD_BUFFERS").is_none_or(|v| v != "0"))
+    }
+
+    fn limits() -> (u64, u64) {
+        static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        *LIMITS.get_or_init(|| {
+            let mb = |name: &str, default: u64| {
+                std::env::var(name)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(default)
+                    << 20
+            };
+            (
+                mb("LEONIDA_CARD_BUFFERS_MIN_MB", 1).max(1 << 20),
+                mb("LEONIDA_CARD_BUFFERS_MB", 1024),
+            )
+        })
+    }
+
+    pub(crate) fn stats() -> [u64; 10] {
+        let mut out = [0u64; 10];
+        for (i, stat) in CARD_STATS.iter().enumerate() {
+            out[i] = stat.swap(0, Ordering::Relaxed);
+        }
+        out[7] = CARDED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|w| w.strong_count() > 0)
+            .count() as u64;
+        out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
+        out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
+        out
+    }
+
+    pub(crate) fn hash_bytes(size: u64) -> u64 {
+        (size / PIECE as u64 + 2) * 64 * 16
+    }
+
+    fn for_size(size: u64) -> Option<ID3D12Resource> {
+        if !ShadowCards::enabled() {
+            return None;
+        }
+        let (least, most) = ShadowCards::limits();
+        if size < least || size >= 1 << 30 {
+            return None;
+        }
+        let host = host()?;
+        if !host.card_ready() {
+            return None;
+        }
+        if let Some([budget, used, ..]) = host.video_memory()
+            && used + size > budget / 10 * 8
+        {
+            return None;
+        }
+        if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+            return None;
+        }
+        let buffer = host.uav_buffer(size);
+        if buffer.is_none() {
+            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        }
+        buffer
+    }
+
+    fn window_most() -> u64 {
+        static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *MOST.get_or_init(|| {
+            std::env::var("LEONIDA_CARD_WINDOWS_MB")
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(default)
+                .unwrap_or(0)
                 << 20
+        })
+    }
+
+    fn window_for(size: u64) -> Option<ID3D12Resource> {
+        let most = ShadowCards::window_most();
+        if most == 0 || !ShadowCards::enabled() {
+            return None;
+        }
+        let host = host()?;
+        if !host.card_ready() {
+            return None;
+        }
+        if let Some([budget, used, ..]) = host.video_memory()
+            && used + size > budget / 10 * 8
+        {
+            return None;
+        }
+        if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
+            WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            return None;
+        }
+        let buffer = host.uav_buffer(size);
+        if buffer.is_none() {
+            WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        }
+        buffer
+    }
+
+    pub(crate) fn dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+        let mut out = Vec::new();
+        let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+        carded.retain(|weak| {
+            let Some(shadow) = weak.upgrade() else {
+                return false;
+            };
+            let ranges = shadow
+                .card
+                .as_ref()
+                .map(|c| {
+                    let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+                    let ranges = std::mem::take(&mut *dirty);
+                    if ShadowRelay::enabled() {
+                        let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+                        sent.retain(|s| s.2 > fetched);
+                        sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+                    }
+                    ranges
+                })
+                .unwrap_or_default();
+            if !ranges.is_empty() {
+                out.push((shadow, ShadowCards::joined(ranges)));
+            }
+            true
+        });
+        out
+    }
+
+    fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+        ranges.sort_unstable();
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (from, to) in ranges {
+            match out.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => out.push((from, to)),
+            }
+        }
+        out
+    }
+
+    pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
+        runs.sort_unstable_by_key(|r| r.first);
+        let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
+        for run in runs {
+            match out.last_mut() {
+                Some(last) if run.first <= last.first + last.pieces => {
+                    last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+                    last.to = last.to.max(run.to);
+                }
+                _ => out.push(run),
+            }
+        }
+        out
+    }
+
+    fn span_of(start: usize, from: usize, to: usize) -> CardSpan {
+        let pieces = ShadowMemory::pieces_of(start, from, to);
+        CardSpan {
+            from: from as u32,
+            to: to as u32,
+            first: pieces.start as u32,
+            pieces: pieces.len() as u32,
+            skew: (start % PIECE) as u32,
+        }
+    }
+}
+
+impl ShadowRelay {
+    pub(crate) fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("LEONIDA_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2")
+                && !ShadowMemory::keeps()
+        })
+    }
+
+    pub(crate) fn preparing(number: u64) {
+        PREPARED.store(number, Ordering::Relaxed);
+    }
+
+    pub(crate) fn relay_fetched(number: u64) {
+        RELAY_FETCHED.fetch_max(number, Ordering::AcqRel);
+    }
+
+    fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+        let mut differs = 0u8;
+        for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+            let wrote = if *n != *h { 0xffu8 } else { 0 };
+            let merged = (*t & !wrote) | (*n & wrote);
+            differs |= merged ^ *t;
+            *t = merged;
+            *h = (*h & !wrote) | (*n & wrote);
+        }
+        differs != 0
+    }
+
+    fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+        skip.sort_unstable();
+        let mut out = Vec::new();
+        let mut at = from;
+        for (a, b) in skip {
+            if b <= at {
+                continue;
+            }
+            if a >= to {
+                break;
+            }
+            if a > at {
+                out.push((at, a));
+            }
+            at = at.max(b);
+        }
+        if at < to {
+            out.push((at, to));
+        }
+        out
+    }
+}
+
+impl SnapshotPool {
+    fn lend(n: usize) -> Vec<u8> {
+        let reused = POOL.lock().unwrap_or_else(|e| e.into_inner()).take(n);
+        reused.unwrap_or_else(|| Vec::with_capacity(n))
+    }
+
+    fn give_back(v: Vec<u8>) {
+        POOL.lock().unwrap_or_else(|e| e.into_inner()).put(v);
+    }
+}
+
+impl ByteDiff {
+    fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+        let whole = a.len().min(b.len()) / 8 * 8;
+        let from = a[..whole]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(b[..whole].chunks_exact(8))
+            .position(|(x, y)| x != y)
+            .map_or(whole, |word| word * 8);
+        a[from..]
+            .iter()
+            .zip(&b[from..])
+            .position(|(x, y)| x != y)
+            .map(|i| from + i)
+    }
+
+    fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+        let whole = a.len().min(b.len()) / 8 * 8;
+        if let Some(i) = a[whole..]
+            .iter()
+            .zip(&b[whole..])
+            .rposition(|(x, y)| x != y)
+        {
+            return Some(whole + i);
+        }
+        let word = a[..whole]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(b[..whole].chunks_exact(8))
+            .rposition(|(x, y)| x != y)?
+            * 8;
+        a[word..word + 8]
+            .iter()
+            .zip(&b[word..word + 8])
+            .rposition(|(x, y)| x != y)
+            .map(|i| word + i)
+    }
+
+    pub(crate) fn merged_stats() -> [u64; 3] {
+        [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
+    }
+
+    fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+        let n = now.len().min(was.len());
+        let mut runs = Vec::new();
+        let mut i = 0;
+        while i < n {
+            while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
+                i += 8;
+            }
+            while i < n && now[i] == was[i] {
+                i += 1;
+            }
+            if i >= n {
+                break;
+            }
+            let first = i;
+            while i < n && now[i] != was[i] {
+                i += 1;
+            }
+            runs.push((first, i - first));
+        }
+        runs
+    }
+}
+
+impl WideCopy {
+    unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
+        const PER_THREAD: usize = 16 << 20;
+        let threads = (len / PER_THREAD).clamp(1, 6);
+        if threads == 1 {
+            unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+            return;
+        }
+        let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
+        std::thread::scope(|s| {
+            for i in 0..threads {
+                let at = (i * each).min(len);
+                let n = each.min(len - at);
+                s.spawn(move || {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (src + at) as *const u8,
+                            (dst + at) as *mut u8,
+                            n,
+                        )
+                    };
+                });
+            }
+        });
+    }
+
+    pub(crate) fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_WIDE_BACK").is_none_or(|v| v != "0"))
+    }
+
+    fn pool() -> &'static Workers {
+        static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        let workers = WORKERS.get_or_init(|| Workers {
+            jobs: Mutex::new(std::collections::VecDeque::new()),
+            more: std::sync::Condvar::new(),
+        });
+        STARTED.call_once(|| {
+            let n = std::thread::available_parallelism()
+                .map_or(4, |n| n.get() / 4)
+                .clamp(2, 6);
+            for i in 0..n {
+                let _ = std::thread::Builder::new()
+                    .name(format!("leonida-wide-{i}"))
+                    .spawn(move || {
+                        let workers = WORKERS.get().expect("made above");
+                        loop {
+                            let job = {
+                                let mut jobs =
+                                    workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                                loop {
+                                    if let Some(job) = jobs.pop_front() {
+                                        break job;
+                                    }
+                                    jobs =
+                                        workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                                }
+                            };
+                            job();
+                        }
+                    });
+            }
+        });
+        workers
+    }
+
+    fn run_jobs(jobs: Vec<Job>) {
+        if jobs.len() < 2 {
+            for job in jobs {
+                job();
+            }
+            return;
+        }
+        let workers = WideCopy::pool();
+        let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+        {
+            let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            for job in jobs {
+                let left = left.clone();
+                queue.push_back(Box::new(move || {
+                    job();
+                    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+                    *n -= 1;
+                    if *n == 0 {
+                        left.1.notify_all();
+                    }
+                }));
+            }
+        }
+        workers.more.notify_all();
+        loop {
+            let job = workers
+                .jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front();
+            match job {
+                Some(job) => job(),
+                None => break,
+            }
+        }
+        let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+        while *n > 0 {
+            n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    pub(crate) fn run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
+        WideCopy::run_jobs(jobs);
+    }
+
+    pub(crate) fn take_snapshots() {
+        let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
+        if snaps.is_empty() {
+            return;
+        }
+        WideCopy::run_jobs(WideCopy::copy_jobs(snaps));
+    }
+
+    fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut group: Vec<(usize, usize, usize)> = Vec::new();
+        let mut bytes = 0;
+        let flush = |group: &mut Vec<(usize, usize, usize)>, jobs: &mut Vec<Job>| {
+            let group = std::mem::take(group);
+            if !group.is_empty() {
+                jobs.push(Box::new(move || {
+                    for (src, dst, len) in group {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len)
+                        };
+                    }
+                }));
+            }
         };
-        (
-            mb("LEONIDA_CARD_BUFFERS_MIN_MB", 1).max(1 << 20),
-            mb("LEONIDA_CARD_BUFFERS_MB", 1024),
-        )
-    })
+        for (src, dst, len) in copies {
+            let mut at = 0;
+            while at < len {
+                let n = (WIDE_JOB - bytes).min(len - at);
+                group.push((src + at, dst + at, n));
+                at += n;
+                bytes += n;
+                if bytes >= WIDE_JOB {
+                    flush(&mut group, &mut jobs);
+                    bytes = 0;
+                }
+            }
+        }
+        flush(&mut group, &mut jobs);
+        jobs
+    }
+
+    pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+        let scans = work
+            .iter()
+            .map(|(shadow, address, end)| {
+                let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
+                match shadow
+                    .before
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                {
+                    Some(before) => (
+                        shadow.data as usize,
+                        before.as_ptr() as usize,
+                        shadow.start as usize,
+                        from,
+                        to,
+                    ),
+                    None => (0, 0, 0, 0, 0),
+                }
+            })
+            .collect();
+        WideCopy::find_pieces(scans)
+    }
+
+    fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
+        type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
+        type Part = (usize, usize, usize, usize, usize, usize, usize);
+        let found: Arc<Mutex<Found>> = Arc::default();
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut group: Vec<Part> = Vec::new();
+        let mut bytes = 0;
+        let flush = |group: &mut Vec<Part>, jobs: &mut Vec<Job>| {
+            let group = std::mem::take(group);
+            if group.is_empty() {
+                return;
+            }
+            let found = found.clone();
+            jobs.push(Box::new(move || {
+                let mut mine: Found = Vec::with_capacity(group.len());
+                for (data, before, start, from, to, which, place) in group {
+                    let mut pieces = Vec::new();
+                    let mut at = from;
+                    while at < to {
+                        let n = (PIECE - (start + at) % PIECE).min(to - at);
+                        let (now, old) = unsafe {
+                            (
+                                std::slice::from_raw_parts((data + at) as *const u8, n),
+                                std::slice::from_raw_parts((before + at) as *const u8, n),
+                            )
+                        };
+                        if now != old {
+                            pieces.push((at, n));
+                        }
+                        at += n;
+                    }
+                    mine.push((which, place, pieces));
+                }
+                found.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
+            }));
+        };
+        let count = scans.len();
+        for (which, (data, before, start, from, to)) in scans.into_iter().enumerate() {
+            let (mut at, mut place) = (from, 0);
+            while at < to {
+                let room = (WIDE_JOB - bytes).max(PIECE);
+                let mut next = (at + room).min(to);
+                if next < to {
+                    next -= (start + next) % PIECE;
+                    if next <= at {
+                        next = (at + PIECE - (start + at) % PIECE).min(to);
+                    }
+                }
+                group.push((data, before, start, at, next, which, place));
+                bytes += next - at;
+                place += 1;
+                at = next;
+                if bytes >= WIDE_JOB {
+                    flush(&mut group, &mut jobs);
+                    bytes = 0;
+                }
+            }
+        }
+        flush(&mut group, &mut jobs);
+        WideCopy::run_jobs(jobs);
+        let mut found = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
+        found.sort_unstable_by_key(|f| (f.0, f.1));
+        let mut out = vec![Vec::new(); count];
+        for (which, _, pieces) in found {
+            out[which].extend(pieces);
+        }
+        out
+    }
+
+    pub(crate) fn back_line(frames: f64) {
+        let c: Vec<f64> = BACK_CLASS
+            .iter()
+            .map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames)
+            .collect();
+        if c.iter().all(|&v| v == 0.0) {
+            return;
+        }
+        let mb = |v: f64| v / (1 << 20) as f64;
+        tracing::info!(
+            "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside ShadowRegistry::lock ({:.1} MB \
+             snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
+             of 1 MiB or more (LEONIDA_CARD_BUFFERS_MIN_MB=1 would have the card look there)",
+            mb(c[2]),
+            c[5],
+            mb(c[0]),
+            mb(c[3]),
+            c[6],
+            mb(c[1]),
+            mb(c[4]),
+        );
+    }
+}
+
+impl ShadowMemory {
+    fn keeps() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_KEEP_SNAPSHOTS").is_some_and(|v| v == "1"))
+    }
+
+    fn kept_most() -> u64 {
+        static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *MOST.get_or_init(|| {
+            std::env::var("LEONIDA_KEEP_SNAPSHOTS_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(256)
+                << 20
+        })
+    }
+
+    fn pieces_of(start: usize, from: usize, to: usize) -> std::ops::Range<usize> {
+        let first = start / PIECE;
+        (start + from) / PIECE - first..(start + to - 1) / PIECE - first + 1
+    }
+
+    fn piece_at(start: usize, len: usize, piece: usize) -> (usize, usize) {
+        let first = start / PIECE;
+        let lo = ((first + piece) * PIECE).saturating_sub(start);
+        let hi = ((first + piece + 1) * PIECE - start).min(len);
+        (lo, hi)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn window_counts() -> [u64; 3] {
+        let asked: u64 = {
+            let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            loose
+                .values()
+                .map(|s| {
+                    let low = s.asked[0].load(Ordering::Relaxed);
+                    let high = s.asked[1].load(Ordering::Relaxed);
+                    high.saturating_sub(low)
+                })
+                .sum()
+        };
+        [
+            LET_GO[0].load(Ordering::Relaxed),
+            LET_GO[1].load(Ordering::Relaxed),
+            asked,
+        ]
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn window_use() -> [u64; 8] {
+        let mut out = [0u64; 8];
+        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        for s in loose.values() {
+            let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+            out[0] += (pages * PAGE as u64).min(s.len);
+            if crate::host::references(&s.buffer) > 1 {
+                out[1] += 1;
+                out[2] += s.len;
+            }
+            if Arc::strong_count(s) > 1 {
+                out[3] += 1;
+                out[4] += s.len;
+            }
+            if s.unsized_asks.load(Ordering::Relaxed) > 0 {
+                out[5] += 1;
+                out[6] += s.len;
+            }
+        }
+        out[7] = ShadowRegistry::window();
+        out
+    }
+
+    pub(crate) fn let_go_idle() {
+        const IDLE_FRAMES: u64 = 4;
+        let gone: Vec<Arc<Shadow>> = {
+            let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            if map.is_empty() {
+                return;
+            }
+            let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+            let idle: Vec<(u64, u64)> = map
+                .iter()
+                .filter(|(_, s)| {
+                    Arc::strong_count(s) == 1
+                        && crate::host::long_ago(
+                            s.used.load(Ordering::Relaxed),
+                            idle_ms,
+                            IDLE_FRAMES,
+                        )
+                        && crate::host::references(&s.buffer) == 1
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            idle.into_iter()
+                .filter_map(|key| map.remove(&key))
+                .collect()
+        };
+        if !gone.is_empty() {
+            let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
+            crate::host::trail(|| {
+                format!(
+                    "sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot",
+                    bytes >> 10
+                )
+            });
+        }
+        for shadow in gone {
+            LET_GO[0].fetch_add(1, Ordering::Relaxed);
+            LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
+            crate::host::retire(shadow);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn memory() -> [u64; 6] {
+        let (windows, window_bytes) = {
+            let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut seen = std::collections::HashSet::new();
+            let bytes: u64 = loose
+                .values()
+                .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
+                .map(|s| s.len)
+                .sum();
+            (seen.len() as u64, bytes)
+        };
+        let (kept, kept_bytes) = {
+            let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            (pool.count as u64, pool.bytes as u64)
+        };
+        [
+            LIVE[0].load(Ordering::Relaxed),
+            LIVE[1].load(Ordering::Relaxed),
+            windows,
+            window_bytes,
+            kept,
+            kept_bytes,
+        ]
+    }
+}
+
+impl ShadowRegistry {
+    pub(crate) fn generation() -> u64 {
+        BUFFER_GENERATION.load(Ordering::Acquire)
+    }
+
+    fn lock() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
+        BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn register(resource: usize, start: u64, len: u64) {
+        let old = ShadowRegistry::lock().insert(
+            (start, resource),
+            Entry {
+                end: start + len,
+                shadow: None,
+            },
+        );
+        crate::memory::ownership_changed(start, old.map_or(len, |e| len.max(e.end - start)));
+        BUFFER_GENERATION.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn unregister(resource: usize, start: u64) {
+        if let Some(old) = ShadowRegistry::lock().remove(&(start, resource)) {
+            crate::memory::ownership_changed(start, old.end - start);
+            BUFFER_GENERATION.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
+        ShadowRegistry::lock()
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end > address)
+            .map(|(k, e)| (k.0, e.end - k.0))
+    }
+
+    pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
+        let end = at.saturating_add(len);
+        let mut gone: Vec<Arc<Shadow>> = Vec::new();
+        {
+            let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            let keys: Vec<(u64, u64)> = map
+                .range((at.saturating_sub(WINDOW), 0)..(end, 0))
+                .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
+                .map(|(key, _)| *key)
+                .collect();
+            gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        }
+        {
+            let mut map = ShadowRegistry::lock();
+            for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+                if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+                    gone.extend(entry.shadow.take());
+                }
+            }
+        }
+        let n = gone.len() as u64;
+        if n != 0 {
+            crate::memory::ownership_changed(at, len);
+            BUFFER_GENERATION.fetch_add(1, Ordering::Release);
+        }
+        for shadow in gone {
+            crate::host::retire(shadow);
+        }
+        n
+    }
+
+    pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
+        let mut spans: Vec<(u64, u64, bool)> = ShadowRegistry::lock()
+            .iter()
+            .map(|(key, entry)| (key.0, entry.end - key.0, false))
+            .collect();
+        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
+        spans
+    }
+
+    pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+        ShadowRegistry::lookup(address, len, false)
+    }
+
+    pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
+        if !ShadowRegistry::fine() {
+            return ShadowRegistry::find(address, len);
+        }
+        ShadowRegistry::lookup(address, len, true)
+    }
+
+    fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+        let end = address.checked_add(len.max(1))?;
+        let mut map = ShadowRegistry::lock();
+        let key = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+            .map(|(k, _)| *k);
+        let Some(key) = key else {
+            drop(map);
+            return ShadowRegistry::loose(address, end, len <= 1, any);
+        };
+        let entry = map.get_mut(&key)?;
+        if entry.shadow.is_none() {
+            let len = entry.end - key.0;
+            let size = len.next_multiple_of(1 << 16);
+            let big = ShadowCards::enabled() && size >= ShadowCards::limits().0;
+            if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+                entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+                return entry.shadow.clone();
+            }
+            let (buffer, data) = host()?.shared_buffer(size)?;
+            crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+            let (buffer, card) = match ShadowCards::for_size(size) {
+                Some(on_card) => {
+                    crate::host::name(&on_card, || {
+                        format!("title buffer {:#x}+{len:#x} on the card", key.0)
+                    });
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                    let card = Card {
+                        staging: buffer,
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        sent: Mutex::default(),
+                        size,
+                    };
+                    (on_card, Some(card))
+                }
+                None => (buffer, None),
+            };
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            if len >= 16 << 20 {
+                tracing::info!(
+                    start = format_args!("{:#x}", key.0),
+                    len,
+                    "large buffer copied to the host"
+                );
+            } else {
+                tracing::debug!(
+                    start = format_args!("{:#x}", key.0),
+                    len,
+                    "buffer copied to the host"
+                );
+            }
+            let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+            shadow.card = card;
+            let shadow = Arc::new(shadow);
+            if shadow.card.is_some() {
+                CARDED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(Arc::downgrade(&shadow));
+            }
+            entry.shadow = Some(shadow);
+        }
+        entry.shadow.clone()
+    }
+
+    fn window() -> u64 {
+        static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        *GRID.get_or_init(|| {
+            let kb = std::env::var("LEONIDA_WINDOW_KB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            ShadowRegistry::grid(kb)
+        })
+    }
+
+    fn grid(kb: Option<u64>) -> u64 {
+        match kb {
+            Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
+            _ => WINDOW,
+        }
+    }
+
+    fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
+        let start = address & !(grid - 1);
+        (start, end.next_multiple_of(grid) - start)
+    }
+
+    fn tails() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    }
+
+    fn tail_of(address: u64, end: u64) -> (u64, u64) {
+        let (cell, len) = ShadowRegistry::window_of(address, end, WINDOW);
+        let start = address & !(TAIL_STEP - 1);
+        (start, cell + len - start)
+    }
+
+    fn holder(
+        windows: impl Iterator<Item = (u64, u64)>,
+        address: u64,
+        end: u64,
+    ) -> Option<(u64, u64)> {
+        windows
+            .filter(|&(start, bytes)| start <= address && start + bytes >= end)
+            .max_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
+    }
+
+    fn fine() -> bool {
+        ShadowRegistry::tails() || ShadowRegistry::window() < WINDOW
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn window_cover() -> u64 {
+        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        ShadowRegistry::cover(loose.keys().copied())
+    }
+
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+    fn cover(windows: impl Iterator<Item = (u64, u64)>) -> u64 {
+        let (mut covered, mut reached) = (0, 0);
+        for (start, bytes) in windows {
+            let end = start + bytes;
+            if end > reached {
+                covered += end - start.max(reached);
+                reached = end;
+            }
+        }
+        covered
+    }
+
+    fn longest_tail(
+        windows: impl Iterator<Item = (u64, u64)>,
+        address: u64,
+        end: u64,
+    ) -> Option<(u64, u64)> {
+        let (cell, len) = ShadowRegistry::window_of(address, end, WINDOW);
+        let step = address & !(TAIL_STEP - 1);
+        windows
+            .filter(|&(start, bytes)| start >= cell && start <= step && start + bytes == cell + len)
+            .min()
+    }
+
+    fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let (cell, _) = ShadowRegistry::window_of(address, end, WINDOW);
+        let named = ShadowRegistry::window_of(
+            address,
+            end,
+            if unsized_ask {
+                WINDOW
+            } else {
+                ShadowRegistry::window()
+            },
+        );
+        let (start, len) = if unsized_ask && ShadowRegistry::tails() {
+            let there = map
+                .range((cell, 0)..=(address, u64::MAX))
+                .map(|(key, _)| *key);
+            ShadowRegistry::longest_tail(there, address, end)
+                .unwrap_or_else(|| ShadowRegistry::tail_of(address, end))
+        } else if any && ShadowRegistry::fine() && !unsized_ask {
+            let there = map
+                .range((cell, 0)..=(address, u64::MAX))
+                .map(|(key, _)| *key);
+            ShadowRegistry::holder(there, address, end).unwrap_or(named)
+        } else {
+            named
+        };
+        let note = |shadow: &Shadow| {
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+            if unsized_ask {
+                shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        if let Some(shadow) = map.get(&(start, len)) {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        if let Some(placed) = crate::inplace::place_for(start, len, true) {
+            let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+            note(&shadow);
+            map.insert((start, len), shadow.clone());
+            return Some(shadow);
+        }
+        let (buffer, data) = host()?.shared_buffer(len)?;
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+        let (buffer, card) = match ShadowCards::window_for(len) {
+            Some(on_card) => {
+                crate::host::name(&on_card, || {
+                    format!("title memory {start:#x}+{len:#x} on the card")
+                });
+                let card = Card {
+                    staging: buffer,
+                    before: Mutex::default(),
+                    dirty: Mutex::default(),
+                    sent: Mutex::default(),
+                    size: len,
+                };
+                (on_card, Some(card))
+            }
+            None => (buffer, None),
+        };
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory copied to the host"
+        );
+        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+        shadow.window = true;
+        shadow.card = card;
+        let shadow = Arc::new(shadow);
+        if shadow.card.is_some() {
+            CARDED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Arc::downgrade(&shadow));
+        }
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        Some(shadow)
+    }
+
+    pub(crate) fn near(va: u64) -> String {
+        let mut all: Vec<(u64, u64, u64)> = ShadowRegistry::lock()
+            .values()
+            .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
+            .collect();
+        all.extend(
+            LOOSE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .map(|s| (s.gpu, s.start, s.len)),
+        );
+        let below = all.iter().filter(|c| c.0 <= va).max();
+        let above = all.iter().filter(|c| c.0 > va).min();
+        let mut text = match below {
+            Some(&(gpu, start, len)) => format!(
+                "; the nearest title memory copy below it: {start:#x}+{len:#x} at host {gpu:#x}, offset {:#x}",
+                va - gpu
+            ),
+            None => "; no title memory copy below it".into(),
+        };
+        if let Some(&(gpu, start, len)) = above {
+            text.push_str(&format!(
+                "; the nearest above: {start:#x}+{len:#x} at host {gpu:#x} ({} copies in all)",
+                all.len()
+            ));
+        }
+        text
+    }
 }
 
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -64,148 +1129,7 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
 pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
-pub(crate) fn card_stats() -> [u64; 10] {
-    let mut out = [0u64; 10];
-    for (i, stat) in CARD_STATS.iter().enumerate() {
-        out[i] = stat.swap(0, Ordering::Relaxed);
-    }
-    out[7] = CARDED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .filter(|w| w.strong_count() > 0)
-        .count() as u64;
-    out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
-    out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
-    out
-}
-
-pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 64 * 16
-}
-
-fn card_for(size: u64) -> Option<ID3D12Resource> {
-    if !cards() {
-        return None;
-    }
-    let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
-        return None;
-    }
-    let host = host()?;
-    if !host.card_ready() {
-        return None;
-    }
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
-        return None;
-    }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-        return None;
-    }
-    let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-    }
-    buffer
-}
-
-fn window_card_most() -> u64 {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("LEONIDA_CARD_WINDOWS_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0)
-            << 20
-    })
-}
-
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
-
-fn window_card_for(size: u64) -> Option<ID3D12Resource> {
-    let most = window_card_most();
-    if most == 0 || !cards() {
-        return None;
-    }
-    let host = host()?;
-    if !host.card_ready() {
-        return None;
-    }
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
-    {
-        return None;
-    }
-    if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
-        WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
-        return None;
-    }
-    let buffer = host.uav_buffer(size);
-    if buffer.is_none() {
-        WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
-    }
-    buffer
-}
-
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-    let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
-    let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
-            return false;
-        };
-        let ranges = shadow
-            .card
-            .as_ref()
-            .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = std::mem::take(&mut *dirty);
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.retain(|s| s.2 > fetched);
-                    sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
-                }
-                ranges
-            })
-            .unwrap_or_default();
-        if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
-        }
-        true
-    });
-    out
-}
-
-fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
-        }
-    }
-    out
-}
-
-pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
-    runs.sort_unstable_by_key(|r| r.first);
-    let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
-    for run in runs {
-        match out.last_mut() {
-            Some(last) if run.first <= last.first + last.pieces => {
-                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
-                last.to = last.to.max(run.to);
-            }
-            _ => out.push(run),
-        }
-    }
-    out
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CardSpan {
@@ -242,20 +1166,9 @@ impl CardSpan {
     }
 }
 
-fn card_span_of(start: usize, from: usize, to: usize) -> CardSpan {
-    let pieces = pieces_of(start, from, to);
-    CardSpan {
-        from: from as u32,
-        to: to as u32,
-        first: pieces.start as u32,
-        pieces: pieces.len() as u32,
-        skew: (start % PIECE) as u32,
-    }
-}
-
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, ShadowCards};
 
     #[test]
     fn piece_runs_join_without_losing_or_adding_pieces() {
@@ -282,7 +1195,7 @@ mod card_tests {
             .collect();
         wanted.sort_unstable();
         wanted.dedup();
-        let joined = joined_piece_runs(runs);
+        let joined = ShadowCards::joined_piece_runs(runs);
         let got: Vec<u32> = joined
             .iter()
             .flat_map(|r| r.first..r.first + r.pieces)
@@ -296,7 +1209,7 @@ mod card_tests {
             [(3, 5), (9, 1), (40, 3), (100, 1)]
         );
         assert!(joined.iter().all(|r| r.skew == 7));
-        assert!(joined_piece_runs(Vec::new()).is_empty());
+        assert!(ShadowCards::joined_piece_runs(Vec::new()).is_empty());
     }
 
     fn shader_piece(span: &CardSpan, i: u32) -> (u32, u32) {
@@ -326,7 +1239,7 @@ mod card_tests {
                 (2 * PIECE, len),
                 (12345, 4 * PIECE + 7),
             ] {
-                let span = card_span_of(start, from, to);
+                let span = ShadowCards::span_of(start, from, to);
                 let mut at = from;
                 for i in 0..span.pieces {
                     let (lo, hi) = span.changed_ranges(i, u16::MAX).next().unwrap();
@@ -346,7 +1259,7 @@ mod card_tests {
 
     #[test]
     fn dirty_page_runs_clip_holes_and_unaligned_declarations() {
-        let span = card_span_of(PIECE - 17, 8, 17 + 5 * 4096 + 7);
+        let span = ShadowCards::span_of(PIECE - 17, 8, 17 + 5 * 4096 + 7);
         assert_eq!(span.changed_ranges(0, 0x7fff).count(), 0);
         assert_eq!(
             span.changed_ranges(0, 0x8000).collect::<Vec<_>>(),
@@ -362,31 +1275,16 @@ mod card_tests {
     #[test]
     fn ranges_join_where_they_touch() {
         assert_eq!(
-            joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]),
+            ShadowCards::joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]),
             [(0, 6), (8, 20), (30, 31)]
         );
-        assert!(joined(Vec::new()).is_empty());
+        assert!(ShadowCards::joined(Vec::new()).is_empty());
     }
-}
-
-pub(crate) fn relay() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("LEONIDA_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps()
-    })
 }
 
 static PREPARED: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn preparing(number: u64) {
-    PREPARED.store(number, Ordering::Relaxed);
-}
-
 static RELAY_FETCHED: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn relay_fetched(number: u64) {
-    RELAY_FETCHED.fetch_max(number, Ordering::AcqRel);
-}
 
 #[derive(Default)]
 struct Flights(Vec<((usize, usize), u32, u64)>);
@@ -422,43 +1320,9 @@ impl Flights {
     }
 }
 
-fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
-    }
-    differs != 0
-}
-
-fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    skip.sort_unstable();
-    let mut out = Vec::new();
-    let mut at = from;
-    for (a, b) in skip {
-        if b <= at {
-            continue;
-        }
-        if a >= to {
-            break;
-        }
-        if a > at {
-            out.push((at, a));
-        }
-        at = at.max(b);
-    }
-    if at < to {
-        out.push((at, to));
-    }
-    out
-}
-
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{ByteDiff, Flights, ShadowRelay};
 
     #[test]
     fn a_range_stays_closed_until_every_flight_that_declared_it_is_done() {
@@ -494,7 +1358,7 @@ mod relay_tests {
         }
         let title0 = title.clone();
         let mut held = held0.clone();
-        assert!(merge_piece(&now, &mut held, &mut title));
+        assert!(ShadowRelay::merge_piece(&now, &mut held, &mut title));
         for at in 0..200 {
             if now[at] != held0[at] {
                 assert_eq!(
@@ -511,19 +1375,22 @@ mod relay_tests {
             }
         }
         let (title1, held1) = (title.clone(), held.clone());
-        assert!(!merge_piece(&now, &mut held, &mut title));
+        assert!(!ShadowRelay::merge_piece(&now, &mut held, &mut title));
         assert_eq!((title, held), (title1, held1));
     }
 
     #[test]
     fn ranges_are_cut_out() {
-        assert_eq!(outside(10, 50, vec![]), vec![(10, 50)]);
-        assert_eq!(outside(10, 50, vec![(0, 10), (50, 60)]), vec![(10, 50)]);
+        assert_eq!(ShadowRelay::outside(10, 50, vec![]), vec![(10, 50)]);
         assert_eq!(
-            outside(10, 50, vec![(30, 35), (0, 12), (34, 40), (48, 99)]),
+            ShadowRelay::outside(10, 50, vec![(0, 10), (50, 60)]),
+            vec![(10, 50)]
+        );
+        assert_eq!(
+            ShadowRelay::outside(10, 50, vec![(30, 35), (0, 12), (34, 40), (48, 99)]),
             vec![(12, 30), (40, 48)]
         );
-        assert_eq!(outside(10, 50, vec![(0, 99)]), vec![]);
+        assert_eq!(ShadowRelay::outside(10, 50, vec![(0, 99)]), vec![]);
     }
 
     #[test]
@@ -539,7 +1406,7 @@ mod relay_tests {
         for at in [8usize, 9, 20, 50] {
             title[at] = 0x77;
         }
-        for (at, n) in changed_runs(&title, &snap) {
+        for (at, n) in ByteDiff::changed_runs(&title, &snap) {
             copy[at..at + n].copy_from_slice(&title[at..at + n]);
             snap[at..at + n].copy_from_slice(&title[at..at + n]);
         }
@@ -549,7 +1416,11 @@ mod relay_tests {
         let seen = copy.clone();
         {
             let mut t = title[a.0..a.1].to_vec();
-            assert!(merge_piece(&seen[a.0..a.1], &mut snap[a.0..a.1], &mut t));
+            assert!(ShadowRelay::merge_piece(
+                &seen[a.0..a.1],
+                &mut snap[a.0..a.1],
+                &mut t
+            ));
             title[a.0..a.1].copy_from_slice(&t);
         }
         assert_eq!(copy, seen, "the merge stores nothing into the copy");
@@ -567,7 +1438,7 @@ mod relay_tests {
             copy[at] = 0xb1;
         }
         title[40] = 0x55;
-        for (at, n) in changed_runs(&title[b.0..b.1], &snap[b.0..b.1]) {
+        for (at, n) in ByteDiff::changed_runs(&title[b.0..b.1], &snap[b.0..b.1]) {
             let at = at + b.0;
             copy[at..at + n].copy_from_slice(&title[at..at + n]);
             snap[at..at + n].copy_from_slice(&title[at..at + n]);
@@ -575,7 +1446,11 @@ mod relay_tests {
         let seen = copy.clone();
         {
             let mut t = title[b.0..b.1].to_vec();
-            assert!(merge_piece(&seen[b.0..b.1], &mut snap[b.0..b.1], &mut t));
+            assert!(ShadowRelay::merge_piece(
+                &seen[b.0..b.1],
+                &mut snap[b.0..b.1],
+                &mut t
+            ));
             title[b.0..b.1].copy_from_slice(&t);
         }
         for at in 32..36 {
@@ -588,7 +1463,7 @@ mod relay_tests {
         assert_eq!(copy[a.0..b.1], title[a.0..b.1]);
         assert_eq!(snap[a.0..b.1], title[a.0..b.1]);
         let mut t = title.clone();
-        assert!(!merge_piece(&copy, &mut snap, &mut t));
+        assert!(!ShadowRelay::merge_piece(&copy, &mut snap, &mut t));
     }
 
     #[test]
@@ -602,7 +1477,7 @@ mod relay_tests {
         title[12] = 0x77;
         title[30] = 0x78;
         let mut noted = Vec::new();
-        for (at, n) in changed_runs(&title, &cpu) {
+        for (at, n) in ByteDiff::changed_runs(&title, &cpu) {
             cpu[at..at + n].copy_from_slice(&title[at..at + n]);
             noted.push((at, at + n, 5u64));
         }
@@ -617,9 +1492,9 @@ mod relay_tests {
             .map(|s| (s.0, s.1))
             .collect();
         let mut changed = false;
-        for (a, b) in outside(0, N, skip) {
+        for (a, b) in ShadowRelay::outside(0, N, skip) {
             let mut t = title[a..b].to_vec();
-            changed |= merge_piece(&fetched[a..b], &mut cpu[a..b], &mut t);
+            changed |= ShadowRelay::merge_piece(&fetched[a..b], &mut cpu[a..b], &mut t);
             title[a..b].copy_from_slice(&t);
         }
         assert!(changed);
@@ -632,7 +1507,7 @@ mod relay_tests {
         assert_eq!(card, title);
         let mut wrong_title = title.clone();
         let mut wrong_cpu = cpu.clone();
-        merge_piece(&fetched, &mut wrong_cpu, &mut wrong_title);
+        ShadowRelay::merge_piece(&fetched, &mut wrong_cpu, &mut wrong_title);
         assert_eq!(wrong_title[30], base[30]);
     }
 }
@@ -690,15 +1565,6 @@ impl SnapshotPool {
 static POOL: std::sync::LazyLock<Mutex<SnapshotPool>> =
     std::sync::LazyLock::new(|| Mutex::new(SnapshotPool::default()));
 
-fn pooled(n: usize) -> Vec<u8> {
-    let reused = POOL.lock().unwrap_or_else(|e| e.into_inner()).take(n);
-    reused.unwrap_or_else(|| Vec::with_capacity(n))
-}
-
-fn give_back(v: Vec<u8>) {
-    POOL.lock().unwrap_or_else(|e| e.into_inner()).put(v);
-}
-
 #[cfg(test)]
 mod snapshot_pool_tests {
     use super::SnapshotPool;
@@ -742,55 +1608,16 @@ mod snapshot_pool_tests {
 
 const NOT_WATCHED: u8 = 2;
 
-fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    let whole = a.len().min(b.len()) / 8 * 8;
-    let from = a[..whole]
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .zip(b[..whole].chunks_exact(8))
-        .position(|(x, y)| x != y)
-        .map_or(whole, |word| word * 8);
-    a[from..]
-        .iter()
-        .zip(&b[from..])
-        .position(|(x, y)| x != y)
-        .map(|i| from + i)
-}
-
-fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
-    let whole = a.len().min(b.len()) / 8 * 8;
-    if let Some(i) = a[whole..]
-        .iter()
-        .zip(&b[whole..])
-        .rposition(|(x, y)| x != y)
-    {
-        return Some(whole + i);
-    }
-    let word = a[..whole]
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .zip(b[..whole].chunks_exact(8))
-        .rposition(|(x, y)| x != y)?
-        * 8;
-    a[word..word + 8]
-        .iter()
-        .zip(&b[word..word + 8])
-        .rposition(|(x, y)| x != y)
-        .map(|i| word + i)
-}
-
 #[cfg(test)]
 mod difference_tests {
-    use super::{first_difference, last_difference};
+    use super::ByteDiff;
 
     #[test]
     fn differences_are_found_as_byte_by_byte() {
         let base: Vec<u8> = (0..61u32).map(|i| (i * 7 + 3) as u8).collect();
         let same = base.clone();
-        assert_eq!(first_difference(&base, &same), None);
-        assert_eq!(last_difference(&base, &same), None);
+        assert_eq!(ByteDiff::first_difference(&base, &same), None);
+        assert_eq!(ByteDiff::last_difference(&base, &same), None);
         for len in [0usize, 1, 7, 8, 9, 16, 23, 61] {
             for at in 0..len {
                 for other in at..len {
@@ -799,8 +1626,12 @@ mod difference_tests {
                     b[other] ^= 0x01;
                     let first = a.iter().zip(&b).position(|(x, y)| x != y);
                     let last = a.iter().zip(&b).rposition(|(x, y)| x != y);
-                    assert_eq!(first_difference(a, &b), first, "{len} {at} {other}");
-                    assert_eq!(last_difference(a, &b), last, "{len} {at} {other}");
+                    assert_eq!(
+                        ByteDiff::first_difference(a, &b),
+                        first,
+                        "{len} {at} {other}"
+                    );
+                    assert_eq!(ByteDiff::last_difference(a, &b), last, "{len} {at} {other}");
                 }
             }
         }
@@ -809,32 +1640,6 @@ mod difference_tests {
 
 const PIECE: usize = 64 << 10;
 
-unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
-    const PER_THREAD: usize = 16 << 20;
-    let threads = (len / PER_THREAD).clamp(1, 6);
-    if threads == 1 {
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
-        return;
-    }
-    let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
-    std::thread::scope(|s| {
-        for i in 0..threads {
-            let at = (i * each).min(len);
-            let n = each.min(len - at);
-            s.spawn(move || {
-                unsafe {
-                    std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n)
-                };
-            });
-        }
-    });
-}
-
-pub(crate) fn wide_back() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_WIDE_BACK").is_none_or(|v| v != "0"))
-}
-
 type Job = Box<dyn FnOnce() + Send>;
 
 struct Workers {
@@ -842,250 +1647,15 @@ struct Workers {
     more: std::sync::Condvar,
 }
 
-fn workers() -> &'static Workers {
-    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    let workers = WORKERS.get_or_init(|| Workers {
-        jobs: Mutex::new(std::collections::VecDeque::new()),
-        more: std::sync::Condvar::new(),
-    });
-    STARTED.call_once(|| {
-        let n = std::thread::available_parallelism()
-            .map_or(4, |n| n.get() / 4)
-            .clamp(2, 6);
-        for i in 0..n {
-            let _ = std::thread::Builder::new()
-                .name(format!("leonida-wide-{i}"))
-                .spawn(move || {
-                    let workers = WORKERS.get().expect("made above");
-                    loop {
-                        let job = {
-                            let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
-                            loop {
-                                if let Some(job) = jobs.pop_front() {
-                                    break job;
-                                }
-                                jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
-                            }
-                        };
-                        job();
-                    }
-                });
-        }
-    });
-    workers
-}
-
-fn wide(jobs: Vec<Job>) {
-    if jobs.len() < 2 {
-        for job in jobs {
-            job();
-        }
-        return;
-    }
-    let workers = workers();
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
-    {
-        let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        for job in jobs {
-            let left = left.clone();
-            queue.push_back(Box::new(move || {
-                job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
-                }
-            }));
-        }
-    }
-    workers.more.notify_all();
-    loop {
-        let job = workers
-            .jobs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop_front();
-        match job {
-            Some(job) => job(),
-            None => break,
-        }
-    }
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
-    }
-}
-
-pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
-    wide(jobs);
-}
-
 const WIDE_JOB: usize = 1 << 20;
 
 static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 
-pub(crate) fn take_snapshots() {
-    let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
-    if snaps.is_empty() {
-        return;
-    }
-    wide(copy_jobs(snaps));
-}
-
-fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
-    let mut jobs: Vec<Job> = Vec::new();
-    let mut group: Vec<(usize, usize, usize)> = Vec::new();
-    let mut bytes = 0;
-    let flush = |group: &mut Vec<(usize, usize, usize)>, jobs: &mut Vec<Job>| {
-        let group = std::mem::take(group);
-        if !group.is_empty() {
-            jobs.push(Box::new(move || {
-                for (src, dst, len) in group {
-                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
-                }
-            }));
-        }
-    };
-    for (src, dst, len) in copies {
-        let mut at = 0;
-        while at < len {
-            let n = (WIDE_JOB - bytes).min(len - at);
-            group.push((src + at, dst + at, n));
-            at += n;
-            bytes += n;
-            if bytes >= WIDE_JOB {
-                flush(&mut group, &mut jobs);
-                bytes = 0;
-            }
-        }
-    }
-    flush(&mut group, &mut jobs);
-    jobs
-}
-
-pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
-    let scans = work
-        .iter()
-        .map(|(shadow, address, end)| {
-            let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
-            match shadow
-                .before
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-            {
-                Some(before) => (
-                    shadow.data as usize,
-                    before.as_ptr() as usize,
-                    shadow.start as usize,
-                    from,
-                    to,
-                ),
-                None => (0, 0, 0, 0, 0),
-            }
-        })
-        .collect();
-    find_pieces(scans)
-}
-
-fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
-    type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
-    type Part = (usize, usize, usize, usize, usize, usize, usize);
-    let found: Arc<Mutex<Found>> = Arc::default();
-    let mut jobs: Vec<Job> = Vec::new();
-    let mut group: Vec<Part> = Vec::new();
-    let mut bytes = 0;
-    let flush = |group: &mut Vec<Part>, jobs: &mut Vec<Job>| {
-        let group = std::mem::take(group);
-        if group.is_empty() {
-            return;
-        }
-        let found = found.clone();
-        jobs.push(Box::new(move || {
-            let mut mine: Found = Vec::with_capacity(group.len());
-            for (data, before, start, from, to, which, place) in group {
-                let mut pieces = Vec::new();
-                let mut at = from;
-                while at < to {
-                    let n = (PIECE - (start + at) % PIECE).min(to - at);
-                    let (now, old) = unsafe {
-                        (
-                            std::slice::from_raw_parts((data + at) as *const u8, n),
-                            std::slice::from_raw_parts((before + at) as *const u8, n),
-                        )
-                    };
-                    if now != old {
-                        pieces.push((at, n));
-                    }
-                    at += n;
-                }
-                mine.push((which, place, pieces));
-            }
-            found.lock().unwrap_or_else(|e| e.into_inner()).extend(mine);
-        }));
-    };
-    let count = scans.len();
-    for (which, (data, before, start, from, to)) in scans.into_iter().enumerate() {
-        let (mut at, mut place) = (from, 0);
-        while at < to {
-            let room = (WIDE_JOB - bytes).max(PIECE);
-            let mut next = (at + room).min(to);
-            if next < to {
-                next -= (start + next) % PIECE;
-                if next <= at {
-                    next = (at + PIECE - (start + at) % PIECE).min(to);
-                }
-            }
-            group.push((data, before, start, at, next, which, place));
-            bytes += next - at;
-            place += 1;
-            at = next;
-            if bytes >= WIDE_JOB {
-                flush(&mut group, &mut jobs);
-                bytes = 0;
-            }
-        }
-    }
-    flush(&mut group, &mut jobs);
-    wide(jobs);
-    let mut found = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
-    found.sort_unstable_by_key(|f| (f.0, f.1));
-    let mut out = vec![Vec::new(); count];
-    for (which, _, pieces) in found {
-        out[which].extend(pieces);
-    }
-    out
-}
-
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
-
-pub(crate) fn back_line(frames: f64) {
-    let c: Vec<f64> = BACK_CLASS
-        .iter()
-        .map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames)
-        .collect();
-    if c.iter().all(|&v| v == 0.0) {
-        return;
-    }
-    let mb = |v: f64| v / (1 << 20) as f64;
-    tracing::info!(
-        "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside buffers ({:.1} MB \
-         snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
-         of 1 MiB or more (LEONIDA_CARD_BUFFERS_MIN_MB=1 would have the card look there)",
-        mb(c[2]),
-        c[5],
-        mb(c[0]),
-        mb(c[3]),
-        c[6],
-        mb(c[1]),
-        mb(c[4]),
-    );
-}
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
+    use super::{Job, PIECE, WIDE_JOB, WideCopy};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1101,7 +1671,7 @@ mod wide_tests {
                     }) as Job
                 })
                 .collect();
-            wide(jobs);
+            WideCopy::run_jobs(jobs);
             assert_eq!(ran.load(Ordering::Relaxed), n * (n + 1) / 2, "{n} jobs");
         }
     }
@@ -1127,9 +1697,9 @@ mod wide_tests {
             .windows(2)
             .map(|w| (s + w[0], d + w[0], w[1] - w[0]))
             .collect();
-        let jobs = copy_jobs(copies);
+        let jobs = WideCopy::copy_jobs(copies);
         assert!(jobs.len() >= 3);
-        wide(jobs);
+        WideCopy::run_jobs(jobs);
         assert!(src == dst);
     }
 
@@ -1183,42 +1753,15 @@ mod wide_tests {
         }
         scans.push((0, 0, 0, 0, 0));
         wanted.push(Vec::new());
-        assert_eq!(find_pieces(scans), wanted);
+        assert_eq!(WideCopy::find_pieces(scans), wanted);
     }
 }
 
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-pub(crate) fn merged_stats() -> [u64; 3] {
-    [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
-}
-
-fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
-    let n = now.len().min(was.len());
-    let mut runs = Vec::new();
-    let mut i = 0;
-    while i < n {
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
-            i += 8;
-        }
-        while i < n && now[i] == was[i] {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
-        let first = i;
-        while i < n && now[i] != was[i] {
-            i += 1;
-        }
-        runs.push((first, i - first));
-    }
-    runs
-}
-
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::ByteDiff;
 
     #[test]
     fn changed_runs_are_exactly_the_bytes_that_differ() {
@@ -1237,7 +1780,7 @@ mod merge_tests {
             for &at in &changes {
                 now[at] ^= 0x41;
             }
-            let runs = changed_runs(&now, &was);
+            let runs = ByteDiff::changed_runs(&now, &was);
             let mut put = was.clone();
             let mut held = Vec::new();
             for &(at, n) in &runs {
@@ -1252,7 +1795,7 @@ mod merge_tests {
                 "{changes:?}"
             );
         }
-        assert!(changed_runs(&[], &[]).is_empty());
+        assert!(ByteDiff::changed_runs(&[], &[]).is_empty());
     }
 }
 
@@ -1283,44 +1826,17 @@ impl Drop for Shadow {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some()
             {
-                CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
+                CARD_BYTES[1].fetch_sub(ShadowCards::hash_bytes(card.size), Ordering::Relaxed);
             }
         }
     }
 }
 
-fn keeps() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_KEEP_SNAPSHOTS").is_some_and(|v| v == "1"))
-}
-
 static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
-fn kept_most() -> u64 {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("LEONIDA_KEEP_SNAPSHOTS_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(256)
-            << 20
-    })
-}
-
-fn pieces_of(start: usize, from: usize, to: usize) -> std::ops::Range<usize> {
-    let first = start / PIECE;
-    (start + from) / PIECE - first..(start + to - 1) / PIECE - first + 1
-}
-
-fn piece_at(start: usize, len: usize, piece: usize) -> (usize, usize) {
-    let first = start / PIECE;
-    let lo = ((first + piece) * PIECE).saturating_sub(start);
-    let hi = ((first + piece + 1) * PIECE - start).min(len);
-    (lo, hi)
-}
 
 #[cfg(test)]
 mod piece_tests {
-    use super::{PIECE, piece_at, pieces_of};
+    use super::{PIECE, ShadowMemory};
 
     #[test]
     fn pieces_cover_the_copy_as_the_compare_cuts_it() {
@@ -1334,133 +1850,25 @@ mod piece_tests {
             5 * PIECE + 12345,
         ] {
             for len in [1usize, 100, PIECE - 1, PIECE, PIECE + 1, 3 * PIECE + 500] {
-                let count = pieces_of(start, 0, len).end;
+                let count = ShadowMemory::pieces_of(start, 0, len).end;
                 let mut at = 0;
                 for piece in 0..count {
-                    let (lo, hi) = piece_at(start, len, piece);
+                    let (lo, hi) = ShadowMemory::piece_at(start, len, piece);
                     assert_eq!(lo, at, "{start} {len} {piece}");
                     let n = (PIECE - (start + at) % PIECE).min(len - at);
                     assert_eq!(hi, at + n, "{start} {len} {piece}");
-                    assert_eq!(pieces_of(start, lo, hi), piece..piece + 1);
-                    assert_eq!(pieces_of(start, hi - 1, hi), piece..piece + 1);
+                    assert_eq!(ShadowMemory::pieces_of(start, lo, hi), piece..piece + 1);
+                    assert_eq!(ShadowMemory::pieces_of(start, hi - 1, hi), piece..piece + 1);
                     at = hi;
                 }
                 assert_eq!(at, len, "{start} {len}");
-                assert_eq!(pieces_of(start, 0, len), 0..count);
+                assert_eq!(ShadowMemory::pieces_of(start, 0, len), 0..count);
             }
         }
     }
 }
 
 static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-
-#[cfg(feature = "diagnostics")]
-pub(crate) fn windows() -> [u64; 3] {
-    let asked: u64 = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        loose
-            .values()
-            .map(|s| {
-                let low = s.asked[0].load(Ordering::Relaxed);
-                let high = s.asked[1].load(Ordering::Relaxed);
-                high.saturating_sub(low)
-            })
-            .sum()
-    };
-    [
-        LET_GO[0].load(Ordering::Relaxed),
-        LET_GO[1].load(Ordering::Relaxed),
-        asked,
-    ]
-}
-
-#[cfg(feature = "diagnostics")]
-pub(crate) fn window_use() -> [u64; 8] {
-    let mut out = [0u64; 8];
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    for s in loose.values() {
-        let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
-        out[0] += (pages * PAGE as u64).min(s.len);
-        if crate::host::references(&s.buffer) > 1 {
-            out[1] += 1;
-            out[2] += s.len;
-        }
-        if Arc::strong_count(s) > 1 {
-            out[3] += 1;
-            out[4] += s.len;
-        }
-        if s.unsized_asks.load(Ordering::Relaxed) > 0 {
-            out[5] += 1;
-            out[6] += s.len;
-        }
-    }
-    out[7] = window();
-    out
-}
-
-pub(crate) fn let_go_idle() {
-    const IDLE_FRAMES: u64 = 4;
-    let gone: Vec<Arc<Shadow>> = {
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        if map.is_empty() {
-            return;
-        }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle: Vec<(u64, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        idle.into_iter()
-            .filter_map(|key| map.remove(&key))
-            .collect()
-    };
-    if !gone.is_empty() {
-        let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
-        crate::host::trail(|| {
-            format!(
-                "sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot",
-                bytes >> 10
-            )
-        });
-    }
-    for shadow in gone {
-        LET_GO[0].fetch_add(1, Ordering::Relaxed);
-        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
-        crate::host::retire(shadow);
-    }
-}
-
-#[cfg(feature = "diagnostics")]
-pub(crate) fn memory() -> [u64; 6] {
-    let (windows, window_bytes) = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        let mut seen = std::collections::HashSet::new();
-        let bytes: u64 = loose
-            .values()
-            .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
-            .map(|s| s.len)
-            .sum();
-        (seen.len() as u64, bytes)
-    };
-    let (kept, kept_bytes) = {
-        let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        (pool.count as u64, pool.bytes as u64)
-    };
-    [
-        LIVE[0].load(Ordering::Relaxed),
-        LIVE[1].load(Ordering::Relaxed),
-        windows,
-        window_bytes,
-        kept,
-        kept_bytes,
-    ]
-}
 
 unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
@@ -1561,7 +1969,7 @@ impl Shadow {
         }
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if relay() {
+        if ShadowRelay::enabled() {
             self.flights
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1600,8 +2008,8 @@ impl Shadow {
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let snapshot = before.get_or_insert_with(|| pooled(total));
-        if keeps() {
+        let snapshot = before.get_or_insert_with(|| SnapshotPool::lend(total));
+        if ShadowMemory::keeps() {
             let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             if kept.0.is_empty() {
                 kept.0 = vec![false; self.pieces(0, total.max(1)).end];
@@ -1629,7 +2037,7 @@ impl Shadow {
             }
             return;
         }
-        if wide_back() {
+        if WideCopy::enabled() {
             let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
             let (data, snapshot) = (self.data as usize, snapshot.as_mut_ptr() as usize);
             snaps.extend(
@@ -1643,7 +2051,7 @@ impl Shadow {
         for (from, to) in parts {
             if from < to {
                 unsafe {
-                    copy_wide(
+                    WideCopy::copy_wide(
                         self.data.add(from),
                         snapshot.as_mut_ptr().add(from),
                         to - from,
@@ -1693,10 +2101,10 @@ impl Shadow {
             for (at, n) in differing {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                let Some(first) = first_difference(host, old) else {
+                let Some(first) = ByteDiff::first_difference(host, old) else {
                     continue;
                 };
-                let last = last_difference(host, old).unwrap_or(first);
+                let last = ByteDiff::last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
                 let title = &mut title[..n];
@@ -1763,10 +2171,10 @@ impl Shadow {
             now.set_len(n);
         }
         let held = unsafe { std::slice::from_raw_parts_mut(before.as_mut_ptr().add(at), n) };
-        let Some(first) = first_difference(now, held) else {
+        let Some(first) = ByteDiff::first_difference(now, held) else {
             return 0;
         };
-        let last = last_difference(now, held).unwrap_or(first);
+        let last = ByteDiff::last_difference(now, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
         title.clear();
@@ -1774,7 +2182,7 @@ impl Shadow {
         if !crate::host::read_into((start + at) as *const u8, title) {
             return 0;
         }
-        if !merge_piece(now, held, title) {
+        if !ShadowRelay::merge_piece(now, held, title) {
             return 0;
         }
         owners.publish(self.id, start + at, title)
@@ -1830,7 +2238,7 @@ impl Shadow {
             return;
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if relay() {
+        if ShadowRelay::enabled() {
             let free = self
                 .flights
                 .lock()
@@ -1843,10 +2251,12 @@ impl Shadow {
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
-        if keeps() {
+        if ShadowMemory::keeps() {
             let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             if !kept.1 && self.len >= 1 << 20 {
-                if KEPT_BYTES.fetch_add(self.len, Ordering::Relaxed) + self.len <= kept_most() {
+                if KEPT_BYTES.fetch_add(self.len, Ordering::Relaxed) + self.len
+                    <= ShadowMemory::kept_most()
+                {
                     kept.1 = true;
                 } else {
                     KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
@@ -1858,20 +2268,20 @@ impl Shadow {
             kept.0.clear();
         }
         if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            give_back(bytes);
+            SnapshotPool::give_back(bytes);
         }
     }
 
     fn pieces(&self, from: usize, to: usize) -> std::ops::Range<usize> {
-        pieces_of(self.start as usize, from, to)
+        ShadowMemory::pieces_of(self.start as usize, from, to)
     }
 
     fn piece(&self, piece: usize) -> (usize, usize) {
-        piece_at(self.start as usize, self.len as usize, piece)
+        ShadowMemory::piece_at(self.start as usize, self.len as usize, piece)
     }
 
     fn changed(&self, from: usize, to: usize) {
-        if !keeps() || from >= to {
+        if !ShadowMemory::keeps() || from >= to {
             return;
         }
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -1984,7 +2394,7 @@ impl Shadow {
                 let at = lo - start;
                 if self.card.is_some() {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
+                    let runs = ByteDiff::changed_runs(title, held);
                     if runs.len() > *runs_left {
                         return true;
                     }
@@ -2001,7 +2411,7 @@ impl Shadow {
                     };
                     let held =
                         unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
+                    for (r, m) in ByteDiff::changed_runs(title, held) {
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 title.as_ptr().add(r),
@@ -2219,19 +2629,19 @@ impl Shadow {
         }
         *before = make(card.size);
         if before.is_some() {
-            CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
+            CARD_BYTES[1].fetch_add(ShadowCards::hash_bytes(card.size), Ordering::Relaxed);
         }
         before.is_some()
     }
 
     pub(crate) fn card_span(&self, address: usize, end: usize) -> Option<CardSpan> {
         let (from, to) = self.inside(address, end.saturating_sub(address));
-        (from < to).then(|| card_span_of(self.start as usize, from, to))
+        (from < to).then(|| ShadowCards::span_of(self.start as usize, from, to))
     }
 
     pub(crate) fn card_run(&self, from: usize, to: usize) -> CardSpan {
         let to = to.min(self.len as usize);
-        card_span_of(self.start as usize, from.min(to.saturating_sub(1)), to)
+        ShadowCards::span_of(self.start as usize, from.min(to.saturating_sub(1)), to)
     }
 
     pub(crate) fn walls_merged(&self, fetched: usize, written: usize) {
@@ -2293,10 +2703,10 @@ impl Shadow {
             return 0;
         }
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
-        let Some(first) = first_difference(gpu, old) else {
+        let Some(first) = ByteDiff::first_difference(gpu, old) else {
             return 0;
         };
-        let last = last_difference(gpu, old).unwrap_or(first);
+        let last = ByteDiff::last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
         title.clear();
@@ -2338,10 +2748,10 @@ impl Shadow {
         }
         let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
-        let Some(first) = first_difference(gpu, held) else {
+        let Some(first) = ByteDiff::first_difference(gpu, held) else {
             return 0;
         };
-        let last = last_difference(gpu, held).unwrap_or(first);
+        let last = ByteDiff::last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
@@ -2362,9 +2772,9 @@ impl Shadow {
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
         let mut changed = false;
-        for (a, b) in outside(at, at + n, skip) {
+        for (a, b) in ShadowRelay::outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            changed |= ShadowRelay::merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
         }
         if !mapped || !changed {
             return 0;
@@ -2381,331 +2791,21 @@ struct Entry {
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
 static BUFFER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
-pub(crate) fn buffer_generation() -> u64 {
-    BUFFER_GENERATION.load(Ordering::Acquire)
-}
-
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    let old = buffers().insert(
-        (start, resource),
-        Entry {
-            end: start + len,
-            shadow: None,
-        },
-    );
-    crate::memory::ownership_changed(start, old.map_or(len, |e| len.max(e.end - start)));
-    BUFFER_GENERATION.fetch_add(1, Ordering::Release);
-}
-
-pub(crate) fn unregister(resource: usize, start: u64) {
-    if let Some(old) = buffers().remove(&(start, resource)) {
-        crate::memory::ownership_changed(start, old.end - start);
-        BUFFER_GENERATION.fetch_add(1, Ordering::Release);
-    }
-}
-
-#[cfg(feature = "diagnostics")]
-pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end > address)
-        .map(|(k, e)| (k.0, e.end - k.0))
-}
-
-pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
-    let end = at.saturating_add(len);
-    let mut gone: Vec<Arc<Shadow>> = Vec::new();
-    {
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
-            .map(|(key, _)| *key)
-            .collect();
-        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
-    }
-    {
-        let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
-                gone.extend(entry.shadow.take());
-            }
-        }
-    }
-    let n = gone.len() as u64;
-    if n != 0 {
-        crate::memory::ownership_changed(at, len);
-        BUFFER_GENERATION.fetch_add(1, Ordering::Release);
-    }
-    for shadow in gone {
-        crate::host::retire(shadow);
-    }
-    n
-}
-
-pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers()
-        .iter()
-        .map(|(key, entry)| (key.0, entry.end - key.0, false))
-        .collect();
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
-    spans
-}
-
-pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
-}
-
-pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    if !fine() {
-        return find(address, len);
-    }
-    lookup(address, len, true)
-}
-
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
-    let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
-        drop(map);
-        return loose(address, end, len <= 1, any);
-    };
-    let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
-        let len = entry.end - key.0;
-        let size = len.next_multiple_of(1 << 16);
-        let big = cards() && size >= card_limits().0;
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
-        }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || {
-                    format!("title buffer {:#x}+{len:#x} on the card", key.0)
-                });
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                    size,
-                };
-                (on_card, Some(card))
-            }
-            None => (buffer, None),
-        };
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
-            tracing::info!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "large buffer copied to the host"
-            );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "buffer copied to the host"
-            );
-        }
-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
-        shadow.card = card;
-        let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
-            CARDED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(Arc::downgrade(&shadow));
-        }
-        entry.shadow = Some(shadow);
-    }
-    entry.shadow.clone()
-}
-
 const WINDOW: u64 = 4 << 20;
-
-fn window() -> u64 {
-    static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *GRID.get_or_init(|| {
-        let kb = std::env::var("LEONIDA_WINDOW_KB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        grid(kb)
-    })
-}
-
-fn grid(kb: Option<u64>) -> u64 {
-    match kb {
-        Some(kb) if kb.is_power_of_two() && (64..=4096).contains(&kb) => kb << 10,
-        _ => WINDOW,
-    }
-}
-
-fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
-    let start = address & !(grid - 1);
-    (start, end.next_multiple_of(grid) - start)
-}
-
-fn tails() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_WINDOW_TAILS").is_some_and(|v| v == "1"))
-}
 
 const TAIL_STEP: u64 = 256 << 10;
 
-fn tail_of(address: u64, end: u64) -> (u64, u64) {
-    let (cell, len) = window_of(address, end, WINDOW);
-    let start = address & !(TAIL_STEP - 1);
-    (start, cell + len - start)
-}
-
-fn holder(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u64) -> Option<(u64, u64)> {
-    windows
-        .filter(|&(start, bytes)| start <= address && start + bytes >= end)
-        .max_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
-}
-
-fn fine() -> bool {
-    tails() || window() < WINDOW
-}
-
-#[cfg(feature = "diagnostics")]
-pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    cover(loose.keys().copied())
-}
-
-#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
-fn cover(windows: impl Iterator<Item = (u64, u64)>) -> u64 {
-    let (mut covered, mut reached) = (0, 0);
-    for (start, bytes) in windows {
-        let end = start + bytes;
-        if end > reached {
-            covered += end - start.max(reached);
-            reached = end;
-        }
-    }
-    covered
-}
-
-fn longest_tail(
-    windows: impl Iterator<Item = (u64, u64)>,
-    address: u64,
-    end: u64,
-) -> Option<(u64, u64)> {
-    let (cell, len) = window_of(address, end, WINDOW);
-    let step = address & !(TAIL_STEP - 1);
-    windows
-        .filter(|&(start, bytes)| start >= cell && start <= step && start + bytes == cell + len)
-        .min()
-}
-
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
-
-fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    let (cell, _) = window_of(address, end, WINDOW);
-    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-    let (start, len) = if unsized_ask && tails() {
-        let there = map
-            .range((cell, 0)..=(address, u64::MAX))
-            .map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        let there = map
-            .range((cell, 0)..=(address, u64::MAX))
-            .map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
-    };
-    let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
-    };
-    if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
-        return Some(shadow.clone());
-    }
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
-    }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
-            crate::host::name(&on_card, || {
-                format!("title memory {start:#x}+{len:#x} on the card")
-            });
-            let card = Card {
-                staging: buffer,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                size: len,
-            };
-            (on_card, Some(card))
-        }
-        None => (buffer, None),
-    };
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
-    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
-    shadow.window = true;
-    shadow.card = card;
-    let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        CARDED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(Arc::downgrade(&shadow));
-    }
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
-    Some(shadow)
-}
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{ShadowRegistry, WINDOW};
 
     #[test]
     fn an_ask_takes_the_longest_window_that_holds_it() {
         let cell = 0xd_1200_0000u64;
         let (ask, end) = (cell + 0x9_0000, cell + 0xb_0000);
-        assert_eq!(holder([].into_iter(), ask, end), None);
+        assert_eq!(ShadowRegistry::holder([].into_iter(), ask, end), None);
         let there = [
             (cell, 0x4_0000),
             (cell + 0x8_0000, 0x2_0000),
@@ -2714,28 +2814,28 @@ mod window_tests {
             (cell + 0xa_0000, 0x40_0000),
         ];
         assert_eq!(
-            holder(there.into_iter(), ask, end),
+            ShadowRegistry::holder(there.into_iter(), ask, end),
             Some((cell + 0x4_0000, 0x10_0000))
         );
         let two = [(cell + 0x8_0000, 0x8_0000), (cell + 0x4_0000, 0x8_0000)];
         assert_eq!(
-            holder(two.into_iter(), ask, end),
+            ShadowRegistry::holder(two.into_iter(), ask, end),
             Some((cell + 0x4_0000, 0x8_0000))
         );
     }
 
     #[test]
     fn overlapping_windows_cover_their_memory_once() {
-        assert_eq!(cover([].into_iter()), 0);
+        assert_eq!(ShadowRegistry::cover([].into_iter()), 0);
         let apart = [(0x10_0000u64, 0x4_0000u64), (0x20_0000, 0x4_0000)];
-        assert_eq!(cover(apart.into_iter()), 0x8_0000);
+        assert_eq!(ShadowRegistry::cover(apart.into_iter()), 0x8_0000);
         let over = [
             (0x10_0000u64, 0x10_0000u64),
             (0x14_0000, 0x4_0000),
             (0x1c_0000, 0x8_0000),
             (0x24_0000, 0x4_0000),
         ];
-        assert_eq!(cover(over.into_iter()), 0x18_0000);
+        assert_eq!(ShadowRegistry::cover(over.into_iter()), 0x18_0000);
     }
 
     #[test]
@@ -2743,15 +2843,21 @@ mod window_tests {
         let cell = 0xd_1200_0000u64;
         let ask = cell + 0x12_3456;
         assert_eq!(
-            tail_of(ask, ask + 1),
+            ShadowRegistry::tail_of(ask, ask + 1),
             (cell + 0x10_0000, WINDOW - 0x10_0000)
         );
-        assert_eq!(tail_of(cell + 0xffff, cell + 0x1_0000), (cell, WINDOW));
+        assert_eq!(
+            ShadowRegistry::tail_of(cell + 0xffff, cell + 0x1_0000),
+            (cell, WINDOW)
+        );
         let end = cell + WINDOW;
         let tail = |from: u64| (cell + from, WINDOW - from);
-        assert_eq!(longest_tail([].into_iter(), ask, ask + 1), None);
         assert_eq!(
-            longest_tail([tail(0x20_0000)].into_iter(), ask, ask + 1),
+            ShadowRegistry::longest_tail([].into_iter(), ask, ask + 1),
+            None
+        );
+        assert_eq!(
+            ShadowRegistry::longest_tail([tail(0x20_0000)].into_iter(), ask, ask + 1),
             None
         );
         let there = [
@@ -2763,78 +2869,54 @@ mod window_tests {
             tail(0x20_0000),
         ];
         assert_eq!(
-            longest_tail(there.into_iter(), ask, ask + 1),
+            ShadowRegistry::longest_tail(there.into_iter(), ask, ask + 1),
             Some(tail(0x8_0000))
         );
         let (start, bytes) = tail(0x8_0000);
         assert!(start <= ask && start + bytes == end);
         let with_whole = [(cell, WINDOW), tail(0x8_0000)];
         assert_eq!(
-            longest_tail(with_whole.into_iter(), ask, ask + 1),
+            ShadowRegistry::longest_tail(with_whole.into_iter(), ask, ask + 1),
             Some((cell, WINDOW))
         );
     }
 
     #[test]
     fn the_grid_is_a_power_of_two_or_the_default() {
-        assert_eq!(grid(None), WINDOW);
-        assert_eq!(grid(Some(4096)), WINDOW);
-        assert_eq!(grid(Some(1024)), 1 << 20);
-        assert_eq!(grid(Some(256)), 256 << 10);
-        assert_eq!(grid(Some(64)), 64 << 10);
+        assert_eq!(ShadowRegistry::grid(None), WINDOW);
+        assert_eq!(ShadowRegistry::grid(Some(4096)), WINDOW);
+        assert_eq!(ShadowRegistry::grid(Some(1024)), 1 << 20);
+        assert_eq!(ShadowRegistry::grid(Some(256)), 256 << 10);
+        assert_eq!(ShadowRegistry::grid(Some(64)), 64 << 10);
         for bad in [0, 32, 100, 1000, 8192] {
-            assert_eq!(grid(Some(bad)), WINDOW, "{bad}");
+            assert_eq!(ShadowRegistry::grid(Some(bad)), WINDOW, "{bad}");
         }
     }
 
     #[test]
     fn windows_hold_their_ask_on_the_grid() {
         let (address, end) = (0xd_1234_5678u64, 0xd_1234_5678u64 + 0x9000);
-        assert_eq!(window_of(address, end, WINDOW), (0xd_1200_0000, 4 << 20));
-        assert_eq!(window_of(address, end, 1 << 20), (0xd_1230_0000, 1 << 20));
         assert_eq!(
-            window_of(address, end, 256 << 10),
+            ShadowRegistry::window_of(address, end, WINDOW),
+            (0xd_1200_0000, 4 << 20)
+        );
+        assert_eq!(
+            ShadowRegistry::window_of(address, end, 1 << 20),
+            (0xd_1230_0000, 1 << 20)
+        );
+        assert_eq!(
+            ShadowRegistry::window_of(address, end, 256 << 10),
             (0xd_1234_0000, 256 << 10)
         );
         let end = address + 0x4_0000;
         assert_eq!(
-            window_of(address, end, 256 << 10),
+            ShadowRegistry::window_of(address, end, 256 << 10),
             (0xd_1234_0000, 512 << 10)
         );
         for g in [64u64 << 10, 256 << 10, 1 << 20, WINDOW] {
-            let (start, len) = window_of(address, end, g);
+            let (start, len) = ShadowRegistry::window_of(address, end, g);
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
     }
-}
-
-pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
-        .values()
-        .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
-        .collect();
-    all.extend(
-        LOOSE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(|s| (s.gpu, s.start, s.len)),
-    );
-    let below = all.iter().filter(|c| c.0 <= va).max();
-    let above = all.iter().filter(|c| c.0 > va).min();
-    let mut text = match below {
-        Some(&(gpu, start, len)) => format!(
-            "; the nearest title memory copy below it: {start:#x}+{len:#x} at host {gpu:#x}, offset {:#x}",
-            va - gpu
-        ),
-        None => "; no title memory copy below it".into(),
-    };
-    if let Some(&(gpu, start, len)) = above {
-        text.push_str(&format!(
-            "; the nearest above: {start:#x}+{len:#x} at host {gpu:#x} ({} copies in all)",
-            all.len()
-        ));
-    }
-    text
 }

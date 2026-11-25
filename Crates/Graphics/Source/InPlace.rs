@@ -119,7 +119,7 @@ pub fn title_memory_freeing(at: usize, len: usize) {
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
-    let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
+    let gone = crate::shadow::ShadowRegistry::in_place_let_go(at as u64, len as u64);
     STATS[7].fetch_add(gone, Ordering::Relaxed);
 }
 
@@ -1322,7 +1322,7 @@ pub(crate) fn tick() {
     if due {
         let which = DONE.fetch_add(1, Ordering::Relaxed);
         std::thread::spawn(move || {
-            let spans = crate::shadow::spans();
+            let spans = crate::shadow::ShadowRegistry::spans();
             for line in census_of(&spans) {
                 tracing::info!("in place {line}");
             }

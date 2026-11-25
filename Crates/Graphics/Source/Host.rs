@@ -140,7 +140,7 @@ fn sweep() {
         return;
     }
     crate::pipeline::PipelineCache::trim();
-    crate::shadow::let_go_idle();
+    crate::shadow::ShadowMemory::let_go_idle();
     crate::texture::TextureUploads::let_go_idle();
     crate::resource::HostTextures::let_go_idle();
 }
@@ -786,7 +786,7 @@ fn record_preludes(plans: Vec<PlannedPrelude>) {
         .into_iter()
         .map(|plan| Box::new(move || plan.record()) as Box<dyn FnOnce() + Send>)
         .collect();
-    crate::shadow::wide_run(jobs);
+    crate::shadow::WideCopy::run(jobs);
 }
 
 fn parallel_preludes(runs: &[&HostList]) -> bool {
@@ -1514,7 +1514,7 @@ fn late_stage() -> u8 {
             Ok("1") => 1,
             Ok("2") => 2,
             Ok("3") => 3,
-            Err(_) if crate::shadow::relay() => 3,
+            Err(_) if crate::shadow::ShadowRelay::enabled() => 3,
             _ => 0,
         }
     })
@@ -1530,7 +1530,7 @@ pub(crate) fn late_free_present() -> bool {
 
 pub(crate) fn relay() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| late_stage() > 0 && crate::shadow::relay())
+    *ON.get_or_init(|| late_stage() > 0 && crate::shadow::ShadowRelay::enabled())
 }
 
 fn relay_exact() -> bool {
@@ -2207,7 +2207,7 @@ fn relay_hand_back(back: &[Declared], owners: &crate::writeback::Owners) {
     }
     #[cfg(feature = "diagnostics")]
     let scanning = std::time::Instant::now();
-    let found = crate::shadow::find_all(&work);
+    let found = crate::shadow::WideCopy::find_all(&work);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::BackScanUs,
@@ -2299,7 +2299,8 @@ fn late_line(frames: f64) {
         );
     }
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes] =
+            crate::shadow::ByteDiff::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (LEONIDA_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB",
@@ -2620,7 +2621,7 @@ mod landings_tests {
 }
 
 fn hand_back(back: &[Declared], owners: &crate::writeback::Owners) {
-    if crate::shadow::wide_back() {
+    if crate::shadow::WideCopy::enabled() {
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
             if shadow.carded() {
@@ -2643,7 +2644,7 @@ fn hand_back(back: &[Declared], owners: &crate::writeback::Owners) {
         }
         #[cfg(feature = "diagnostics")]
         let scanning = std::time::Instant::now();
-        let found = crate::shadow::find_all(&work);
+        let found = crate::shadow::WideCopy::find_all(&work);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::BackScanUs,
@@ -2929,7 +2930,7 @@ impl Host {
 
     fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
         use std::sync::Arc;
-        if !crate::shadow::cards() {
+        if !crate::shadow::ShadowCards::enabled() {
             return None;
         }
         let declared = declared_writes(runs, true);
@@ -2941,7 +2942,7 @@ impl Host {
             }
             None => 0,
         };
-        let mut dirty = crate::shadow::card_dirty(sent_as);
+        let mut dirty = crate::shadow::ShadowCards::dirty(sent_as);
         if declared.is_empty() && dirty.is_empty() {
             return None;
         }
@@ -2950,7 +2951,7 @@ impl Host {
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for (shadow, _) in &declared {
             if shadow.card_make_before(|size| {
-                let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
+                let before = self.uav_buffer(crate::shadow::ShadowCards::hash_bytes(size))?;
                 name(&before, || {
                     "title buffer on the card, hashes of its pieces".into()
                 });
@@ -3019,7 +3020,7 @@ impl Host {
                                 ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                             };
                         let runs = if rehash_runs() {
-                            crate::shadow::joined_piece_runs(runs)
+                            crate::shadow::ShadowCards::joined_piece_runs(runs)
                         } else {
                             runs
                         };
@@ -3231,7 +3232,9 @@ impl Host {
             }
         }
         if pieces.is_empty() {
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            crate::shadow::ShadowRelay::relay_fetched(
+                *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
+            );
             return;
         }
         if fetch.is_none() {
@@ -3306,7 +3309,7 @@ impl Host {
             written += merged;
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-        crate::shadow::relay_fetched(after);
+        crate::shadow::ShadowRelay::relay_fetched(after);
     }
 
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
@@ -3536,7 +3539,7 @@ impl Host {
                         }) as Box<dyn FnOnce() + Send>
                     })
                     .collect();
-                crate::shadow::wide_run(jobs);
+                crate::shadow::WideCopy::run(jobs);
                 for (written, count) in written.iter_mut().zip(counts.iter()) {
                     *written += count.load(Ordering::Relaxed);
                 }
@@ -3876,7 +3879,7 @@ impl Host {
         let behind = late && flying();
         crate::descriptor::ViewWaits::make_all();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
-        crate::shadow::preparing(this_submission);
+        crate::shadow::ShadowRelay::preparing(this_submission);
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
@@ -3935,7 +3938,7 @@ impl Host {
         {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
-            crate::shadow::take_snapshots();
+            crate::shadow::WideCopy::take_snapshots();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(
                 crate::copystat::C::SnapshotUs,
@@ -4140,7 +4143,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_ends(lock);
         if relay() {
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            crate::shadow::ShadowRelay::relay_fetched(
+                *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
+            );
         }
         working(was_working);
         (submitted, None)
@@ -4180,7 +4185,7 @@ impl Host {
                         text.push_str(&format!("; {what} {names:?}"));
                     }
                 }
-                text.push_str(&crate::shadow::near(va));
+                text.push_str(&crate::shadow::ShadowRegistry::near(va));
                 text.push_str(&crate::descriptor::host::near_heaps(va));
             }
             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
@@ -5232,7 +5237,7 @@ fn run_fills(fills: &[Fill], workers: usize) -> usize {
                 Box::new(move || owned.into_iter().for_each(Fill::run)) as Box<dyn FnOnce() + Send>
             })
             .collect();
-        crate::shadow::wide_run(queued);
+        crate::shadow::WideCopy::run(queued);
         jobs
     } else {
         fills.iter().copied().for_each(Fill::run);
@@ -5412,7 +5417,7 @@ impl Batch {
                     Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>
                 })
                 .collect();
-            crate::shadow::wide_run(jobs);
+            crate::shadow::WideCopy::run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             PREPARING[0].fetch_sub(
                 summed.saturating_sub(started.elapsed().as_micros() as u64),
@@ -5865,7 +5870,7 @@ impl Meter {
         );
         late_line(frames);
         card_clock_line(frames, ms);
-        crate::shadow::back_line(frames);
+        crate::shadow::WideCopy::back_line(frames);
         {
             let [passes, pieces, compares] =
                 [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -5922,7 +5927,7 @@ impl Meter {
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
-        let card = crate::shadow::card_stats();
+        let card = crate::shadow::ShadowCards::stats();
         let card_fetch_copies = CARD_FETCH_COPIES.swap(0, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::WriteJournal::slow_asks();
@@ -5991,7 +5996,7 @@ impl Meter {
                 slow[1] as f64 / 1e3 / frames,
                 slow[2] as f64 / 1e3
             );
-            if crate::shadow::cards() {
+            if crate::shadow::ShadowCards::enabled() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \

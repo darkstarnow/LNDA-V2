@@ -286,7 +286,7 @@ struct RootSlot {
 
 impl RootSlot {
     fn resolve(&mut self, find: impl FnOnce() -> Option<std::sync::Arc<crate::shadow::Shadow>>) {
-        let generation = crate::shadow::buffer_generation();
+        let generation = crate::shadow::ShadowRegistry::generation();
         if self.generation != generation {
             let current = find();
             if self.shadow.as_ref().map(|s| s.id()) != current.as_ref().map(|s| s.id()) {
@@ -369,7 +369,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    let shadow = crate::shadow::ShadowRegistry::find(address, 1)?;
     let len = shadow.left(address).min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
@@ -675,10 +675,11 @@ impl State {
         }
         if kind == USER_VIEW_BIAS {
             return match self.roots_ref(compute).get(usize::from(slot)) {
-                Some(&Root::View(address)) => crate::shadow::find(address, 1).map_or(0, |s| {
-                    let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                    ((s.gpu(address) - base) & 15) as u32
-                }),
+                Some(&Root::View(address)) => crate::shadow::ShadowRegistry::find(address, 1)
+                    .map_or(0, |s| {
+                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
+                        ((s.gpu(address) - base) & 15) as u32
+                    }),
                 _ => 0,
             };
         }
@@ -802,7 +803,9 @@ impl State {
             if v.address == 0 || v.size == 0 {
                 continue;
             }
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some(shadow) =
+                crate::shadow::ShadowRegistry::find_any(v.address, u64::from(v.size))
+            else {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -819,7 +822,9 @@ impl State {
         }
         if indexed {
             let v = self.index;
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some(shadow) =
+                crate::shadow::ShadowRegistry::find_any(v.address, u64::from(v.size))
+            else {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -1124,7 +1129,7 @@ impl State {
                 .map_or(u64::MAX, |mb| mb << 20)
         });
         let find = |a: u64| {
-            let s = crate::shadow::find(a, 1)?;
+            let s = crate::shadow::ShadowRegistry::find(a, 1)?;
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {
                 once!("a root UAV of a buffer whose host copy shaders cannot write");
@@ -1228,7 +1233,7 @@ impl State {
             address.unwrap_or(0) | u64::from(biased) << 63,
         );
         let slot = self.root_srv_slots.entry(key).or_default();
-        slot.resolve(|| address.and_then(|a| crate::shadow::find(a, 1)));
+        slot.resolve(|| address.and_then(|a| crate::shadow::ShadowRegistry::find(a, 1)));
         let shadow = address.zip(slot.shadow.clone());
         let index = match slot.index {
             Some(index) => index,
@@ -1807,7 +1812,7 @@ impl State {
                 }
                 Root::View(a) => {
                     let _ = write!(text, " {slot}=view {a:#x}");
-                    match crate::shadow::extent(*a) {
+                    match crate::shadow::ShadowRegistry::extent(*a) {
                         Some((start, len)) => {
                             let _ = write!(text, " in buffer {start:#x}+{len:#x}");
                         }
@@ -1826,7 +1831,7 @@ impl State {
     fn trace_builder_args(&self, list: &HostList, dispatch: std::fmt::Arguments<'_>) {
         crate::pipeline::BvhBuilder::trace_args(self.pipeline as This, |hash, ordinal| {
             tracing::info!(hash, ordinal, frame = crate::queue::Presenter::presented() + 1,
-                list = ?std::ptr::from_ref(list), buffer_generation = crate::shadow::buffer_generation(),
+                list = ?std::ptr::from_ref(list), buffer_generation = crate::shadow::ShadowRegistry::generation(),
                 %dispatch, roots = %self.compute_root_text(), "ray-tracing builder dispatch arguments at record attempt");
         });
     }
@@ -2048,7 +2053,7 @@ impl State {
                 .chain(&stage.root_uavs)
             {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
-                    let host = crate::shadow::find(*address, 1)
+                    let host = crate::shadow::ShadowRegistry::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
                 }
@@ -2493,7 +2498,7 @@ impl State {
                 }
                 (table, n, h.finish())
             };
-            let generation = crate::shadow::buffer_generation();
+            let generation = crate::shadow::ShadowRegistry::generation();
             if let Some((first, checked)) = self.fresh_tables.get_mut(&key)
                 && (*checked == generation
                     || (0..n).all(|k| {
@@ -2700,7 +2705,7 @@ impl State {
             if v.address == 0
                 || stride == 0
                 || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
+                || crate::shadow::ShadowRegistry::find(from, rects * 3 * stride).is_none()
             {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
@@ -2815,11 +2820,12 @@ impl State {
         count: Option<u64>,
     ) {
         let len = u64::from(stride) * u64::from(max.max(1));
-        let Some(args) = crate::shadow::find_any(arguments, len) else {
+        let Some(args) = crate::shadow::ShadowRegistry::find_any(arguments, len) else {
             return;
         };
         args.refresh(list, arguments, len);
-        let counter = count.and_then(|at| crate::shadow::find_any(at, 4).map(|s| (s, at)));
+        let counter =
+            count.and_then(|at| crate::shadow::ShadowRegistry::find_any(at, 4).map(|s| (s, at)));
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
@@ -2899,12 +2905,12 @@ impl State {
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
-        let Some(args) = crate::shadow::find_any(arguments, len) else {
+        let Some(args) = crate::shadow::ShadowRegistry::find_any(arguments, len) else {
             why("arguments outside title buffers");
             return false;
         };
         let counter = match count {
-            Some(at) => match crate::shadow::find_any(at, 4) {
+            Some(at) => match crate::shadow::ShadowRegistry::find_any(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
@@ -3569,13 +3575,13 @@ mod tests {
             [&state.root_srv_slots[&key], &state.root_uav_slots[&key]]
                 .map(|slot| (slot.index.unwrap(), slot.shadow.as_ref().unwrap().id()))
         };
-        crate::shadow::register(1, address, 64);
+        crate::shadow::ShadowRegistry::register(1, address, 64);
         let first = bind(&mut state);
         assert_eq!(first[0].1, first[1].1);
-        crate::shadow::register(3, address + 64, 64);
+        crate::shadow::ShadowRegistry::register(3, address + 64, 64);
         assert_eq!(bind(&mut state), first);
-        crate::shadow::unregister(1, address);
-        crate::shadow::register(2, address, 64);
+        crate::shadow::ShadowRegistry::unregister(1, address);
+        crate::shadow::ShadowRegistry::register(2, address, 64);
         let second = bind(&mut state);
         for (prior, current) in first.into_iter().zip(second) {
             assert_ne!(prior.0, current.0, "recorded descriptor overwritten");
@@ -3585,8 +3591,8 @@ mod tests {
         assert_eq!(bind(&mut state), second);
         list.close();
         host.execute(&[&list]);
-        crate::shadow::unregister(2, address);
-        crate::shadow::unregister(3, address + 64);
+        crate::shadow::ShadowRegistry::unregister(2, address);
+        crate::shadow::ShadowRegistry::unregister(3, address + 64);
     }
 
     #[test]
@@ -3756,9 +3762,9 @@ mod tests {
         state.set_constants(true, 1, &[0xbaad, 0xfeed], 0);
         state.set_view(true, 2, base + 32);
         state.set_constants(true, 3, &[0; 65], 0);
-        crate::shadow::register(base as usize, base, 256);
+        crate::shadow::ShadowRegistry::register(base as usize, base, 256);
         let roots = state.compute_root_text();
-        crate::shadow::unregister(base as usize, base);
+        crate::shadow::ShadowRegistry::unregister(base as usize, base);
         assert!(roots.contains("0=table 0x80 1=constants [baad, feed]"));
         assert!(roots.contains(&format!(
             "2=view {:#x} in buffer {base:#x}+0x100",

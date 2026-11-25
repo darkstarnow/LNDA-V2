@@ -2089,7 +2089,7 @@ impl HostHeap {
         let Some((address, width)) = buffer_extent(view) else {
             return true;
         };
-        let Some(shadow) = crate::shadow::find(address, width) else {
+        let Some(shadow) = crate::shadow::ShadowRegistry::find(address, width) else {
             return false;
         };
         if let Some(current) = self.shows(index, &shadow.buffer) {
@@ -2185,7 +2185,8 @@ impl HostHeap {
         let view = Descriptors::view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
         if let Some((address, len)) = buffer_range(&view) {
-            let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
+            let host =
+                crate::shadow::ShadowRegistry::find(address, len.max(1)).map(|s| s.gpu(address));
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
         }
         Some(text)
@@ -2326,11 +2327,11 @@ pub(crate) fn buffer_copy(
         && let Some((base, width)) = buffer_extent(view)
         && address >= base
         && address - base < width.max(1)
-        && let Some(shadow) = crate::shadow::find(base, width)
+        && let Some(shadow) = crate::shadow::ShadowRegistry::find(base, width)
     {
         return Some((shadow, address, len));
     }
-    crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
+    crate::shadow::ShadowRegistry::find(address, len).map(|shadow| (shadow, address, len))
 }
 
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
@@ -2509,7 +2510,7 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let shadow = crate::shadow::ShadowRegistry::find(address, len)?;
     let offset = shadow.offset(address);
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if let Err(reason) = rebase_srv(&mut desc, offset, width) {
@@ -2588,7 +2589,7 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let shadow = crate::shadow::ShadowRegistry::find(address, len)?;
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
@@ -2781,7 +2782,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let shadow = crate::shadow::ShadowRegistry::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 once!(
@@ -3290,16 +3291,16 @@ mod tests {
                 assert_eq!(heap.shows(slot, &shadow.buffer), Some(true));
             }
         };
-        crate::shadow::register(1, start, 512);
-        let outer = crate::shadow::find(address, 64).unwrap();
+        crate::shadow::ShadowRegistry::register(1, start, 512);
+        let outer = crate::shadow::ShadowRegistry::find(address, 64).unwrap();
         verify(&outer);
-        crate::shadow::register(2, address, 64);
-        let inner = crate::shadow::find(address, 64).unwrap();
+        crate::shadow::ShadowRegistry::register(2, address, 64);
+        let inner = crate::shadow::ShadowRegistry::find(address, 64).unwrap();
         assert_ne!(outer.id(), inner.id());
         verify(&inner);
-        crate::shadow::unregister(2, address);
+        crate::shadow::ShadowRegistry::unregister(2, address);
         verify(&outer);
-        crate::shadow::unregister(1, start);
+        crate::shadow::ShadowRegistry::unregister(1, start);
     }
 
     #[test]
@@ -3324,21 +3325,21 @@ mod tests {
         desc[11] = (address >> 32) as u32;
         super::super::Descriptors::create_placed_srv(std::ptr::null(), &resource, &desc, handle);
         let view = super::super::Descriptors::view(handle).unwrap();
-        crate::shadow::register(3, start, 1024);
-        let outer = crate::shadow::find(address, 720).unwrap();
+        crate::shadow::ShadowRegistry::register(3, start, 1024);
+        let outer = crate::shadow::ShadowRegistry::find(address, 720).unwrap();
         heap.mirror(0, handle, true).unwrap();
         assert_eq!(heap.shows(0, &outer.buffer), None);
         assert!(heap.buffer_owner_current(0, &view));
-        crate::shadow::register(4, address, 720);
-        let inner = crate::shadow::find(address, 720).unwrap();
+        crate::shadow::ShadowRegistry::register(4, address, 720);
+        let inner = crate::shadow::ShadowRegistry::find(address, 720).unwrap();
         assert!(!heap.buffer_owner_current(0, &view));
         heap.mirror(0, handle, true).unwrap();
         assert_eq!(heap.shows(0, &inner.buffer), Some(true));
-        crate::shadow::unregister(4, address);
+        crate::shadow::ShadowRegistry::unregister(4, address);
         heap.mirror(0, handle, true).unwrap();
         assert_eq!(heap.shows(0, &outer.buffer), None);
         assert!(heap.buffer_owner_current(0, &view));
-        crate::shadow::unregister(3, start);
+        crate::shadow::ShadowRegistry::unregister(3, start);
     }
 
     #[test]

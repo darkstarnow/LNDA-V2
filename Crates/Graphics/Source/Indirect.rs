@@ -625,7 +625,7 @@ void main() {
         let size = PIECE * PIECES as usize;
         let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
         let (_hashes, _, hashes_gpu) =
-            warp.shared_buffer(crate::shadow::card_hash_bytes(size as u64));
+            warp.shared_buffer(crate::shadow::ShadowCards::hash_bytes(size as u64));
         let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };

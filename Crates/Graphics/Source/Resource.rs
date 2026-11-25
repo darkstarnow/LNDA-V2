@@ -966,7 +966,7 @@ impl GpuResource {
         #[cfg(windows)]
         if desc.dimension == BUFFER {
             let at = std::ptr::from_ref::<GpuResource>(&resource) as usize;
-            crate::shadow::register(at, resource.data() as u64, desc.width);
+            crate::shadow::ShadowRegistry::register(at, resource.data() as u64, desc.width);
         }
         object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
     }
@@ -2258,7 +2258,7 @@ impl Drop for GpuResource {
         );
         crate::descriptor::Descriptors::forget(std::ptr::from_ref::<GpuResource>(self) as usize);
         if self.desc.dimension == BUFFER {
-            crate::shadow::unregister(
+            crate::shadow::ShadowRegistry::unregister(
                 std::ptr::from_ref::<GpuResource>(self) as usize,
                 self.data() as u64,
             );

@@ -571,11 +571,11 @@ fn log_memory() {
     let mb = |v: u64| v as f64 / (1 << 20) as f64;
     let (working, private) = process_memory();
     let (free, left) = system_memory();
-    let copies = crate::shadow::memory();
+    let copies = crate::shadow::ShadowMemory::memory();
     let staged = crate::texture::TextureUploads::memory();
     let textures = [0, 1].map(|i| crate::resource::HOST_TEXTURES[i].load(Relaxed));
     let made: Vec<u64> = crate::host::MADE.iter().map(|m| m.load(Relaxed)).collect();
-    let windows = crate::shadow::windows();
+    let windows = crate::shadow::ShadowMemory::window_counts();
     let stagings = crate::texture::TextureUploads::let_go();
     let census = crate::resource::HostTextures::census();
     let kinds: Vec<u64> = crate::resource::KINDS
@@ -681,7 +681,7 @@ fn log_memory() {
         crate::resource::PlacedTextures::placed_filler_twins()
     );
     let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
-    let window = crate::shadow::window_use();
+    let window = crate::shadow::ShadowMemory::window_use();
     let views = crate::descriptor::Views::kept();
     let own: Vec<u64> = OWN.iter().map(|o| o.load(Relaxed)).collect();
     tracing::info!(
@@ -746,7 +746,7 @@ fn log_memory() {
          memory that is in more than one window, and is copied once for each); host lists never \
          reset since they were made: {}",
         mb(copies[3]),
-        mb(crate::shadow::window_cover()),
+        mb(crate::shadow::ShadowRegistry::window_cover()),
         lists[3],
     );
 }
