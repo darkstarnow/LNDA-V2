@@ -152,7 +152,7 @@ impl CommandList {
         let state = &Self::from_this(this).state;
         f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
         #[cfg(feature = "diagnostics")]
-        crate::copystat::recorded(started);
+        crate::copystat::CopyStats::recorded(started);
     }
 
     #[cfg(windows)]
@@ -525,7 +525,7 @@ impl CommandList {
             }) {
                 host.push(UAV_BARRIER);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+                crate::copystat::C::add(crate::copystat::C::WaitsForBuffers, 1);
             }
             if !host.is_empty() {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
@@ -1265,7 +1265,7 @@ impl CommandList {
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         if let Some(host) = Self::host_list(this) {
-            crate::capture::op(std::ptr::from_ref(host) as usize, || {
+            crate::capture::CaptureFrames::op(std::ptr::from_ref(host) as usize, || {
                 format!(
                     "WAIT VALUE at {address:#x} comparison {comparison} reference {reference:#x} wide {wide} met {}",
                     wait.met()
@@ -1294,8 +1294,8 @@ impl CommandList {
     extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         #[cfg(all(windows, feature = "diagnostics"))]
         if count > 0 {
-            crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
-            if crate::copystat::barrier_test() & 1 != 0 {
+            crate::copystat::C::add(crate::copystat::C::WaitsForGroups, 1);
+            if crate::copystat::CopyStats::barrier_test() & 1 != 0 {
                 return;
             }
         }
@@ -1341,7 +1341,7 @@ impl CommandList {
             let _ = value;
             #[cfg(feature = "diagnostics")]
             if let Some(host) = Self::host_list(this) {
-                crate::capture::op(std::ptr::from_ref(host) as usize, || {
+                crate::capture::CaptureFrames::op(std::ptr::from_ref(host) as usize, || {
                     format!("WRITE VALUE at {address:#x} value {value:#x}")
                 });
             }
@@ -1782,9 +1782,9 @@ impl ValueWait {
         let met = self.holds();
         #[cfg(all(windows, feature = "diagnostics"))]
         {
-            use crate::copystat::{C, add};
-            add(C::WaitChecks, 1);
-            add(C::WaitCheckNs, started.elapsed().as_nanos() as u64);
+            use crate::copystat::C;
+            C::add(C::WaitChecks, 1);
+            C::add(C::WaitCheckNs, started.elapsed().as_nanos() as u64);
         }
         met
     }

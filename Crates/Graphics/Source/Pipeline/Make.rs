@@ -373,7 +373,7 @@ fn wait(p: &Pending, frame: u64) {
         Instant::now(),
     );
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(
+    crate::copystat::C::add(
         crate::copystat::C::PipelineWaitUs,
         started.elapsed().as_micros() as u64,
     );

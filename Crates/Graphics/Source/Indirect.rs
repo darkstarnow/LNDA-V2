@@ -287,9 +287,9 @@ impl Clamp {
             count_offset,
         ];
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+        crate::copystat::C::add(crate::copystat::C::IndirectBounded, 1);
         #[cfg(feature = "diagnostics")]
-        let waits = crate::copystat::barrier_test() & 2 == 0;
+        let waits = crate::copystat::CopyStats::barrier_test() & 2 == 0;
         #[cfg(not(feature = "diagnostics"))]
         let waits = true;
         let first = [

@@ -360,12 +360,12 @@ impl TextureUploads {
             .store(crate::host::HostClock::moment(), Relaxed);
         if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+            crate::copystat::C::add(crate::copystat::C::TexSkipped, 1);
             list.defer_texture(staging);
             return;
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexUploads, 1);
+        crate::copystat::C::add(crate::copystat::C::TexUploads, 1);
         const COPY_DEST: u32 = 0x400;
         crate::list::CommandList::ensure_state(list, resource, COPY_DEST);
         for (i, footprint) in staging.footprints.iter().enumerate() {
@@ -942,7 +942,7 @@ impl Staging {
                 self.detile(read);
             });
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+            crate::copystat::C::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -980,7 +980,7 @@ impl Staging {
             }
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            crate::copystat::C::add(crate::copystat::C::TexHashed, size as u64);
             let changed = TextureUploads::with_read(size, |read| {
                 crate::host::TitleCopy::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = blake3::hash(read);
@@ -996,7 +996,7 @@ impl Staging {
             });
             #[cfg(feature = "diagnostics")]
             if changed {
-                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                crate::copystat::C::add(crate::copystat::C::TexChanged, size as u64);
             }
             let _ = changed;
             return size;
@@ -1005,7 +1005,7 @@ impl Staging {
             return TextureUploads::with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+                crate::copystat::C::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
                     return size;
                 }
@@ -1015,14 +1015,14 @@ impl Staging {
                 last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                crate::copystat::C::add(crate::copystat::C::TexChanged, size as u64);
                 size
             });
         }
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        crate::copystat::C::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
             return size;
         }
@@ -1032,7 +1032,7 @@ impl Staging {
         last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        crate::copystat::C::add(crate::copystat::C::TexChanged, size as u64);
         size
     }
 

@@ -2750,7 +2750,7 @@ mod tests {
                     copy.transition(image, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32)
                         .is_none()
                 );
-                let (buffer, _) = crate::capture::read_back(
+                let (buffer, _) = crate::capture::TargetDump::read_back(
                     &host.device,
                     &copy.list,
                     HostTextures::host_resource(image).unwrap(),

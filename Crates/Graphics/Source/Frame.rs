@@ -113,9 +113,9 @@ impl FramePacer {
         };
         #[cfg(all(windows, feature = "diagnostics"))]
         {
-            use crate::copystat::{C, add};
-            add(C::PaceWaits, 1);
-            add(C::PaceUs, wait.min(limit).as_micros() as u64);
+            use crate::copystat::C;
+            C::add(C::PaceWaits, 1);
+            C::add(C::PaceUs, wait.min(limit).as_micros() as u64);
         }
         if kind == ORIGIN && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
             let frame = self.frame.fetch_add(1, Ordering::Relaxed) + 1;

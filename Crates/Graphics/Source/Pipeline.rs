@@ -664,7 +664,7 @@ impl PipelineDrops {
     }
 
     pub(crate) fn note_why(why: String) {
-        crate::capture::op(0, || format!("DROPPED {why}"));
+        crate::capture::CaptureFrames::op(0, || format!("DROPPED {why}"));
         let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
         *drops
             .get_or_insert_with(HashMap::new)

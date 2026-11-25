@@ -830,7 +830,7 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        crate::copystat::C::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
@@ -893,14 +893,14 @@ impl HostHeap {
             });
             #[cfg(feature = "diagnostics")]
             {
-                use crate::copystat::{C, add};
-                add(C::DynamicRefused, 1);
-                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+                use crate::copystat::C;
+                C::add(C::DynamicRefused, 1);
+                C::add(C::DynamicNs, started.elapsed().as_nanos() as u64);
             }
             return None;
         };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(
+        crate::copystat::C::add(
             crate::copystat::C::DynamicNs,
             started.elapsed().as_nanos() as u64,
         );

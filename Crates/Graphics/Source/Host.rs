@@ -1636,7 +1636,7 @@ impl LateRun {
         let scanning = std::time::Instant::now();
         let found = crate::shadow::WideCopy::find_all(&work);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(
+        crate::copystat::C::add(
             crate::copystat::C::BackScanUs,
             scanning.elapsed().as_micros() as u64,
         );
@@ -1648,7 +1648,7 @@ impl LateRun {
             }
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(*from, to - from, written);
+            crate::copystat::CopyStats::compared(*from, to - from, written);
             let _ = (from, to);
         }
     }
@@ -1882,7 +1882,7 @@ impl LateRun {
             let scanning = std::time::Instant::now();
             let found = crate::shadow::WideCopy::find_all(&work);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(
+            crate::copystat::C::add(
                 crate::copystat::C::BackScanUs,
                 scanning.elapsed().as_micros() as u64,
             );
@@ -1891,7 +1891,7 @@ impl LateRun {
                 LateRun::walls_landed(HOST_COPY, *from, to - from, to - from, written, 0, None);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::compared(*from, to - from, written);
+                crate::copystat::CopyStats::compared(*from, to - from, written);
             }
             for (shadow, declared) in back {
                 shadow.copy_back_done(declared);
@@ -1917,7 +1917,7 @@ impl LateRun {
                 LateRun::walls_landed(HOST_COPY, from, to - from, to - from, written, 0, None);
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::compared(from, to - from, written);
+                crate::copystat::CopyStats::compared(from, to - from, written);
             }
             shadow.copy_back_done(declared);
         }
@@ -1985,7 +1985,7 @@ impl FillWork {
 impl TitleCopy {
     pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
         #[cfg(feature = "diagnostics")]
-        match crate::copystat::mode() {
+        match crate::copystat::CopyStats::mode() {
             1 => {
                 unsafe { std::ptr::copy(src, dst, len) };
                 return;
@@ -2009,7 +2009,7 @@ impl TitleCopy {
         let moved = std::time::Instant::now();
         let whole = TitleCopy::read(src, dst, len);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(
+        crate::copystat::C::add(
             crate::copystat::C::MoveUs,
             moved.elapsed().as_micros() as u64,
         );
@@ -2020,7 +2020,7 @@ impl TitleCopy {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+        crate::copystat::C::add(crate::copystat::C::Fallbacks, 1);
         #[cfg(feature = "diagnostics")]
         let sparse = std::time::Instant::now();
         if !title_dst && len >= 64 << 10 {
@@ -2029,7 +2029,7 @@ impl TitleCopy {
             TitleCopy::read_pieces(src, dst, len);
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(
+        crate::copystat::C::add(
             crate::copystat::C::SparseUs,
             sparse.elapsed().as_micros() as u64,
         );
@@ -2056,7 +2056,7 @@ impl TitleCopy {
             }
             if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                crate::copystat::C::add(crate::copystat::C::Unmapped, n as u64);
                 unsafe { to.write_bytes(0, n) };
             } else if !TitleCopy::read(at, to, n) {
                 TitleCopy::read_pieces(at, to, n);
@@ -2073,7 +2073,7 @@ impl TitleCopy {
                     let to = dst.wrapping_add(at - src as usize);
                     if !TitleCopy::read(at as *const u8, to, n) {
                         #[cfg(feature = "diagnostics")]
-                        crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                        crate::copystat::C::add(crate::copystat::C::Unmapped, n as u64);
                         unsafe { to.write_bytes(0, n) };
                     }
                 });
@@ -3334,9 +3334,9 @@ impl Host {
         );
         #[cfg(feature = "diagnostics")]
         {
-            use crate::copystat::{C, add};
-            add(C::HostLists, 1);
-            add(C::HostListNs, started.elapsed().as_nanos() as u64);
+            use crate::copystat::C;
+            C::add(C::HostLists, 1);
+            C::add(C::HostListNs, started.elapsed().as_nanos() as u64);
         }
         list
     }
@@ -4149,7 +4149,7 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             let (from, to) = r.declared;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(from, to - from, written);
+            crate::copystat::CopyStats::compared(from, to - from, written);
             let _ = (from, to);
         }
     }
@@ -4320,7 +4320,7 @@ impl Host {
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::card_waited(gpu.as_micros() as u64, || {
+                crate::copystat::CopyStats::card_waited(gpu.as_micros() as u64, || {
                     format!("{flights} submissions sent ahead, settled together")
                 });
                 if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
@@ -4442,7 +4442,7 @@ impl Host {
         #[cfg(feature = "diagnostics")] called: std::time::Instant,
     ) -> (std::sync::MutexGuard<'a, u64>, Option<Sent>) {
         #[cfg(feature = "diagnostics")]
-        crate::copystat::submission_begins();
+        crate::copystat::CopyStats::submission_begins();
         let was_working = HostTrail::working(true);
         HostTrail::submitting(1, runs.len());
         crate::writeback::starting(STARTED.load(Ordering::Relaxed) + 1);
@@ -4477,7 +4477,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::Submissions, 1);
+        crate::copystat::C::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
@@ -4533,7 +4533,7 @@ impl Host {
             let snapshots = std::time::Instant::now();
             crate::shadow::WideCopy::take_snapshots();
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(
+            crate::copystat::C::add(
                 crate::copystat::C::SnapshotUs,
                 snapshots.elapsed().as_micros() as u64,
             );
@@ -4582,7 +4582,7 @@ impl Host {
             );
             HostTrail::submitting(0, 0);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::submission_ends(lock);
+            crate::copystat::CopyStats::submission_ends(lock);
             let sent = Sent {
                 number: this_submission,
                 card,
@@ -4630,7 +4630,7 @@ impl Host {
             if HostSetup::timing() {
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
-                    crate::copystat::command_took(&op, ms);
+                    crate::copystat::CopyStats::command_took(&op, ms);
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -4659,7 +4659,7 @@ impl Host {
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::card_waited(gpu.as_micros() as u64, || {
+        crate::copystat::CopyStats::card_waited(gpu.as_micros() as u64, || {
             let pipelines: std::collections::BTreeSet<String> = runs
                 .iter()
                 .flat_map(|l| {
@@ -4716,13 +4716,13 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         if !back.is_empty() {
-            crate::copystat::add(crate::copystat::C::BackSubmissions, 1);
+            crate::copystat::C::add(crate::copystat::C::BackSubmissions, 1);
         }
         #[cfg(feature = "diagnostics")]
         if back.is_empty() && runs.iter().all(|l| l.deferred().writes.is_empty()) {
-            use crate::copystat::{C, add};
-            add(C::NothingBack, 1);
-            add(C::NothingBackUs, gpu.as_micros() as u64);
+            use crate::copystat::C;
+            C::add(C::NothingBack, 1);
+            C::add(C::NothingBackUs, gpu.as_micros() as u64);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
@@ -4734,7 +4734,7 @@ impl Host {
         self.log_messages();
         HostTrail::submitting(0, 0);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::submission_ends(lock);
+        crate::copystat::CopyStats::submission_ends(lock);
         if LateRun::relay() {
             crate::shadow::ShadowRelay::relay_fetched(
                 *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
@@ -5044,7 +5044,7 @@ impl HostList {
             HostSetup::fail(format_args!("a host command list did not reset ({e})"));
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(
+        crate::copystat::C::add(
             crate::copystat::C::ResetNs,
             started.elapsed().as_nanos() as u64,
         );
@@ -5088,7 +5088,7 @@ impl HostList {
             return None;
         }
         self.settle(copy, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
-        let result = crate::capture::read_back(device, &self.list, &copy.texture);
+        let result = crate::capture::TargetDump::read_back(device, &self.list, &copy.texture);
         self.settle(copy, state);
         result
     }
@@ -5377,7 +5377,7 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if !HostSetup::dred_on() {
-            crate::capture::op(std::ptr::from_ref(self) as usize, what);
+            crate::capture::CaptureFrames::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
         {
@@ -5389,7 +5389,7 @@ impl HostList {
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
             let what = what();
-            crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
+            crate::capture::CaptureFrames::op(std::ptr::from_ref(self) as usize, || what.clone());
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
             unsafe {
@@ -5400,7 +5400,7 @@ impl HostList {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
-            crate::copystat::add(
+            crate::copystat::C::add(
                 crate::copystat::C::NoteNs,
                 started.elapsed().as_nanos() as u64,
             );
@@ -5659,15 +5659,15 @@ impl HostList {
 
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
-        use crate::copystat::{C, add};
+        use crate::copystat::C;
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                        C::add(C::Copies, 1);
+                        C::add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
                     TitleCopy::copy_mapped(dst as *mut u8, src as *const u8, len, true);
@@ -5680,8 +5680,8 @@ impl HostList {
                     let jobs = FillWork::run(fills, FillWork::workers());
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Copies, fills.len() as u64);
-                        add(C::CopyBytes, bytes as u64);
+                        C::add(C::Copies, fills.len() as u64);
+                        C::add(C::CopyBytes, bytes as u64);
                         if jobs > 1 {
                             FILL_BATCHES[0].fetch_add(1, Ordering::Relaxed);
                             FILL_BATCHES[1].fetch_add(fills.len() as u64, Ordering::Relaxed);
@@ -5693,8 +5693,8 @@ impl HostList {
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Refreshes, 1);
-                        add(C::RefreshBytes, *len as u64);
+                        C::add(C::Refreshes, 1);
+                        C::add(C::RefreshBytes, *len as u64);
                     }
                     batch.add(shadow, *address, *len);
                     continue;
@@ -5709,8 +5709,8 @@ impl HostList {
                     }
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        C::add(C::Runs, 1);
+                        C::add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
                     continue;
                 }
@@ -5721,8 +5721,8 @@ impl HostList {
                     shadow.writing(*address, *len);
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::GpuWrites, 1);
-                        add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+                        C::add(C::GpuWrites, 1);
+                        C::add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                     }
                     continue;
                 }
@@ -5921,7 +5921,7 @@ impl Batch {
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
+        crate::copystat::CopyStats::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
@@ -6121,7 +6121,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "leonida_graphics::frame", token = crate::frame::FramePacer::frame(), "present");
         #[cfg(feature = "diagnostics")]
-        crate::copystat::presented();
+        crate::copystat::CopyStats::presented();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -6345,7 +6345,7 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                crate::copystat::CopyStats::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -6445,7 +6445,8 @@ impl Host {
                 return None;
             };
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now = crate::capture::CaptureFrames::wanted(frame)
+                || crate::capture::CaptureFrames::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
             let slot = if LateRun::late_free_present() && !read_now {
@@ -6478,14 +6479,14 @@ impl Host {
             ]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+            let capture = crate::capture::CaptureFrames::wanted(frame)
+                .then(|| crate::capture::TargetDump::read_back(&self.device, list, texture))
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() {
                 None
             } else {
-                crate::capture::probe(&self.device, list, texture)
+                crate::capture::CaptureFrames::probe(&self.device, list, texture)
             };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
@@ -6507,12 +6508,12 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+                crate::capture::TargetDump::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            return Some(probe.is_some_and(|b| crate::capture::CaptureFrames::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }

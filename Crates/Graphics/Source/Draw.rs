@@ -510,8 +510,8 @@ impl ViewInspector {
                 } else {
                     #[cfg(feature = "diagnostics")]
                     {
-                        crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
-                        crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
+                        crate::copystat::C::add(crate::copystat::C::GpuWritesLeftOut, 1);
+                        crate::copystat::C::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
                     }
                 }
             }
@@ -557,9 +557,12 @@ impl ViewInspector {
             }
             (View::Unordered(resource, _, _), ResourceType::Uav) => {
                 #[cfg(feature = "diagnostics")]
-                crate::capture::note_target(*resource as This);
+                crate::capture::TargetDump::note_target(*resource as This);
                 #[cfg(feature = "diagnostics")]
-                crate::capture::note_written(std::ptr::from_ref(list) as usize, *resource as This);
+                crate::capture::InputDump::note_written(
+                    std::ptr::from_ref(list) as usize,
+                    *resource as This,
+                );
                 list.texture_written(*resource as This);
                 if !list.twin_use(*resource as This, true, true) {
                     crate::list::CommandList::ensure_state(
@@ -732,7 +735,7 @@ impl FixedState {
 
     pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
         #[cfg(feature = "diagnostics")]
-        crate::capture::op(std::ptr::from_ref(list) as usize, || {
+        crate::capture::CaptureFrames::op(std::ptr::from_ref(list) as usize, || {
             format!("STENCIL REF {reference:#x}")
         });
         unsafe { list.list.OMSetStencilRef(reference) };
@@ -740,7 +743,7 @@ impl FixedState {
 
     pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
         #[cfg(feature = "diagnostics")]
-        crate::capture::op(std::ptr::from_ref(list) as usize, || {
+        crate::capture::CaptureFrames::op(std::ptr::from_ref(list) as usize, || {
             format!("DEPTH BOUNDS {min}..{max}")
         });
         if crate::host::Host::instance().is_some_and(|h| h.depth_bounds())
@@ -872,7 +875,7 @@ impl State {
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
+            crate::capture::TargetDump::note_target(record.resource);
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
         }
         self.depth = 0;
@@ -885,7 +888,7 @@ impl State {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
+            crate::capture::TargetDump::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
         unsafe {
@@ -2141,7 +2144,7 @@ impl State {
 
     #[cfg(feature = "diagnostics")]
     fn list_dropped_roots(&self, groups: [u32; 3]) {
-        crate::capture::op(0, || {
+        crate::capture::CaptureFrames::op(0, || {
             let [x, y, z] = groups;
             let shaders = crate::pipeline::PipelineState::shaders_of(self.pipeline as This);
             format!(
@@ -2299,7 +2302,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::memory::ray_probe::after_dispatch(list, p);
         #[cfg(feature = "diagnostics")]
-        crate::capture::dump_with_input(list, self.pipeline as This, &[], input);
+        crate::capture::InputDump::dump_with_input(list, self.pipeline as This, &[], input);
         #[cfg(feature = "diagnostics")]
         if builder {
             crate::pipeline::BvhBuilder::recorded(self.pipeline as This, false);
@@ -2313,14 +2316,14 @@ impl State {
         list: &HostList,
         p: &HostPipeline,
     ) -> Option<crate::capture::InputDump> {
-        let selectors = crate::capture::input_selectors();
-        if selectors.is_empty() || crate::capture::folder().is_none() {
+        let selectors = crate::capture::InputSelector::all();
+        if selectors.is_empty() || crate::capture::CaptureFrames::folder().is_none() {
             return None;
         }
         let stage = p.stages.first()?;
         let selector = selectors.iter().find(|s| s.hash == stage.shader.hash)?;
         let frame = crate::queue::Presenter::presented() + 1;
-        if !crate::capture::listed(frame) {
+        if !crate::capture::CaptureFrames::listed(frame) {
             return None;
         }
         let is_input = stage.translated().used.iter().any(|u| {
@@ -2348,7 +2351,7 @@ impl State {
         {
             return None;
         }
-        crate::capture::read_input(list, frame, selector, *resource)
+        crate::capture::InputDump::read(list, frame, selector, *resource)
     }
 
     #[cfg(feature = "diagnostics")]
@@ -2948,7 +2951,8 @@ impl State {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
-        let listed = crate::capture::listed(crate::queue::Presenter::presented() + 1);
+        let listed =
+            crate::capture::CaptureFrames::listed(crate::queue::Presenter::presented() + 1);
         let logged = listed || TRACED.fetch_add(1, Ordering::Relaxed) < 64;
         let targets: Vec<String> = self
             .targets
@@ -3162,7 +3166,7 @@ impl State {
             }
         }
         #[cfg(feature = "diagnostics")]
-        if !ran && crate::capture::recording_listed() {
+        if !ran && crate::capture::CaptureFrames::recording_listed() {
             self.dropped_records(list, (kind, stride, max), arguments, count);
         }
         ran
@@ -3172,7 +3176,7 @@ impl State {
     fn dump_after(&self, list: &HostList) {
         let mut targets = self.targets.clone();
         targets.push(self.depth);
-        crate::capture::dump_after(list, self.pipeline as This, &targets);
+        crate::capture::InputDump::dump_after(list, self.pipeline as This, &targets);
     }
 
     #[cfg(feature = "diagnostics")]
@@ -3200,7 +3204,7 @@ impl State {
             "DROPPED {}",
             crate::pipeline::PipelineState::shaders_of(self.pipeline as This)
         );
-        crate::capture::read_indirect(list, records, count, (kind, stride, max), name);
+        crate::capture::Records::read(list, records, count, (kind, stride, max), name);
     }
 
     fn run_indirect(
@@ -3444,15 +3448,15 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if kind == DISPATCH {
             crate::memory::ray_probe::after_dispatch(list, p);
-            crate::capture::dump_after(list, self.pipeline as This, &[]);
+            crate::capture::InputDump::dump_after(list, self.pipeline as This, &[]);
         } else {
             self.dump_after(list);
         }
         #[cfg(feature = "diagnostics")]
-        if crate::capture::recording_listed() {
+        if crate::capture::CaptureFrames::recording_listed() {
             let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
             let name = crate::pipeline::PipelineState::shaders_of(self.pipeline as This);
-            crate::capture::read_indirect(
+            crate::capture::Records::read(
                 list,
                 crate::capture::Records::Clamped(&bounded, at),
                 count,

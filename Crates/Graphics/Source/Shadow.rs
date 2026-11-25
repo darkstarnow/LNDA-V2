@@ -2093,9 +2093,9 @@ impl Shadow {
             };
             #[cfg(feature = "diagnostics")]
             let syncing = {
-                use crate::copystat::{C, add};
-                add(C::BackScanUs, scanning.elapsed().as_micros() as u64);
-                add(C::BackDiffer, differing.len() as u64);
+                use crate::copystat::C;
+                C::add(C::BackScanUs, scanning.elapsed().as_micros() as u64);
+                C::add(C::BackDiffer, differing.len() as u64);
                 std::time::Instant::now()
             };
             for &(at, n) in &differing {
@@ -2128,7 +2128,7 @@ impl Shadow {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(
+            crate::copystat::C::add(
                 crate::copystat::C::BackSyncUs,
                 syncing.elapsed().as_micros() as u64,
             );
@@ -2138,7 +2138,7 @@ impl Shadow {
 
     fn compared(&self, from: usize, to: usize) {
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::BackCompared, (to - from) as u64);
+        crate::copystat::C::add(crate::copystat::C::BackCompared, (to - from) as u64);
         let (bytes, ranges) = if self.window { (2, 5) } else { (3, 6) };
         BACK_CLASS[bytes].fetch_add((to - from) as u64, Ordering::Relaxed);
         BACK_CLASS[ranges].fetch_add(1, Ordering::Relaxed);
@@ -2482,21 +2482,21 @@ impl Shadow {
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
-                    use crate::copystat::{C, add};
-                    add(C::Checked, (to - from) as u64);
-                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    use crate::copystat::C;
+                    C::add(C::Checked, (to - from) as u64);
+                    C::add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
                 }
                 return copied;
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
+        crate::copystat::C::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
+        crate::copystat::CopyStats::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
     }
 

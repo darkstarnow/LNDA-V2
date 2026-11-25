@@ -273,9 +273,9 @@ impl WriteJournal {
         }
         #[cfg(feature = "diagnostics")]
         {
-            use crate::copystat::{C, add};
-            add(C::Watches, 1);
-            add(C::WatchUs, started.elapsed().as_micros() as u64);
+            use crate::copystat::C;
+            C::add(C::Watches, 1);
+            C::add(C::WatchUs, started.elapsed().as_micros() as u64);
             WriteJournal::slow(started.elapsed().as_micros() as u64);
         }
         let now = j.ahead_asked;
@@ -346,7 +346,7 @@ impl WriteJournal {
             let guarding = std::time::Instant::now();
             let written = PageGuards::guard(first * PAGE, last * PAGE);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(
+            crate::copystat::C::add(
                 crate::copystat::C::GuardUs,
                 guarding.elapsed().as_micros() as u64,
             );
@@ -356,9 +356,9 @@ impl WriteJournal {
         };
         #[cfg(feature = "diagnostics")]
         {
-            use crate::copystat::{C, add};
-            add(C::Watches, 1);
-            add(C::WatchUs, started.elapsed().as_micros() as u64);
+            use crate::copystat::C;
+            C::add(C::Watches, 1);
+            C::add(C::WatchUs, started.elapsed().as_micros() as u64);
             WriteJournal::slow(started.elapsed().as_micros() as u64);
         }
         j.asked += 1;
@@ -709,7 +709,7 @@ impl TitleMemory {
             let mut g = PageGuards::lock();
             if PageGuards::open(&mut g, at, at + 1) {
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                crate::copystat::C::add(crate::copystat::C::GuardFaults, 1);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
             if TitleMemory::writable(at) {

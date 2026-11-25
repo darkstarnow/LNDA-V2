@@ -164,7 +164,7 @@ impl Held {
     ) {
         #[cfg(feature = "diagnostics")]
         {
-            crate::capture::op(queue, || {
+            crate::capture::CaptureFrames::op(queue, || {
                 format!(
                     "RUN held submission of {} lists (forced {all})",
                     order.len()
@@ -180,7 +180,7 @@ impl Held {
                     .iter()
                     .all(|h| matches!(h, Held::Value(w) if w.met()))
             {
-                crate::copystat::add(crate::copystat::C::PartsTogether, 1);
+                crate::copystat::C::add(crate::copystat::C::PartsTogether, 1);
             }
         }
         #[cfg(not(feature = "diagnostics"))]
@@ -197,7 +197,7 @@ impl Held {
         }
         if all {
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::Forced, 1);
+            crate::copystat::C::add(crate::copystat::C::Forced, 1);
             static ONCE: AtomicBool = AtomicBool::new(false);
             if !ONCE.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
@@ -334,7 +334,7 @@ impl CommandQueue {
 
     #[cfg(all(windows, feature = "diagnostics"))]
     fn describe_submission(this: This, lists: &[This], note: &str) {
-        crate::capture::op(this as usize, || {
+        crate::capture::CaptureFrames::op(this as usize, || {
             let kind = (!this.is_null()).then(|| Self::from_this(this).kind);
             let named: Vec<String> = lists
                 .iter()
@@ -529,7 +529,7 @@ impl CommandQueue {
             );
         }
         #[cfg(feature = "diagnostics")]
-        crate::capture::op(this as usize, || {
+        crate::capture::CaptureFrames::op(this as usize, || {
             format!(
                 "WAIT queue kind {} for fence {fence:?} value {value} (now {now})",
                 self.kind
@@ -787,7 +787,7 @@ impl Presenter {
 
     fn present(planes: u32, plane: *const Plane) {
         #[cfg(all(windows, feature = "diagnostics"))]
-        crate::copystat::present_begins();
+        crate::copystat::CopyStats::present_begins();
         #[cfg(windows)]
         Self::settle();
         let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -796,9 +796,9 @@ impl Presenter {
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         {
-            crate::capture::frame_drew(frame, crate::draw::DrawCounters::drawn());
-            if crate::capture::listed(frame) {
-                crate::capture::dump_targets(frame);
+            crate::capture::CaptureFrames::frame_drew(frame, crate::draw::DrawCounters::drawn());
+            if crate::capture::CaptureFrames::listed(frame) {
+                crate::capture::TargetDump::dump_targets(frame);
             }
         }
         #[cfg(windows)]
@@ -899,7 +899,7 @@ impl BlackFrames {
                 draws = drawn - last.drawn,
                 copied = shown.is_some(),
                 black_frames = last.count,
-                levels = ?crate::capture::recent_levels(),
+                levels = ?crate::capture::CaptureFrames::recent_levels(),
                 "a black frame after a frame that was not"
             );
             for d in draws {
@@ -908,7 +908,7 @@ impl BlackFrames {
             AFTER.store(frame + 6, Ordering::Relaxed);
         }
         if AFTER.load(Ordering::Relaxed) == frame {
-            tracing::warn!(frame, levels = ?crate::capture::recent_levels(), "levels after the black frame");
+            tracing::warn!(frame, levels = ?crate::capture::CaptureFrames::recent_levels(), "levels after the black frame");
         }
         last.black = black;
         last.drawn = drawn;
