@@ -139,10 +139,10 @@ fn sweep() {
     {
         return;
     }
-    crate::pipeline::trim_library();
+    crate::pipeline::PipelineCache::trim();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
-    crate::resource::let_go_idle();
+    crate::resource::HostTextures::let_go_idle();
 }
 
 pub(crate) fn retire<T: 'static>(object: T) {
@@ -233,7 +233,7 @@ pub(crate) fn removal_context() -> String {
         "the submitting thread was {phase}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {} finished {}",
         SUBMITTING[1].load(Ordering::Relaxed),
         ms(SUBMITTING[2].load(Ordering::Relaxed)),
-        crate::pipeline::library_removal_note(),
+        crate::pipeline::PipelineCache::removal_note(),
         RETIREMENTS[0].load(Ordering::Relaxed),
         RETIREMENTS[1].load(Ordering::Relaxed),
         STARTED.load(Ordering::Relaxed),
@@ -3874,7 +3874,7 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
-        crate::descriptor::make_waiting();
+        crate::descriptor::ViewWaits::make_all();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -4455,8 +4455,8 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
-        let copy = crate::resource::host_copy(resource)?;
+        let texture = crate::resource::HostTextures::host_resource(resource)?;
+        let copy = crate::resource::HostTextures::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
@@ -4524,10 +4524,10 @@ impl HostList {
         write: bool,
     ) -> bool {
         const UNORDERED_ACCESS: u32 = 0x8;
-        let Some(twin) = crate::resource::twin(resource) else {
+        let Some(twin) = crate::resource::Twin::of(resource) else {
             return false;
         };
-        let Some(depth) = crate::resource::host_copy(resource) else {
+        let Some(depth) = crate::resource::HostTextures::host_copy(resource) else {
             return false;
         };
         let side = usize::from(colour);
@@ -4684,7 +4684,7 @@ impl HostList {
         const COPY_SOURCE: u32 = 0x800;
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
         for resource in wanted {
-            let Some(copy) = crate::resource::host_copy(resource.as_ptr()) else {
+            let Some(copy) = crate::resource::HostTextures::host_copy(resource.as_ptr()) else {
                 continue;
             };
             self.settle(&copy, COPY_SOURCE);
@@ -5927,7 +5927,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
         #[cfg(feature = "diagnostics")]
-        let drops = crate::pipeline::take_drops();
+        let drops = crate::pipeline::PipelineDrops::take();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -6035,7 +6035,7 @@ impl Meter {
                     crate::resource::PLANES[1].load(Ordering::Relaxed),
                     crate::resource::PLANES[2].load(Ordering::Relaxed)
                 ),
-                making = crate::pipeline::making(),
+                making = crate::pipeline::PipelineCache::making(),
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 cpu_pct = self.cpu_pct,

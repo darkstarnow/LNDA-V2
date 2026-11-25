@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at};
+use super::{Descriptors, VIEW_TAG, View};
 use crate::host::host;
 
 pub(crate) const FIRST_RAW_PAGE_SLOTS: u32 = 1024;
@@ -85,8 +85,8 @@ impl Spans {
     fn bytes(&mut self, desc: &[u32; 14], first: u32) -> Option<u64> {
         *self
             .sizes
-            .entry((crate::resource::placed_key(*desc), first))
-            .or_insert_with(|| crate::resource::placed_bytes_from(desc, first))
+            .entry((crate::resource::PlacedTextures::placed_key(*desc), first))
+            .or_insert_with(|| crate::resource::PlacedTextures::placed_bytes_from(desc, first))
     }
 
     fn overlapping(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
@@ -111,7 +111,7 @@ impl Spans {
 
     fn against(&self, start: u64, end: u64, desc: &[u32; 14]) -> Vec<(u64, u64)> {
         let mut spans = self.overlapping(start, end);
-        let key = crate::resource::placed_key(*desc);
+        let key = crate::resource::PlacedTextures::placed_key(*desc);
         spans.retain(|span| {
             let same = span.0 == start
                 && (span.1 == end || self.spans.get(span).is_some_and(|s| s.0 == key));
@@ -149,7 +149,12 @@ impl Spans {
         }
         self.spans
             .entry((start, end))
-            .or_insert_with(|| (crate::resource::placed_key(*desc), Default::default()))
+            .or_insert_with(|| {
+                (
+                    crate::resource::PlacedTextures::placed_key(*desc),
+                    Default::default(),
+                )
+            })
             .1
             .insert(index);
         self.by_slot.insert(index, (start, end));
@@ -494,7 +499,9 @@ impl TextureQueue {
 pub(crate) fn is_texture_view(view: &View) -> bool {
     match view {
         View::Placed(false, resource, _) => resource[0] != 1,
-        View::Shader(r, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_none(),
+        View::Shader(r, _) => {
+            crate::resource::GpuResource::buffer_bytes(*r as crate::object::This).is_none()
+        }
         _ => false,
     }
 }
@@ -547,7 +554,8 @@ fn view_stride(view: &View) -> Option<u32> {
     } else if raw {
         1
     } else {
-        crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes as u32)
+        crate::resource::ResourceFormat::element(format.0 as u32)
+            .map_or(0, |(bytes, _)| bytes as u32)
     })
 }
 
@@ -911,7 +919,7 @@ impl HostHeap {
         self.strides.as_ref().map(|s| &s.0)
     }
 
-    pub(crate) fn address_buffer(&self, heap: &super::Heap) -> Option<&ID3D12Resource> {
+    pub(crate) fn address_buffer(&self, heap: &super::DescriptorHeap) -> Option<&ID3D12Resource> {
         if let Some((buffer, _)) = self.addresses.get() {
             return Some(buffer);
         }
@@ -927,7 +935,7 @@ impl HostHeap {
             for &slot in slots.indices.iter().chain(slots.acceleration.keys()) {
                 let address = heap
                     .handle(slot)
-                    .and_then(super::view)
+                    .and_then(super::Descriptors::view)
                     .as_ref()
                     .and_then(guest_srv_address)
                     .unwrap_or(0);
@@ -984,7 +992,7 @@ impl HostHeap {
 
     pub(crate) fn demand_material_texture(
         &self,
-        heap: &super::Heap,
+        heap: &super::DescriptorHeap,
         index: u32,
         stamp: crate::material_demand::Mark,
         frame: u64,
@@ -1001,7 +1009,7 @@ impl HostHeap {
         {
             return None;
         }
-        let View::Placed(false, resource, desc) = super::checked_view(handle)? else {
+        let View::Placed(false, resource, desc) = super::Descriptors::checked_view(handle)? else {
             return None;
         };
         if resource[0] == 1 {
@@ -1009,7 +1017,7 @@ impl HostHeap {
         }
         let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
         let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-        let len = placed.bytes(&resource, crate::resource::first_mip(&desc))?;
+        let len = placed.bytes(&resource, crate::resource::PlacedTextures::first_mip(&desc))?;
         let end = start.checked_add(len)?;
         if len == 0 || start == 0 {
             return None;
@@ -1036,7 +1044,7 @@ impl HostHeap {
             || desc[4] >= resource[7] >> 16
             || textures.rechecks.contains_key(&index)
             || crate::texture::mapped_bytes(start as *const u8, usize::try_from(len).ok()?) != len
-            || crate::resource::writable_texture_overlaps(start, end)
+            || crate::resource::PlacedTextures::writable_texture_overlaps(start, end)
             || crate::texture::host_written_overlaps(start, end)
         {
             return None;
@@ -1078,7 +1086,7 @@ impl HostHeap {
         drop(textures);
         start.checked_add(len).is_some_and(|end| {
             mapped == len
-                && !crate::resource::writable_texture_overlaps(start, end)
+                && !crate::resource::PlacedTextures::writable_texture_overlaps(start, end)
                 && !crate::texture::host_written_overlaps(start, end)
         })
     }
@@ -1190,7 +1198,7 @@ impl HostHeap {
         slots.len()
     }
 
-    pub(crate) fn texture_sweep(&self, heap: &super::Heap, frame: u64) {
+    pub(crate) fn texture_sweep(&self, heap: &super::DescriptorHeap, frame: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         const SLOTS: u32 = 1 << 15;
         const EVERY_MS: u64 = 100;
@@ -1300,14 +1308,17 @@ impl HostHeap {
     }
 
     fn mapped_displaced_view(&self, index: u32, key: u64) -> Option<([u32; 14], u64, u64)> {
-        let View::Placed(false, resource, desc) = view_at(key as u32, (key >> 32) as u32)? else {
+        let View::Placed(false, resource, desc) =
+            Descriptors::view_at(key as u32, (key >> 32) as u32)?
+        else {
             return None;
         };
         let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
         let end = {
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            let end =
-                start.checked_add(placed.bytes(&resource, crate::resource::first_mip(&desc))?)?;
+            let end = start.checked_add(
+                placed.bytes(&resource, crate::resource::PlacedTextures::first_mip(&desc))?,
+            )?;
             if !matches!(
                 placed.claim(index, start, end, &resource).0,
                 Claim::Free | Claim::Own
@@ -1367,7 +1378,8 @@ impl HostHeap {
         let pivot = unmade.partition_point(|&(index, ..)| index < resume);
         let mut next = resume;
         for &(index, i, generation, other) in unmade[pivot..].iter().chain(&unmade[..pivot]) {
-            let Some(View::Placed(false, resource, desc)) = view_at(i, generation) else {
+            let Some(View::Placed(false, resource, desc)) = Descriptors::view_at(i, generation)
+            else {
                 continue;
             };
             if resource[0] == 1 {
@@ -1389,7 +1401,9 @@ impl HostHeap {
             let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let (bytes, claim, against) = {
                 let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-                let Some(bytes) = placed.bytes(&resource, crate::resource::first_mip(&desc)) else {
+                let Some(bytes) =
+                    placed.bytes(&resource, crate::resource::PlacedTextures::first_mip(&desc))
+                else {
                     continue;
                 };
                 let (claim, against) =
@@ -1451,7 +1465,7 @@ impl HostHeap {
         if key == 0 {
             return;
         }
-        match view_at(key as u32, (key >> 32) as u32) {
+        match Descriptors::view_at(key as u32, (key >> 32) as u32) {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
         }
@@ -1542,7 +1556,8 @@ impl HostHeap {
                 true
             }
             Some(View::Shader(r, _))
-                if crate::resource::buffer_bytes(*r as crate::object::This).is_none() =>
+                if crate::resource::GpuResource::buffer_bytes(*r as crate::object::This)
+                    .is_none() =>
             {
                 OBJECT_TEXTURE_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 true
@@ -1555,7 +1570,7 @@ impl HostHeap {
                 if resource[0] != 1
                     && !self.tabled_lately(index, crate::frame::FramePacer::frame()) =>
             {
-                let first = crate::resource::first_mip(desc);
+                let first = crate::resource::PlacedTextures::first_mip(desc);
                 Some((
                     resource,
                     u64::from(desc[10]) | u64::from(desc[11]) << 32,
@@ -1952,7 +1967,9 @@ impl HostHeap {
         }
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         let key = u64::from(generation) << 32 | u64::from(i);
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        let view = (tag == VIEW_TAG)
+            .then(|| Descriptors::view_at(i, generation))
+            .flatten();
         let Some(view) = view else {
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
@@ -1979,7 +1996,7 @@ impl HostHeap {
             if placed.displaced.get(&index) == Some(&key) {
                 let start = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let span = placed
-                    .bytes(resource, crate::resource::first_mip(desc))
+                    .bytes(resource, crate::resource::PlacedTextures::first_mip(desc))
                     .map(|bytes| (start, start.saturating_add(bytes)));
                 if span.is_none() || placed.by_slot.get(&index) != span.as_ref() {
                     return Ok(None);
@@ -2021,12 +2038,12 @@ impl HostHeap {
                 view.waiting_texture()
             };
             if let Some(texture) = waiting {
-                super::wait_for(texture, handle);
+                super::ViewWaits::wait_for(texture, handle);
             }
             let later = !for_draw && (view.is_buffer() || waiting.is_some());
             if later
                 && keep_views()
-                && view_at(
+                && Descriptors::view_at(
                     made[index as usize] as u32,
                     (made[index as usize] >> 32) as u32,
                 )
@@ -2086,15 +2103,17 @@ impl HostHeap {
     fn shows_placed_owner(&self, index: u32, view: &View) -> bool {
         let owner = placed_texture(view);
         let candidates = match owner.as_ref().map(|p| &p.view) {
-            Some(View::Shader(resource, _)) => {
-                [crate::resource::host_resource(*resource as _), None, None]
-            }
+            Some(View::Shader(resource, _)) => [
+                crate::resource::HostTextures::host_resource(*resource as _),
+                None,
+                None,
+            ],
             Some(View::Unordered(resource, _, _)) => {
                 let resource = *resource as crate::object::This;
                 [
-                    crate::resource::host_resource(resource),
-                    crate::resource::twin_resource(resource),
-                    crate::resource::twin_plane_resource(resource),
+                    crate::resource::HostTextures::host_resource(resource),
+                    crate::resource::Twin::resource_of(resource),
+                    crate::resource::Twin::plane_resource_of(resource),
                 ]
             }
             _ => [None; 3],
@@ -2115,7 +2134,7 @@ impl HostHeap {
             && resource[0] != 1
         {
             let start = u64::from(desc[10]) | (u64::from(desc[11]) << 32);
-            let first = crate::resource::first_mip(desc);
+            let first = crate::resource::PlacedTextures::first_mip(desc);
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let bytes = placed.bytes(resource, first).unwrap_or(0);
             let (claim, overlap) =
@@ -2157,7 +2176,7 @@ impl HostHeap {
         if key == 0 {
             return Some("null".into());
         }
-        let view = view_at(key as u32, (key >> 32) as u32)?;
+        let view = Descriptors::view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
         if let Some((address, len)) = buffer_range(&view) {
             let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
@@ -2176,7 +2195,7 @@ macro_rules! once {
 
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
-    words[0] = crate::resource::pc_format(words[0]);
+    words[0] = crate::resource::ResourceFormat::pc_format(words[0]);
     unsafe {
         std::ptr::from_ref(&words)
             .cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>()
@@ -2186,7 +2205,7 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
 
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
-    words[0] = crate::resource::pc_format(words[0]);
+    words[0] = crate::resource::ResourceFormat::pc_format(words[0]);
     unsafe {
         std::ptr::from_ref(&words)
             .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
@@ -2201,7 +2220,7 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
     } else if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 {
         4
     } else {
-        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+        crate::resource::ResourceFormat::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     }
 }
 
@@ -2243,7 +2262,7 @@ pub(crate) fn guest_srv_address(view: &View) -> Option<u64> {
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
         View::Shader(r, Some(desc)) => (
-            crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
+            crate::resource::GpuResource::buffer_bytes(*r as crate::object::This)?.0 as u64,
             desc,
         ),
         View::Placed(false, resource, desc) if resource[0] == 1 => (
@@ -2251,7 +2270,8 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
             desc[..10].try_into().ok()?,
         ),
         View::Unordered(r, _, Some(desc)) => {
-            let base = crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64;
+            let base =
+                crate::resource::GpuResource::buffer_bytes(*r as crate::object::This)?.0 as u64;
             return unordered_range(base, desc);
         }
         View::Placed(true, resource, desc) if resource[0] == 1 => {
@@ -2272,7 +2292,8 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 pub(crate) fn buffer_extent(view: &View) -> Option<(u64, u64)> {
     match view {
         View::Shader(r, Some(_)) | View::Unordered(r, _, Some(_)) => {
-            let (data, len) = crate::resource::buffer_bytes(*r as crate::object::This)?;
+            let (data, len) =
+                crate::resource::GpuResource::buffer_bytes(*r as crate::object::This)?;
             Some((data as u64, len))
         }
         View::Placed(_, resource, desc) if resource[0] == 1 => Some((
@@ -2314,7 +2335,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
         4
     } else {
-        crate::resource::element(desc.Format.0 as u32)?.0
+        crate::resource::ResourceFormat::element(desc.Format.0 as u32)?.0
     };
     Some((
         base.checked_add(buffer.FirstElement.checked_mul(element)?)?,
@@ -2347,7 +2368,7 @@ fn buffer_view_ok(
     raw: bool,
     width: u64,
 ) -> bool {
-    use crate::resource::family;
+    use crate::resource::ResourceFormat;
     let f = format.0 as u32;
     let element = if raw {
         if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 || !first.is_multiple_of(4) {
@@ -2360,8 +2381,8 @@ fn buffer_view_ok(
         }
         u64::from(stride)
     } else {
-        let typeless = family(f) == f && family(f + 1) == f;
-        match crate::resource::element(f) {
+        let typeless = ResourceFormat::family(f) == f && ResourceFormat::family(f + 1) == f;
+        match crate::resource::ResourceFormat::element(f) {
             Some((bytes, 1)) if f != 0 && !typeless && bytes > 0 => bytes,
             _ => return false,
         }
@@ -2573,7 +2594,7 @@ fn buffer_uav(
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
         4
     } else {
-        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+        crate::resource::ResourceFormat::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
     let offset = shadow.offset(address);
     let window = (desc.Format == DXGI_FORMAT_UNKNOWN)
@@ -2650,7 +2671,7 @@ fn buffer_uav(
 }
 
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
-    use crate::resource::{DEPTH_FORMATS, family};
+    use crate::resource::{DEPTH_FORMATS, ResourceFormat};
     let d = unsafe { texture.GetDesc() };
     let allowed = if unordered {
         d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
@@ -2670,7 +2691,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         );
         return false;
     }
-    let typeless = family(own) == own && family(own + 1) == own;
+    let typeless = ResourceFormat::family(own) == own && ResourceFormat::family(own + 1) == own;
     if let Some(format) = format.as_deref_mut()
         && unordered
         && let Some(&(_, linear)) = crate::resource::SRGB
@@ -2683,13 +2704,13 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if view == 0 {
         return !typeless;
     }
-    if view != own && crate::resource::target_format(view) == own {
+    if view != own && crate::resource::ResourceFormat::target_format(view) == own {
         if let Some(format) = format {
             *format = d.Format;
         }
         return true;
     }
-    if family(view) != family(own) {
+    if ResourceFormat::family(view) != ResourceFormat::family(own) {
         once!(view, own, "view format of another family");
         return false;
     }
@@ -2772,7 +2793,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
-            if let Some(texture) = crate::resource::host_resource(resource) {
+            if let Some(texture) = crate::resource::HostTextures::host_resource(resource) {
                 #[cfg(feature = "diagnostics")]
                 {
                     let own = unsafe { texture.GetDesc() }.Format.0;
@@ -2803,7 +2824,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
                 Some(Some(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
-                (crate::resource::buffer_bytes(resource), desc)
+                (crate::resource::GpuResource::buffer_bytes(resource), desc)
             {
                 buffer_srv(data as u64, len, srv_desc(desc), at)
             } else {
@@ -2812,15 +2833,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some(texture) = crate::resource::host_resource(resource) else {
-                return match (crate::resource::buffer_bytes(resource), desc) {
+            let Some(texture) = crate::resource::HostTextures::host_resource(resource) else {
+                return match (crate::resource::GpuResource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at)
                     }
                     _ => None,
                 };
             };
-            if crate::resource::depth_and_unordered(resource) {
+            if crate::resource::GpuResource::depth_and_unordered(resource) {
                 static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 512 {
                     tracing::info!(
@@ -2831,10 +2852,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
             }
             let mut desc = desc.as_ref().map(uav_desc);
-            let twin = crate::resource::twin_resource(resource)
+            let twin = crate::resource::Twin::resource_of(resource)
                 .and_then(|twin| Some((twin, twin_uav(twin, desc.as_ref())?)))
                 .or_else(|| {
-                    let twin = crate::resource::twin_plane_resource(resource)?;
+                    let twin = crate::resource::Twin::plane_resource_of(resource)?;
                     Some((twin, twin_uav(twin, desc.as_ref())?))
                 });
             let texture = match twin {
@@ -2934,7 +2955,8 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
         (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
             resource[0] != 1
                 && desc[10..12] == other_desc[10..12]
-                && crate::resource::placed_key(*resource) == crate::resource::placed_key(*other)
+                && crate::resource::PlacedTextures::placed_key(*resource)
+                    == crate::resource::PlacedTextures::placed_key(*other)
         }
         _ => false,
     }
@@ -2945,11 +2967,11 @@ fn resident_sampled_texture(view: &View) -> Option<crate::resource::ResidentText
         View::Shader(object, _) => *object as crate::object::This,
         View::Placed(false, resource, desc) if resource[0] != 1 && resource[12] & 7 == 0 => {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            crate::resource::placed_known(address, resource)?
+            crate::resource::PlacedTextures::placed_known(address, resource)?
         }
         _ => return None,
     };
-    crate::resource::resident_copy(texture)
+    crate::resource::GpuResource::resident_copy(texture)
 }
 
 pub(crate) struct PlacedTexture {
@@ -2967,14 +2989,14 @@ pub(crate) fn placed_texture(view: &View) -> Option<PlacedTexture> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let owner = if resource[12] & 4 != 0 {
-        crate::resource::writable_texture_at(address, resource)
+        crate::resource::PlacedTextures::writable_texture_at(address, resource)
     } else {
         None
     };
     let texture = match &owner {
         Some(owner) => owner.as_ptr(),
         None if *unordered => return None,
-        None => crate::resource::texture_at(address, resource)?,
+        None => crate::resource::PlacedTextures::texture_at(address, resource)?,
     };
     let words = desc[..10].try_into().ok();
     let view = if *unordered {
@@ -3057,7 +3079,8 @@ fn magenta() -> Option<&'static ID3D12Resource> {
 
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
-    let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
+    let is_buffer =
+        |r: &usize| crate::resource::GpuResource::buffer_bytes(*r as crate::object::This).is_some();
     let (buffer, dimension) = match view {
         View::Unordered(r, _, desc) => (
             is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
@@ -3244,11 +3267,16 @@ mod tests {
         desc[6] = 16;
         desc[10] = address as u32;
         desc[11] = (address >> 32) as u32;
-        super::super::create_placed_srv(std::ptr::null(), &resource, &desc, handle);
+        super::super::Descriptors::create_placed_srv(std::ptr::null(), &resource, &desc, handle);
         let mut unordered = desc;
         unordered[4] = 16;
         unordered[6] = 0;
-        super::super::create_placed_uav(std::ptr::null(), &resource, &unordered, handle + 32);
+        super::super::Descriptors::create_placed_uav(
+            std::ptr::null(),
+            &resource,
+            &unordered,
+            handle + 32,
+        );
         let verify = |shadow: &crate::shadow::Shadow| {
             for slot in 0..2 {
                 heap.mirror(slot, handle + 32 * u64::from(slot), true)
@@ -3288,8 +3316,8 @@ mod tests {
         desc[6] = 60;
         desc[10] = address as u32;
         desc[11] = (address >> 32) as u32;
-        super::super::create_placed_srv(std::ptr::null(), &resource, &desc, handle);
-        let view = super::super::view(handle).unwrap();
+        super::super::Descriptors::create_placed_srv(std::ptr::null(), &resource, &desc, handle);
+        let view = super::super::Descriptors::view(handle).unwrap();
         crate::shadow::register(3, start, 1024);
         let outer = crate::shadow::find(address, 720).unwrap();
         heap.mirror(0, handle, true).unwrap();
@@ -3815,8 +3843,8 @@ mod tests {
             resource[4] = width;
             View::Placed(false, resource, desc)
         };
-        super::super::record(handle(1).unwrap(), view(64, at));
-        super::super::record(handle(2).unwrap(), view(64, at + 0x8_0000));
+        super::super::Descriptors::record(handle(1).unwrap(), view(64, at));
+        super::super::Descriptors::record(handle(2).unwrap(), view(64, at + 0x8_0000));
         host.note_buffer(5, Some(&view(128, at + 0x8_0000)), false);
         let queued = || -> Vec<u32> {
             host.texture_slots_due(u64::MAX, 8)
@@ -3836,7 +3864,7 @@ mod tests {
         assert_eq!(queued(), [1]);
 
         for slot in 8..136 {
-            super::super::record(handle(slot).unwrap(), view(64, at));
+            super::super::Descriptors::record(handle(slot).unwrap(), view(64, at));
         }
         host.textures.lock().unwrap().remove(1);
         let next = host.sweep_part(0..136, 0, handle, 51, true, &mut counts);
@@ -3861,8 +3889,8 @@ mod tests {
         static PIXELS: [u8; 1 << 20] = [0; 1 << 20];
         let address = PIXELS.as_ptr() as u64;
         let resource = [3, 0, 0, 0, 256, 0, 256, 0x9_0001, 28, 1, 0, 0x105, 0, 0];
-        let visible = crate::resource::placed_bytes_from(&resource, 2).unwrap();
-        assert!(visible < crate::resource::placed_bytes(&resource).unwrap());
+        let visible = crate::resource::PlacedTextures::placed_bytes_from(&resource, 2).unwrap();
+        assert!(visible < crate::resource::PlacedTextures::placed_bytes(&resource).unwrap());
         let record = |address: u64, width: u32, first: u32| {
             let mut shape = resource;
             shape[4] = width;
@@ -3876,7 +3904,7 @@ mod tests {
                 1,
             ]);
             (view[10], view[11]) = (address as u32, (address >> 32) as u32);
-            let [i, generation] = super::super::words_for(View::Placed(false, shape, view));
+            let [i, generation] = super::super::Views::words_for(View::Placed(false, shape, view));
             [VIEW_TAG, i, generation]
         };
         let words = [const { std::cell::Cell::new([0u32; 3]) }; 8];
@@ -3970,7 +3998,7 @@ mod tests {
                 desc,
             )
         };
-        let len = crate::resource::placed_bytes(&[
+        let len = crate::resource::PlacedTextures::placed_bytes(&[
             3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0,
         ])
         .unwrap();
@@ -4089,14 +4117,14 @@ mod tests {
         desc[10] = address as u32;
         desc[11] = (address >> 32) as u32;
         assert!(resident_sampled_texture(&View::Placed(false, resource, desc)).is_none());
-        assert!(crate::resource::placed_known(address, &resource).is_none());
-        let texture = crate::resource::texture_at(address, &resource).unwrap();
+        assert!(crate::resource::PlacedTextures::placed_known(address, &resource).is_none());
+        let texture = crate::resource::PlacedTextures::texture_at(address, &resource).unwrap();
         let heap = HostHeap::new(false, 4).unwrap();
         let record = |view: View| {
-            let [index, generation] = super::super::words_for(view);
+            let [index, generation] = super::super::Views::words_for(view);
             [VIEW_TAG, index, generation, 0]
         };
-        let original = crate::resource::host_copy(texture).unwrap();
+        let original = crate::resource::HostTextures::host_copy(texture).unwrap();
         desc[4] = 1;
         let placed = resident_sampled_texture(&View::Placed(false, resource, desc)).unwrap();
         let object = resident_sampled_texture(&View::Shader(texture as usize, None)).unwrap();
@@ -4118,7 +4146,7 @@ mod tests {
             heap.mirror_queued(2, unavailable.as_ptr() as u64, write, true)
                 .is_err()
         );
-        assert!(crate::resource::placed_known(address, &other).is_none());
+        assert!(crate::resource::PlacedTextures::placed_known(address, &other).is_none());
         assert!(device_removed().is_none());
     }
 

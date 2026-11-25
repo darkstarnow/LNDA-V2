@@ -240,7 +240,7 @@ pub fn wait_for_previous() {
 
 fn end() {
     #[cfg(windows)]
-    leonida_graphics::pipeline::save_pipeline_cache();
+    leonida_graphics::pipeline::PipelineCache::save();
     unsafe { TerminateProcess(GetCurrentProcess(), 0) };
 }
 

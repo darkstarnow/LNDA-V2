@@ -577,7 +577,7 @@ fn log_memory() {
     let made: Vec<u64> = crate::host::MADE.iter().map(|m| m.load(Relaxed)).collect();
     let windows = crate::shadow::windows();
     let stagings = crate::texture::let_go();
-    let census = crate::resource::census();
+    let census = crate::resource::HostTextures::census();
     let kinds: Vec<u64> = crate::resource::KINDS
         .iter()
         .map(|k| k.load(Relaxed))
@@ -601,7 +601,7 @@ fn log_memory() {
             WALKING.store(false, Relaxed);
         }
     }
-    let kept = crate::pipeline::kept();
+    let kept = crate::pipeline::ShaderStore::kept();
     tracing::info!(
         "memory kept beside the lines below: {} shader containers {:.0} MB, {} translations \
          {:.0} MB; the pipeline library's file {:.0} MB (its last save wrote {:.0} MB)",
@@ -668,7 +668,7 @@ fn log_memory() {
         staged[2],
         textures[0],
         mb(textures[1]),
-        crate::resource::placed_textures(),
+        crate::resource::HostTextures::placed_textures(),
         made[0],
         mb(made[1]),
         made[2],
@@ -678,11 +678,11 @@ fn log_memory() {
     );
     tracing::info!(
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; LEONIDA_PLACED_FILLER=1 keeps it)",
-        crate::resource::placed_filler_twins()
+        crate::resource::PlacedTextures::placed_filler_twins()
     );
     let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
     let window = crate::shadow::window_use();
-    let views = crate::descriptor::views_kept();
+    let views = crate::descriptor::Views::kept();
     let own: Vec<u64> = OWN.iter().map(|o| o.load(Relaxed)).collect();
     tracing::info!(
         "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",

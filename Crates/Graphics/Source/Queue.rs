@@ -674,7 +674,7 @@ impl CommandQueue {
         pool_pages: u32,
         _flags: u32,
     ) -> HRESULT {
-        let Some(map) = crate::resource::page_mapper() else {
+        let Some(map) = crate::resource::MemoryHooks::page_mapper() else {
             return E_INVALIDARG;
         };
         if batches.is_null() && count > 0 {
@@ -853,16 +853,16 @@ impl Presenter {
     #[cfg(windows)]
     fn show(resource: This, frame: u64) {
         let (Some(texture), Some(host)) = (
-            crate::resource::host_resource(resource),
+            crate::resource::HostTextures::host_resource(resource),
             crate::host::host(),
         ) else {
             return;
         };
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
+        let state = crate::resource::HostTextures::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
         let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
+        crate::resource::HostTextures::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         BlackFrames::observe(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]

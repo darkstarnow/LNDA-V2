@@ -26,7 +26,9 @@ fn kinds() -> &'static [(u64, u32, u32)] {
 
 pub(crate) fn wanted(resource: This) -> bool {
     let kinds = kinds();
-    !kinds.is_empty() && crate::resource::texture_kind(resource).is_some_and(|k| kinds.contains(&k))
+    !kinds.is_empty()
+        && crate::resource::PlacedTextures::texture_kind(resource)
+            .is_some_and(|k| kinds.contains(&k))
 }
 
 pub(crate) struct Back {
@@ -83,7 +85,7 @@ pub(crate) fn record(
 ) -> Option<Back> {
     let host = crate::host::host()?;
     let resource = retained.as_ptr();
-    let (layout, at, size) = crate::resource::title_texture(resource)?;
+    let (layout, at, size) = crate::resource::PlacedTextures::title_texture(resource)?;
     at.checked_add(size)?;
     let desc = unsafe { texture.GetDesc() };
     let mips = u32::from(desc.MipLevels);
@@ -128,7 +130,7 @@ pub(crate) fn record(
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
     COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let kind = crate::resource::texture_kind(resource);
+    let kind = crate::resource::PlacedTextures::texture_kind(resource);
     Some(Back {
         _resource: retained,
         mapping,

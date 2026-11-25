@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn speculation_stops_before_heap_growth_and_confirmed_accesses_can_still_grow() {
-        use crate::descriptor::{create_srv, host::HostHeap};
+        use crate::descriptor::{Descriptors, host::HostHeap};
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -619,7 +619,7 @@ mod tests {
             0,
             0,
         ];
-        create_srv(std::ptr::null(), std::ptr::null(), &view, handle);
+        Descriptors::create_srv(std::ptr::null(), std::ptr::null(), &view, handle);
         heap.mirror(1, handle, false).unwrap();
         let direct = last + 5 * PAGE;
         memory.prepare_addresses(&heap, &[last, direct], &[]);
@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn raw_builder_maps_headers_named_by_the_view_heap_without_a_shader_table() {
-        use crate::descriptor::{create_srv, host::HostHeap};
+        use crate::descriptor::{Descriptors, host::HostHeap};
         use std::ptr::null;
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -710,7 +710,7 @@ mod tests {
                 0,
                 0,
             ];
-            create_srv(null(), null(), &desc, handle);
+            Descriptors::create_srv(null(), null(), &desc, handle);
             heap.mirror(1, handle, false).unwrap();
         };
         install(start + 256);

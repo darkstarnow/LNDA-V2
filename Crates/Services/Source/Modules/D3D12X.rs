@@ -11,8 +11,11 @@ extern "system" fn create_device(
     iid: *const Iid,
     out: *mut *const Object,
 ) -> HRESULT {
-    leonida_graphics::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
-    leonida_graphics::resource::use_page_mapper(super::xmem::map_alias);
+    leonida_graphics::resource::MemoryHooks::use_allocator(
+        super::xmem::XMemAlloc,
+        super::xmem::XMemFree,
+    );
+    leonida_graphics::resource::MemoryHooks::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
     leonida_graphics::on_failure(host_gpu_failed);
     device::Device::create(adapter, parameters, iid, out)
@@ -30,7 +33,7 @@ fn host_gpu_failed(what: &str) -> ! {
 pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(windows)]
     {
-        leonida_graphics::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
+        leonida_graphics::pipeline::PipelineCache::use_dir(dir.with_file_name("pipelines"));
         leonida_graphics::shader_cache::use_shader_cache(dir);
     }
     #[cfg(not(windows))]
@@ -38,7 +41,7 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
 }
 
 #[cfg(windows)]
-pub use leonida_graphics::pipeline::{save_pipeline_cache, warm};
+pub use leonida_graphics::pipeline::{PipelineCache, ShaderStore};
 
 pub(crate) fn module() -> ServiceModule {
     ServiceModule {

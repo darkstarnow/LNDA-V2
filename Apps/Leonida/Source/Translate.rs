@@ -341,7 +341,9 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                             let Some(stage) = stage else { continue };
                             let compute = pipelines && stage == "compute";
                             let (translated, pipeline) =
-                                leonida_services::modules::d3d12x::warm(stage, bytes, compute);
+                                leonida_services::modules::d3d12x::ShaderStore::warm(
+                                    stage, bytes, compute,
+                                );
                             let count = if translated { &done } else { &refused };
                             let n = count.fetch_add(1, Ordering::Relaxed) + 1;
                             match pipeline {
@@ -358,7 +360,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             });
         }
     }
-    leonida_services::modules::d3d12x::save_pipeline_cache();
+    leonida_services::modules::d3d12x::PipelineCache::save();
     println!(
         "warm         {} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
         done.into_inner(),

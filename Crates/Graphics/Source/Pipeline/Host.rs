@@ -175,9 +175,9 @@ impl GraphicsState {
                         .zip(&self.names)
                         .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
                             SemanticName: PCSTR(name.as_ptr().cast()),
-                            Format: DXGI_FORMAT(
-                                crate::resource::pc_format(e.Format.0 as u32) as i32
-                            ),
+                            Format: DXGI_FORMAT(crate::resource::ResourceFormat::pc_format(
+                                e.Format.0 as u32,
+                            ) as i32),
                             ..*e
                         })
                         .collect();
@@ -193,13 +193,15 @@ impl GraphicsState {
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
                     for f in &mut self.targets.RTFormats {
-                        f.0 = crate::resource::target_format(crate::resource::pc_format(f.0 as u32))
-                            as i32;
+                        f.0 = crate::resource::ResourceFormat::target_format(
+                            crate::resource::ResourceFormat::pc_format(f.0 as u32),
+                        ) as i32;
                     }
                 }
                 16 => {
                     let f = data.cast::<u32>().read_unaligned();
-                    self.depth_format = DXGI_FORMAT(crate::resource::pc_format(f) as i32);
+                    self.depth_format =
+                        DXGI_FORMAT(crate::resource::ResourceFormat::pc_format(f) as i32);
                 }
                 17 => self.samples = data.cast::<DXGI_SAMPLE_DESC>().read_unaligned(),
                 _ => {}
@@ -276,7 +278,8 @@ impl GraphicsState {
                 } else {
                     e.AlignedByteOffset
                 };
-                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
+                let bytes =
+                    crate::resource::ResourceFormat::element(format).map_or(0, |(b, _)| b as u32);
                 next[slot] = offset + bytes;
                 Input {
                     slot: slot as u32,

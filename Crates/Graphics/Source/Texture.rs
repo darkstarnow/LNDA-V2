@@ -65,8 +65,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
     let (Some(to), Some(from)) = (
-        crate::resource::host_resource(placed),
-        crate::resource::host_resource(source),
+        crate::resource::HostTextures::host_resource(placed),
+        crate::resource::HostTextures::host_resource(source),
     ) else {
         return false;
     };
@@ -335,13 +335,13 @@ pub(crate) fn host_written(resource: This) {
         set.get_or_insert_with(Default::default)
             .insert(resource as usize)
     };
-    if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
+    if new && let Some((at, desc)) = crate::resource::GpuResource::texture_memory(resource) {
         let words = unsafe {
             std::ptr::from_ref(&desc)
                 .cast::<[u32; 14]>()
                 .read_unaligned()
         };
-        let bytes = crate::resource::placed_bytes(&words).unwrap_or(u64::MAX);
+        let bytes = crate::resource::PlacedTextures::placed_bytes(&words).unwrap_or(u64::MAX);
         if !at.is_null() && bytes > 0 {
             HOST_WRITTEN_AT
                 .lock()
@@ -986,8 +986,9 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     {
         return Some(s.clone());
     }
-    let (memory, desc) = crate::resource::texture_memory(resource)?;
-    let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
+    let (memory, desc) = crate::resource::GpuResource::texture_memory(resource)?;
+    let Some(layout) =
+        crate::resource::ResourceLayout::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
         once!(
             ?desc,
@@ -1097,16 +1098,16 @@ mod first_mip_tests {
     #[test]
     fn a_2d_view_names_its_first_mip() {
         assert_eq!(
-            crate::resource::first_mip(&[71, 4, 0x1688, 0, 4, 5, 0, 0, 0, 0]),
+            crate::resource::PlacedTextures::first_mip(&[71, 4, 0x1688, 0, 4, 5, 0, 0, 0, 0]),
             4
         );
         assert_eq!(
-            crate::resource::first_mip(&[71, 5, 0x1688, 0, 4, 5, 0, 0, 0, 0]),
+            crate::resource::PlacedTextures::first_mip(&[71, 5, 0x1688, 0, 4, 5, 0, 0, 0, 0]),
             0,
             "an array view"
         );
         assert_eq!(
-            crate::resource::first_mip(&[71, 4, 0x1688, 0, 99, 5, 0, 0, 0, 0]),
+            crate::resource::PlacedTextures::first_mip(&[71, 4, 0x1688, 0, 99, 5, 0, 0, 0, 0]),
             15
         );
     }
@@ -1146,7 +1147,7 @@ mod title_memory_tests {
         unsafe { memory.cast::<u8>().write_bytes(0x57, 2 * page) };
         let mut title = std::ptr::null();
         assert_eq!(
-            crate::resource::create_at_address(
+            crate::resource::PlacedTextures::create_at_address(
                 std::ptr::null_mut(),
                 at as u64,
                 &desc,
@@ -1158,7 +1159,7 @@ mod title_memory_tests {
             0
         );
         let owner = unsafe { IUnknown::from_raw(title.cast_mut().cast()) };
-        let host = crate::resource::host_copy(title).unwrap();
+        let host = crate::resource::HostTextures::host_copy(title).unwrap();
         let staging = super::staging(title, &host.texture, 0).unwrap();
         assert!(staging.size <= page);
         for (range, overlapping) in [(at + page..at + 2 * page, false), (at..at + page, true)] {
@@ -1265,7 +1266,7 @@ mod title_memory_tests {
                 3, 0, 0, 0, 16, 0, height, 65537, 10, 1, 0, 256, 3_145_728, 0,
             ];
             let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
-            let layout = crate::resource::texture_layout(&desc)
+            let layout = crate::resource::ResourceLayout::texture_layout(&desc)
                 .expect("a console layout")
                 .planes[0]
                 .layout

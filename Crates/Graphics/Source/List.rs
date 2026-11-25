@@ -461,8 +461,9 @@ impl CommandList {
     #[cfg(windows)]
     fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
         use windows::core::Interface;
-        let host =
-            |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+        let host = |r: This| {
+            crate::resource::HostTextures::host_resource(r).map(|h| h.as_raw().cast_const().cast())
+        };
         match b.kind {
             0 => {
                 const BEGIN_ONLY: u32 = 1;
@@ -496,7 +497,7 @@ impl CommandList {
                 first: if b.first.is_null() {
                     b.first
                 } else {
-                    match crate::resource::twin_resource(b.first) {
+                    match crate::resource::Twin::resource_of(b.first) {
                         Some(twin) => twin.as_raw().cast_const().cast(),
                         None => host(b.first)?,
                     }
@@ -520,7 +521,7 @@ impl CommandList {
             if barriers.iter().any(|b| {
                 b.kind != 1
                     && !b.first.is_null()
-                    && crate::resource::buffer_bytes(b.first).is_some()
+                    && crate::resource::GpuResource::buffer_bytes(b.first).is_some()
             }) {
                 host.push(UAV_BARRIER);
                 #[cfg(feature = "diagnostics")]
@@ -554,7 +555,7 @@ impl CommandList {
 
     #[cfg(windows)]
     fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
-        let (data, size) = crate::resource::buffer_bytes(buffer)?;
+        let (data, size) = crate::resource::GpuResource::buffer_bytes(buffer)?;
         let end = offset.checked_add(len)?;
         if end > size {
             tracing::warn!(offset, len, size, "copy outside its buffer");
@@ -584,7 +585,8 @@ impl CommandList {
 
     #[cfg(windows)]
     fn unlike(dst: This, src: This) -> bool {
-        let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
+        let unlike = crate::resource::GpuResource::stands_in(dst)
+            != crate::resource::GpuResource::stands_in(src);
         if unlike {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -605,8 +607,8 @@ impl CommandList {
                 return;
             };
             if let (Some(to), Some(from)) = (
-                crate::resource::host_resource(dst),
-                crate::resource::host_resource(src),
+                crate::resource::HostTextures::host_resource(dst),
+                crate::resource::HostTextures::host_resource(src),
             ) {
                 if Self::unlike(dst, src) {
                     return;
@@ -623,8 +625,8 @@ impl CommandList {
                 list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
                 unsafe { list.list.CopyResource(to, from) };
             } else if let (Some((to, a)), Some((from, b))) = (
-                crate::resource::buffer_bytes(dst),
-                crate::resource::buffer_bytes(src),
+                crate::resource::GpuResource::buffer_bytes(dst),
+                crate::resource::GpuResource::buffer_bytes(src),
             ) {
                 list.defer_copy(to, from, a.min(b) as usize);
             }
@@ -658,7 +660,7 @@ impl CommandList {
             else {
                 return;
             };
-            let Some(to) = crate::resource::host_resource(dst.resource) else {
+            let Some(to) = crate::resource::HostTextures::host_resource(dst.resource) else {
                 static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let made = Self::read_back(list, dst, x, y, z, src, source_box);
@@ -670,13 +672,14 @@ impl CommandList {
                     {
                         return;
                     }
-                    let source = crate::resource::host_resource(src.resource).map(|r| {
-                        let d = unsafe { r.GetDesc() };
-                        format!(
-                            "{}x{} f{} mips {}",
-                            d.Width, d.Height, d.Format.0, d.MipLevels
-                        )
-                    });
+                    let source =
+                        crate::resource::HostTextures::host_resource(src.resource).map(|r| {
+                            let d = unsafe { r.GetDesc() };
+                            format!(
+                                "{}x{} f{} mips {}",
+                                d.Width, d.Height, d.Format.0, d.MipLevels
+                            )
+                        });
                     tracing::info!(
                         copies = n,
                         made = ?made,
@@ -717,7 +720,8 @@ impl CommandList {
                 }
                 _upload = buffer;
             } else {
-                let Some(texture) = crate::resource::host_resource(src.resource) else {
+                let Some(texture) = crate::resource::HostTextures::host_resource(src.resource)
+                else {
                     return;
                 };
                 list.twin_use(src.resource, false, false);
@@ -801,7 +805,8 @@ impl CommandList {
         let bytes = pitch * (rows - 1) + row;
         let data = Self::buffer_range(dst.resource, dst.footprint.offset, bytes)
             .ok_or("a destination outside its buffer")?;
-        let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+        let texture =
+            crate::resource::HostTextures::host_resource(src.resource).ok_or("no host texture")?;
         let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
         list.twin_use(src.resource, false, false);
         if crate::texture::title_written(texture) {
@@ -865,8 +870,8 @@ impl CommandList {
         #[cfg(windows)]
         if let Some(list) = Self::host_list(this)
             && let (Some(to), Some(from)) = (
-                crate::resource::host_resource(dst),
-                crate::resource::host_resource(src),
+                crate::resource::HostTextures::host_resource(dst),
+                crate::resource::HostTextures::host_resource(src),
             )
         {
             use windows::Win32::Foundation::RECT;
@@ -889,7 +894,7 @@ impl CommandList {
             list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
             unsafe {
                 let (a, b) = (to.GetDesc(), from.GetDesc());
-                let format = if crate::resource::stands_in(dst) {
+                let format = if crate::resource::GpuResource::stands_in(dst) {
                     a.Format
                 } else {
                     DXGI_FORMAT(format as i32)
@@ -931,13 +936,14 @@ impl CommandList {
     ) {
         #[cfg(windows)]
         {
-            let (Some(list), Some(record)) =
-                (Self::host_list(this), crate::descriptor::rtv_record(handle))
-            else {
+            let (Some(list), Some(record)) = (
+                Self::host_list(this),
+                crate::descriptor::RtvRecord::rtv(handle),
+            ) else {
                 return;
             };
             let (Some(texture), Some(host)) = (
-                crate::resource::host_resource(record.resource),
+                crate::resource::HostTextures::host_resource(record.resource),
                 crate::host::host(),
             ) else {
                 return;
@@ -977,13 +983,14 @@ impl CommandList {
         #[cfg(windows)]
         {
             use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
-            let (Some(list), Some(record)) =
-                (Self::host_list(this), crate::descriptor::dsv_record(handle))
-            else {
+            let (Some(list), Some(record)) = (
+                Self::host_list(this),
+                crate::descriptor::RtvRecord::dsv(handle),
+            ) else {
                 return;
             };
             let (Some(texture), Some(host)) = (
-                crate::resource::host_resource(record.resource),
+                crate::resource::HostTextures::host_resource(record.resource),
                 crate::host::host(),
             ) else {
                 return;
@@ -993,7 +1000,7 @@ impl CommandList {
             const DEPTH_WRITE: u32 = 0x10;
             list.twin_use(record.resource, false, true);
             Self::ensure_state(list, record.resource, DEPTH_WRITE);
-            if crate::resource::depth_and_unordered(record.resource) {
+            if crate::resource::GpuResource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[2]
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1060,7 +1067,7 @@ impl CommandList {
         const BINARY: u32 = 1;
         const TIMESTAMP: u32 = 2;
         const PIPELINE_STATISTICS: u32 = 3;
-        let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
+        let Some((data, size)) = crate::resource::GpuResource::buffer_bytes(buffer) else {
             return;
         };
         let (what, bytes) = match kind {
@@ -1083,7 +1090,7 @@ impl CommandList {
     }
 
     extern "system" fn set_pipeline(this: This, pipeline: This) {
-        crate::pipeline::bound(pipeline);
+        crate::pipeline::PipelineState::bound(pipeline);
         #[cfg(windows)]
         Self::with_state(this, |_, state| state.set_pipeline(pipeline));
         #[cfg(not(windows))]
@@ -1147,8 +1154,10 @@ impl CommandList {
             }
             return;
         };
-        let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-        let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+        let address =
+            crate::resource::GpuResource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
+        let counter =
+            crate::resource::GpuResource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
         let mut ran = false;
         #[cfg(windows)]
         if let ([[kind, ..]], Some(address)) = (args, address)
@@ -1169,7 +1178,7 @@ impl CommandList {
                 Self::with_state(this, |_, state| state.invalid_indirect());
             }
             #[cfg(all(windows, feature = "diagnostics"))]
-            crate::pipeline::note_why(format!(
+            crate::pipeline::PipelineDrops::note_why(format!(
                 "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
                 address.is_some(),
                 count.is_null() || counter.is_some()
@@ -1719,30 +1728,33 @@ mod state {
 }
 
 #[cfg(not(windows))]
+#[allow(non_upper_case_globals)]
 mod state {
-    pub(super) use super::CommandList::draw as draw_indexed;
-    pub(super) use super::CommandList::draw as dispatch_mesh;
-    pub(super) use super::CommandList::draw as dispatch_mesh_x;
-    pub(super) use super::CommandList::ignored_state as blend_factor;
-    pub(super) use super::CommandList::ignored_state as compute_constant;
-    pub(super) use super::CommandList::ignored_state as compute_constants;
-    pub(super) use super::CommandList::ignored_state as compute_table;
-    pub(super) use super::CommandList::ignored_state as compute_view;
-    pub(super) use super::CommandList::ignored_state as graphics_constant;
-    pub(super) use super::CommandList::ignored_state as graphics_constants;
-    pub(super) use super::CommandList::ignored_state as graphics_table;
-    pub(super) use super::CommandList::ignored_state as graphics_view;
-    pub(super) use super::CommandList::ignored_state as heaps;
-    pub(super) use super::CommandList::ignored_state as index_buffer;
-    pub(super) use super::CommandList::ignored_state as scissors;
-    pub(super) use super::CommandList::ignored_state as stencil_ref;
-    pub(super) use super::CommandList::ignored_state as depth_bounds;
-    pub(super) use super::CommandList::ignored_state as targets;
-    pub(super) use super::CommandList::ignored_state as topology;
-    pub(super) use super::CommandList::ignored_state as vertex_buffers;
-    pub(super) use super::CommandList::ignored_state as viewports;
-    pub(super) use super::dispatch;
-    pub(super) use super::draw;
+    use super::{CommandList, This};
+
+    pub(super) const draw_indexed: extern "system" fn(This) = CommandList::draw;
+    pub(super) const dispatch_mesh: extern "system" fn(This) = CommandList::draw;
+    pub(super) const dispatch_mesh_x: extern "system" fn(This) = CommandList::draw;
+    pub(super) const blend_factor: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const compute_constant: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const compute_constants: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const compute_table: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const compute_view: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const graphics_constant: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const graphics_constants: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const graphics_table: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const graphics_view: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const heaps: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const index_buffer: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const scissors: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const stencil_ref: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const depth_bounds: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const targets: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const topology: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const vertex_buffers: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const viewports: extern "system" fn(This) = CommandList::ignored_state;
+    pub(super) const dispatch: extern "system" fn(This) = CommandList::dispatch;
+    pub(super) const draw: extern "system" fn(This) = CommandList::draw;
 }
 
 static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

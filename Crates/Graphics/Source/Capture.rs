@@ -368,7 +368,7 @@ pub(crate) fn read_input(
     resource: usize,
 ) -> Option<InputDump> {
     let host = crate::host::host()?;
-    let copy = crate::resource::host_copy(resource as crate::object::This)?;
+    let copy = crate::resource::HostTextures::host_copy(resource as crate::object::This)?;
     let desc = unsafe { copy.texture.GetDesc() };
     if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
         || desc.DepthOrArraySize != 1
@@ -449,7 +449,10 @@ pub(crate) fn dump_with_input(
     if input.is_none() && !recording_listed() {
         return;
     }
-    let after = named_after(hashes, &crate::pipeline::shaders_of(pipeline));
+    let after = named_after(
+        hashes,
+        &crate::pipeline::PipelineState::shaders_of(pipeline),
+    );
     let Some(hash) = after.or_else(|| input.as_ref().map(|i| &i.selector.hash)) else {
         return;
     };
@@ -477,7 +480,8 @@ pub(crate) fn dump_with_input(
         return;
     };
     for (i, &resource) in textures.iter().enumerate() {
-        let Some(copy) = crate::resource::host_copy(resource as crate::object::This) else {
+        let Some(copy) = crate::resource::HostTextures::host_copy(resource as crate::object::This)
+        else {
             continue;
         };
         let d = unsafe { copy.texture.GetDesc() };
@@ -723,7 +727,7 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     if !targets.iter().any(|&(r, _)| r == resource as usize)
-        && let Some(copy) = crate::resource::host_copy(resource)
+        && let Some(copy) = crate::resource::HostTextures::host_copy(resource)
     {
         targets.push((resource as usize, copy));
     }

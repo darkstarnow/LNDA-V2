@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use crate::descriptor::{
-    Heap, View,
+    DescriptorHeap, View,
     host::{HostHeap, buffer_copy},
 };
 use crate::host::HostList;
@@ -112,7 +112,7 @@ impl Sampler {
     }
 }
 
-pub(crate) fn wants(heap: &Heap, offset: u32, fields: &'static [u32]) -> bool {
+pub(crate) fn wants(heap: &DescriptorHeap, offset: u32, fields: &'static [u32]) -> bool {
     static SAMPLER: OnceLock<Mutex<Sampler>> = OnceLock::new();
     let mut sampler = SAMPLER
         .get_or_init(Default::default)
@@ -120,7 +120,7 @@ pub(crate) fn wants(heap: &Heap, offset: u32, fields: &'static [u32]) -> bool {
         .unwrap_or_else(|e| e.into_inner());
     sampler.select(
         crate::frame::FramePacer::frame(),
-        (heap as *const Heap as usize, offset, fields),
+        (heap as *const DescriptorHeap as usize, offset, fields),
     )
 }
 
@@ -176,7 +176,7 @@ fn indices(words: &[u32], fields: &[u32], count: u32) -> Vec<u32> {
 
 pub(crate) fn record(
     list: &HostList,
-    heap: &Heap,
+    heap: &DescriptorHeap,
     table: u64,
     record: u32,
     fields: &'static [u32],
@@ -194,7 +194,9 @@ pub(crate) fn record(
     let Some(ticket) = Ticket::take() else { return };
     let Some(host) = heap.host() else { return };
     let stamp = host.material_write_stamp();
-    let Some(view @ View::Placed(false, _, _)) = crate::descriptor::checked_view(handle) else {
+    let Some(view @ View::Placed(false, _, _)) =
+        crate::descriptor::Descriptors::checked_view(handle)
+    else {
         return;
     };
     let Some((source, address, len)) = buffer_copy(&view) else {
@@ -280,14 +282,19 @@ pub(crate) fn record(
 }
 
 impl Mailbox {
-    pub(crate) fn take(&self, heap: &Heap, host: &HostHeap, frame: u64) -> Vec<(u32, u64, bool)> {
+    pub(crate) fn take(
+        &self,
+        heap: &DescriptorHeap,
+        host: &HostHeap,
+        frame: u64,
+    ) -> Vec<(u32, u64, bool)> {
         let observations = std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()));
         let mut priority = Vec::new();
         for obs in observations {
             if frame.abs_diff(obs.frame) > MAX_AGE
                 || heap
                     .handle(obs.source_slot)
-                    .and_then(crate::descriptor::checked_view)
+                    .and_then(crate::descriptor::Descriptors::checked_view)
                     .as_ref()
                     != Some(&obs.view)
                 || !obs
