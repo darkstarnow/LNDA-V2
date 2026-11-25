@@ -1541,7 +1541,7 @@ impl PlacedTextures {
             return None;
         }
         map.insert((address, *desc), out as usize);
-        crate::texture::placed_in_host_written(address, desc);
+        crate::texture::HostWrites::note_placed(address, desc);
         GpuResource::from_this(out)
             .host
             .placed
@@ -1718,7 +1718,10 @@ impl HostTextures {
                     continue;
                 };
                 if layout.size == 0
-                    || crate::texture::committed(memory as *const u8, layout.size as usize)
+                    || crate::texture::TitleMemoryMap::committed(
+                        memory as *const u8,
+                        layout.size as usize,
+                    )
                 {
                     continue;
                 }
@@ -1728,7 +1731,10 @@ impl HostTextures {
                 let there = |from: u64, to: u64| {
                     (0..u64::from(layout.slices)).all(|slice| {
                         let at = memory as u64 + slice * layout.slice_size + from;
-                        crate::texture::committed(at as *const u8, (to - from) as usize)
+                        crate::texture::TitleMemoryMap::committed(
+                            at as *const u8,
+                            (to - from) as usize,
+                        )
                     })
                 };
                 let all: u64 = mips.iter().map(texels).sum::<u64>().max(1);
@@ -1764,7 +1770,8 @@ impl HostTextures {
                 for &(at, len) in list {
                     n[0] += 1;
                     n[1] += len;
-                    let there = crate::texture::mapped_bytes(at as *const u8, len as usize);
+                    let there =
+                        crate::texture::TitleMemoryMap::mapped_bytes(at as *const u8, len as usize);
                     if len > 0 && there >= len {
                         n[2] += 1;
                         n[3] += len;
@@ -1864,7 +1871,7 @@ impl HostTextures {
         let all = PlacedTextures::tracked();
         for &at in all.iter() {
             let r = unsafe { &*(at as *const GpuResource) };
-            if !GpuResource::fills(&r.desc) || crate::texture::host_wrote(at) {
+            if !GpuResource::fills(&r.desc) || crate::texture::HostWrites::wrote(at) {
                 continue;
             }
             let gone = {
@@ -1875,7 +1882,7 @@ impl HostTextures {
                         && crate::host::references(&host.texture) == 1
                 });
                 if idle {
-                    crate::texture::unstage(at as This);
+                    crate::texture::TextureUploads::unstage(at as This);
                     made.take()
                 } else {
                     None
@@ -1926,7 +1933,7 @@ impl HostTextures {
                     if placed && host.filled {
                         placed_filled += 1;
                         if placed_filled.is_multiple_of(EVERY)
-                            && !crate::texture::committed(r.data().cast_const(), 1)
+                            && !crate::texture::TitleMemoryMap::committed(r.data().cast_const(), 1)
                         {
                             count[8] += host.bytes * EVERY;
                             if crate::host::references(&host.texture) > 1 {
@@ -2245,7 +2252,7 @@ impl Drop for GpuResource {
                 crate::host::retire(twin);
             }
         }
-        crate::texture::forget(
+        crate::texture::HostWrites::forget(
             std::ptr::from_ref::<GpuResource>(self) as usize,
             self.data() as u64,
         );
@@ -2596,7 +2603,9 @@ mod tests {
             let expected = mips == 1 && flags == 0;
             assert_eq!(layout.addressable(), mips == 1);
             assert_eq!(
-                crate::texture::title_written(HostTextures::host_resource(image).unwrap()),
+                crate::texture::TextureUploads::title_written(
+                    HostTextures::host_resource(image).unwrap()
+                ),
                 flags == 0
             );
             let data = unsafe {
@@ -2652,7 +2661,7 @@ mod tests {
             };
             slot::<Copy>(list, 0x80)(list, &dst, 0, 0, 0, &src, null.cast());
             assert_eq!(
-                crate::texture::is_staged(image),
+                crate::texture::TextureUploads::is_staged(image),
                 expected,
                 "mips={mips}, flags={flags}"
             );

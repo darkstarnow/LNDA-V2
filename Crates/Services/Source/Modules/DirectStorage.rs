@@ -918,7 +918,7 @@ fn into_destination(
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill_virtual_destination(out, fill, leonida_graphics::title_bytes_written);
+        return fill_virtual_destination(out, fill, leonida_graphics::TitleMemory::bytes_written);
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
@@ -977,7 +977,7 @@ fn fill_virtual_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
     publish: impl FnOnce(&[u8]),
 ) -> Result<(), HRESULT> {
-    leonida_graphics::kernel_will_write(out.as_ptr() as usize, out.len());
+    leonida_graphics::TitleMemory::will_write(out.as_ptr() as usize, out.len());
     let produced = fill(out)?;
     let written = out.get(..produced).ok_or(INVALID_DATA)?;
     if !written.is_empty() {

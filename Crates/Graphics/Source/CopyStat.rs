@@ -572,11 +572,11 @@ fn log_memory() {
     let (working, private) = process_memory();
     let (free, left) = system_memory();
     let copies = crate::shadow::memory();
-    let staged = crate::texture::memory();
+    let staged = crate::texture::TextureUploads::memory();
     let textures = [0, 1].map(|i| crate::resource::HOST_TEXTURES[i].load(Relaxed));
     let made: Vec<u64> = crate::host::MADE.iter().map(|m| m.load(Relaxed)).collect();
     let windows = crate::shadow::windows();
-    let stagings = crate::texture::let_go();
+    let stagings = crate::texture::TextureUploads::let_go();
     let census = crate::resource::HostTextures::census();
     let kinds: Vec<u64> = crate::resource::KINDS
         .iter()

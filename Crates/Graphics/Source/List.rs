@@ -613,14 +613,14 @@ impl CommandList {
                 if Self::unlike(dst, src) {
                     return;
                 }
-                if crate::texture::title_written(from) {
-                    crate::texture::upload(list, src, from);
+                if crate::texture::TextureUploads::title_written(from) {
+                    crate::texture::TextureUploads::upload(list, src, from);
                 }
                 list.twin_use(dst, false, true);
                 list.twin_use(src, false, false);
                 Self::ensure_state(list, dst, COPY_DEST);
                 Self::ensure_state(list, src, COPY_SOURCE);
-                crate::texture::host_written(dst);
+                crate::texture::HostWrites::note(dst);
                 #[cfg(feature = "diagnostics")]
                 list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
                 unsafe { list.list.CopyResource(to, from) };
@@ -725,15 +725,15 @@ impl CommandList {
                     return;
                 };
                 list.twin_use(src.resource, false, false);
-                if crate::texture::title_written(texture) {
-                    crate::texture::upload(list, src.resource, texture);
+                if crate::texture::TextureUploads::title_written(texture) {
+                    crate::texture::TextureUploads::upload(list, src.resource, texture);
                 }
                 Self::ensure_state(list, src.resource, COPY_SOURCE);
                 from.resource = texture.as_raw().cast_const().cast();
             }
             list.twin_use(dst.resource, false, true);
             Self::ensure_state(list, dst.resource, COPY_DEST);
-            crate::texture::host_written(dst.resource);
+            crate::texture::HostWrites::note(dst.resource);
             let mut to_location = dst;
             to_location.resource = to.as_raw().cast_const().cast();
             let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -809,8 +809,8 @@ impl CommandList {
             crate::resource::HostTextures::host_resource(src.resource).ok_or("no host texture")?;
         let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
         list.twin_use(src.resource, false, false);
-        if crate::texture::title_written(texture) {
-            crate::texture::upload(list, src.resource, texture);
+        if crate::texture::TextureUploads::title_written(texture) {
+            crate::texture::TextureUploads::upload(list, src.resource, texture);
         }
         Self::ensure_state(list, src.resource, COPY_SOURCE);
         let mut from = src;
@@ -889,7 +889,7 @@ impl CommandList {
             list.twin_use(src, false, false);
             Self::ensure_state(list, dst, RESOLVE_DEST);
             Self::ensure_state(list, src, RESOLVE_SOURCE);
-            crate::texture::host_written(dst);
+            crate::texture::HostWrites::note(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
             unsafe {
@@ -1027,8 +1027,8 @@ impl CommandList {
         {
             let len = len as usize;
             list.defer(move || {
-                if crate::texture::committed(src as *const u8, len)
-                    && crate::texture::committed(dst as *const u8, len)
+                if crate::texture::TitleMemoryMap::committed(src as *const u8, len)
+                    && crate::texture::TitleMemoryMap::committed(dst as *const u8, len)
                 {
                     unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
                 }
@@ -1790,7 +1790,7 @@ impl ValueWait {
         }
         static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *ASK.get_or_init(|| std::env::var_os("LEONIDA_WAIT_ASK").is_some_and(|v| v == "1"))
-            && !crate::texture::committed(self.address as *const u8, bytes)
+            && !crate::texture::TitleMemoryMap::committed(self.address as *const u8, bytes)
         {
             return true;
         }

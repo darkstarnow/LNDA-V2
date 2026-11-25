@@ -1914,7 +1914,7 @@ impl Shadow {
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter()
-            .any(|(a, e)| match crate::watch::asked(a, e) {
+            .any(|(a, e)| match crate::watch::WriteJournal::asked(a, e) {
                 Some((_, written)) => written.into_iter().any(|(page, write)| {
                     page >= base
                         && copied
@@ -1953,7 +1953,7 @@ impl Shadow {
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
         for (a, e) in busy {
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let Some((now, written)) = crate::watch::WriteJournal::writes(a, e, true) else {
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2062,7 +2062,7 @@ impl Shadow {
 
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some((now, written)) = crate::watch::WriteJournal::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);

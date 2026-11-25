@@ -1087,7 +1087,7 @@ mod tests {
                 ),
                 S_OK
             );
-            crate::texture::host_written(raw);
+            crate::texture::HostWrites::note(raw);
             unsafe { IUnknown::from_raw(raw.cast_mut().cast()) }
         };
         let large = owner(512);
@@ -1099,7 +1099,7 @@ mod tests {
                 expected
             );
             assert_eq!(
-                crate::texture::host_written_overlaps(range.0, range.1),
+                crate::texture::HostWrites::overlaps(range.0, range.1),
                 expected
             );
         };

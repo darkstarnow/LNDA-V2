@@ -492,7 +492,7 @@ fn written(slice: &Slice, n: usize) {
     };
     shown.sort_unstable();
     for run in shown.chunk_by(|a, b| a + PAGE == *b) {
-        leonida_graphics::kernel_will_write(run[0], run.len() * PAGE);
+        leonida_graphics::TitleMemory::will_write(run[0], run.len() * PAGE);
     }
 }
 
@@ -546,7 +546,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     };
     let mut physical = physical();
     let _changing =
-        leonida_graphics::title_memory_remapping_range(physical.unmap_extent(base, end));
+        leonida_graphics::TitleMemory::remapping_range(physical.unmap_extent(base, end));
     unmap(&mut physical, base, len);
     if pages.is_null() {
         return address;
@@ -618,7 +618,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         return false;
     }
     let mut physical = physical();
-    let _changing = leonida_graphics::title_memory_remapping_range(physical.unmap_extent(to, end));
+    let _changing = leonida_graphics::TitleMemory::remapping_range(physical.unmap_extent(to, end));
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -681,7 +681,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
-    leonida_graphics::title_memory_remapped(base, len);
+    leonida_graphics::TitleMemory::remapped(base, len);
     leonida_graphics::title_memory_view(
         base,
         len,
@@ -806,7 +806,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
-        leonida_graphics::title_memory_remapped(at, size);
+        leonida_graphics::TitleMemory::remapped(at, size);
         unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
@@ -1134,7 +1134,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut reads = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let _reading = leonida_graphics::title_memory_reading_range(first..first + 1);
+                    let _reading = leonida_graphics::TitleMemory::reading_range(first..first + 1);
                     assert_eq!(unsafe { (first as *const u8).read_volatile() }, 1);
                     reads += 1;
                 }
@@ -1146,7 +1146,7 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         assert!(reader.join().expect("the reader never faulted") > 0);
-        let first_page = leonida_graphics::title_memory_reading_range(first..first + 1);
+        let first_page = leonida_graphics::TitleMemory::reading_range(first..first + 1);
         let (started, starting) = std::sync::mpsc::channel();
         let (done, ended) = std::sync::mpsc::channel();
         let page = pages[1];

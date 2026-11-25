@@ -740,7 +740,7 @@ impl State {
                     self.roots_ref(compute).get(usize::from(word.slot))
                 && table != 0
                 && let Some(handle) = table.checked_add(u64::from(word.dword) * 4)
-                && crate::texture::committed(handle as *const u8, 12)
+                && crate::texture::TitleMemoryMap::committed(handle as *const u8, 12)
                 && let Some(address) = crate::descriptor::Descriptors::view(handle)
                     .as_ref()
                     .and_then(crate::descriptor::host::guest_srv_address)
@@ -1643,7 +1643,10 @@ impl State {
                     crate::resource::PlacedTextures::first_mip(&desc),
                 )
                 .unwrap_or(1);
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                let mapped = crate::texture::TitleMemoryMap::mapped_bytes(
+                    address as *const u8,
+                    len as usize,
+                );
                 if recovered && !host.material_upload_allowed(index, write, address, len, mapped) {
                     host.texture_slot_done(index, write, None);
                     continue;
@@ -1660,7 +1663,7 @@ impl State {
                         host.texture_slot_later(index, write, frame, most);
                         continue;
                     }
-                    if !crate::texture::committed(address as *const u8, 1) {
+                    if !crate::texture::TitleMemoryMap::committed(address as *const u8, 1) {
                         HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
                     }
                     partly = Some(mapped);
@@ -1711,14 +1714,14 @@ impl State {
                 }
             };
             let title_fills = crate::resource::HostTextures::host_resource(resource)
-                .is_some_and(crate::texture::title_written);
+                .is_some_and(crate::texture::TextureUploads::title_written);
             if !title_fills {
                 host.texture_slot_done(index, write, None);
                 continue;
             }
-            let tabled = crate::texture::is_staged(resource);
+            let tabled = crate::texture::TextureUploads::is_staged(resource);
             if tabled {
-                crate::texture::upload_again(resource);
+                crate::texture::TextureUploads::upload_again(resource);
             }
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
@@ -1737,7 +1740,8 @@ impl State {
                 crate::host::log_removal_context();
                 return;
             }
-            let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
+            let (bytes, whole) =
+                crate::texture::TextureUploads::staged(resource).unwrap_or((0, true));
             let again = match partly {
                 Some(mapped) => Some((frame + 1, mapped)),
                 None => (!whole).then_some((frame + 120, 0)),
@@ -1751,11 +1755,11 @@ impl State {
                 continue;
             }
             let memory = if again.is_none() && heap_recheck() {
-                crate::texture::staged_memory(resource)
+                crate::texture::TextureUploads::staged_memory(resource)
             } else {
                 None
             };
-            crate::texture::unstage(resource);
+            crate::texture::TextureUploads::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
@@ -1765,7 +1769,7 @@ impl State {
                     index,
                     frame,
                     (at, len),
-                    crate::texture::fingerprint(at, len),
+                    crate::texture::TitleMemoryMap::fingerprint(at, len),
                 );
             }
         }
@@ -2707,7 +2711,7 @@ impl State {
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
             list.defer_host(move || {
-                let _mapped = crate::watch::title_memory_reading();
+                let _mapped = crate::watch::TitleMemory::reading();
                 let (src, dst) = unsafe {
                     (
                         std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
@@ -3194,11 +3198,13 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     }
     match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
-            let aliased = crate::resource::GpuResource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            let aliased =
+                crate::resource::GpuResource::alias_of(*resource as This).is_some_and(|source| {
+                    crate::texture::TextureUploads::alias(list, *resource as This, source)
+                });
             if !aliased
                 && let Some(t) = crate::resource::HostTextures::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+                && crate::texture::TextureUploads::title_written(t)
             {
                 let first = match (&placed, view) {
                     (Some(_), View::Shader(_, Some(desc))) => {
@@ -3206,7 +3212,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                     }
                     _ => 0,
                 };
-                crate::texture::upload_from(list, *resource as This, t, first);
+                crate::texture::TextureUploads::upload_from(list, *resource as This, t, first);
             }
             list.twin_use(*resource as This, false, false);
             let (tested, _) = TESTED_DEPTH.get();
@@ -3271,7 +3277,7 @@ fn print_4k(at: u64) -> String {
 
 #[cfg(feature = "diagnostics")]
 fn memory_state(at: u64, bytes: u64) -> String {
-    let mapped = crate::texture::mapped_bytes(at as *const u8, bytes as usize);
+    let mapped = crate::texture::TitleMemoryMap::mapped_bytes(at as *const u8, bytes as usize);
     let last = at + bytes.saturating_sub(4096);
     format!(
         "memory={at:#x} mapped={mapped}/{bytes} first4k={} last4k={}",
@@ -3291,7 +3297,7 @@ fn texture_state(this: This) -> String {
             .read_unaligned()
     };
     let bytes = crate::resource::PlacedTextures::placed_bytes(&words).unwrap_or(0);
-    let staged = match crate::texture::staged_state(this) {
+    let staged = match crate::texture::TextureUploads::staged_state(this) {
         Some((uploaded, dirty)) => format!("staged=yes uploaded={uploaded} dirty={dirty}"),
         None => "staged=no".into(),
     };
@@ -3302,7 +3308,7 @@ fn texture_state(this: This) -> String {
         words[8],
         words[7] >> 16,
         crate::resource::GpuResource::host_made(this).is_some(),
-        crate::texture::host_wrote(this as usize),
+        crate::texture::HostWrites::wrote(this as usize),
         crate::resource::GpuResource::title_fills(this),
         memory_state(at as u64, bytes)
     )
@@ -3375,7 +3381,8 @@ fn describe(view: Option<&View>) -> String {
             u64::from(d[10]) | u64::from(d[11]) << 32
         ),
         Some(View::Constant(address, size))
-            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
+            if *size >= 16
+                && crate::texture::TitleMemoryMap::committed(*address as *const u8, 16) =>
         {
             let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
             format!("Constant({address:#x}, {size}) {v:?}")

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 pub(crate) const PAGE: usize = 64 << 10;
 const KERNEL_PAGE: usize = 4096;
 
-struct Journal {
+pub(crate) struct WriteJournal {
     asked: u64,
     written: BTreeMap<usize, u64>,
     found: Vec<usize>,
@@ -14,7 +14,7 @@ struct Journal {
     kept: bool,
 }
 
-static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
+static JOURNAL: Mutex<WriteJournal> = Mutex::new(WriteJournal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
@@ -26,252 +26,9 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
-pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
-    let mut pieces: Vec<(usize, usize)> = ranges
-        .iter()
-        .filter(|r| r.0 < r.1)
-        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
-        .collect();
-    if pieces.len() < 2 {
-        return;
-    }
-    pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    if j.kept {
-        return;
-    }
-    j.asked += 1;
-    j.ahead_asked = j.asked;
-    j.ahead.clear();
-    let mut i = 0;
-    while i < pieces.len() {
-        let first = pieces[i].0;
-        let mut last = pieces[i].1;
-        let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
-            last = last.max(pieces[k].1);
-            k += 1;
-        }
-        ask_run(j, &pieces[i..k]);
-        i = k;
-    }
-}
-
 #[cfg(feature = "diagnostics")]
 static SLOW: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
-
-#[cfg(feature = "diagnostics")]
-fn slow(us: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    if us >= 1000 {
-        SLOW[0].fetch_add(1, Relaxed);
-        SLOW[1].fetch_add(us, Relaxed);
-    }
-    SLOW[2].fetch_max(us, Relaxed);
-}
-
-#[cfg(feature = "diagnostics")]
-pub(crate) fn slow_asks() -> [u64; 3] {
-    [0, 1, 2].map(|i| SLOW[i].swap(0, std::sync::atomic::Ordering::Relaxed))
-}
-
-pub(crate) fn ask_ahead_done() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if !j.kept {
-        j.ahead.clear();
-    }
-}
-
-pub(crate) fn once() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_ASK_ONCE").is_none_or(|v| v != "0"))
-}
-
-pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
-    if !once() {
-        return;
-    }
-    ask_once_end();
-    ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    if j.ahead.is_empty() {
-        j.asked += 1;
-        j.ahead_asked = j.asked;
-    }
-    for &(start, end) in ranges {
-        if start >= end {
-            continue;
-        }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
-            j.ahead.push((first, last));
-        }
-    }
-    j.kept = !j.ahead.is_empty();
-}
-
-pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if j.kept {
-        j.kept = false;
-        j.ahead.clear();
-    }
-}
-
-pub(crate) fn wrote(at: usize, len: usize) {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if !j.kept || len == 0 {
-        return;
-    }
-    j.asked += 1;
-    let now = j.asked;
-    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
-    }
-}
-
-fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
-    if pieces.len() < 2 {
-        return;
-    }
-    let first = pieces[0].0;
-    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if ask_kernel(j, first, last) {
-        j.ahead.push((first, last));
-        return;
-    }
-    let (a, b) = pieces.split_at(pieces.len() / 2);
-    ask_run(j, a);
-    ask_run(j, b);
-}
-
-fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    if failed {
-        return false;
-    }
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-        slow(started.elapsed().as_micros() as u64);
-    }
-    let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
-    }
-    true
-}
-
-pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| {
-            (
-                j.ahead_asked,
-                j.written
-                    .range(first..last)
-                    .map(|(&p, &w)| (p, w))
-                    .collect(),
-            )
-        })
-}
-
-pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
-    }
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
-        }
-        #[cfg(feature = "diagnostics")]
-        let guarding = std::time::Instant::now();
-        let written = guard(first * PAGE, last * PAGE);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(
-            crate::copystat::C::GuardUs,
-            guarding.elapsed().as_micros() as u64,
-        );
-        written?
-    } else {
-        Vec::new()
-    };
-    #[cfg(feature = "diagnostics")]
-    {
-        use crate::copystat::{C, add};
-        add(C::Watches, 1);
-        add(C::WatchUs, started.elapsed().as_micros() as u64);
-        slow(started.elapsed().as_micros() as u64);
-    }
-    j.asked += 1;
-    let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
-    }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
-}
 
 const BLOCK: usize = PAGE;
 
@@ -336,260 +93,25 @@ impl CleanBlocks {
     }
 }
 
-struct Guards {
+pub(crate) struct PageGuards {
     protected: BTreeSet<usize>,
     clean: CleanBlocks,
     absent: BTreeSet<usize>,
     aliased: BTreeSet<usize>,
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
+static GUARDS: Mutex<PageGuards> = Mutex::new(PageGuards {
     protected: BTreeSet::new(),
     clean: CleanBlocks(BTreeMap::new()),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known =
-        !*ASK.get_or_init(|| std::env::var_os("LEONIDA_GUARD_ASK").is_some_and(|v| v == "1")) && {
-            let g = guards();
-            let first = start / BLOCK;
-            g.protected.contains(&first) || g.absent.contains(&first)
-        };
-    if !known && !is_view(start, end) {
-        return None;
-    }
-    install();
-    let mut g = guards();
-    let mut written = Vec::new();
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    let mut uncommitted_until = first;
-    for gap in g.clean.gaps(first, last) {
-        let mut run = None;
-        for block in gap.clone() {
-            if g.absent.contains(&block) {
-                if block >= uncommitted_until {
-                    uncommitted_until = uncommitted_end(block);
-                }
-                if block < uncommitted_until {
-                    if let Some(from) = run.take() {
-                        protect(&mut g, from, block);
-                    }
-                    continue;
-                }
-                g.absent.remove(&block);
-            }
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
-                g.clean.insert(block, block + 1);
-            } else {
-                run.get_or_insert(block);
-                continue;
-            }
-            if let Some(from) = run.take() {
-                protect(&mut g, from, block);
-            }
-        }
-        if let Some(from) = run.take() {
-            protect(&mut g, from, gap.end);
-        }
-    }
-    Some(written)
-}
-
-fn is_view(start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
-    };
-    static HOLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let holes =
-        *HOLES.get_or_init(|| std::env::var_os("LEONIDA_GUARD_HOLES").is_none_or(|v| v != "0"));
-    let mut at = start;
-    loop {
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 {
-            return false;
-        }
-        if info.Type == MEM_MAPPED {
-            return true;
-        }
-        if info.State == MEM_COMMIT || !holes {
-            return false;
-        }
-        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
-        if next <= at || next >= end {
-            return true;
-        }
-        at = next;
-    }
-}
-
-fn protect(g: &mut Guards, from: usize, to: usize) {
-    protect_here(g, from, to);
-    if !view_guard() {
-        return;
-    }
-    for (base, bytes) in
-        crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK))
-    {
-        let first = (base / BLOCK).max(from);
-        let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
-        for block in first..last {
-            let shown = crate::inplace::pages_of(block * BLOCK);
-            if shown.len() < 2 || shown.len() > MANY_VIEWS {
-                continue;
-            }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for alias in shown {
-                let alias = alias / BLOCK;
-                g.aliased.insert(alias);
-                if alias != block {
-                    protect_alias(g, alias);
-                }
-            }
-        }
-    }
-}
-
 pub(crate) const MANY_VIEWS: usize = 64;
-
-fn view_guard() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_VIEW_GUARD").is_none_or(|v| v != "0"))
-}
 
 #[cfg(feature = "diagnostics")]
 pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
-
-fn protect_alias(g: &mut Guards, block: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    if g.protected.contains(&block) {
-        return;
-    }
-    let mut old = 0;
-    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
-        g.protected.insert(block);
-    }
-}
-
-fn protect_here(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    let set = |from: usize, to: usize| {
-        let mut old = 0;
-        unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
-        }
-    };
-    let note = |g: &mut Guards, from: usize, to: usize| {
-        g.protected.extend(from..to);
-        g.clean.insert(from, to);
-    };
-    if set(from, to) {
-        note(g, from, to);
-        return;
-    }
-    for block in from..to {
-        if set(block, block + 1) {
-            note(g, block, block + 1);
-        } else if block < uncommitted_end(block) {
-            g.absent.insert(block);
-        }
-    }
-}
-
-fn uncommitted_end(block: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{
-        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
-    };
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
-    if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
-        (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
-    } else {
-        block
-    }
-}
-
-fn open(g: &mut Guards, start: usize, end: usize) -> bool {
-    let any = open_here(g, start, end);
-    if start >= end || g.aliased.is_empty() {
-        return any;
-    }
-    let aliased: Vec<usize> = g
-        .aliased
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for block in aliased {
-        g.aliased.remove(&block);
-        for alias in crate::inplace::pages_of(block * BLOCK) {
-            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
-                #[cfg(feature = "diagnostics")]
-                ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            g.aliased.remove(&(alias / BLOCK));
-        }
-    }
-    any
-}
-
-fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(block);
-        let mut old = 0;
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
-    }
-    !blocks.is_empty()
-}
-
-pub fn writing(at: usize, len: usize) {
-    open(&mut guards(), at, at.saturating_add(len));
-    crate::descriptor::host::remapped(at, len);
-}
-
-pub fn title_bytes_written(bytes: &[u8]) {
-    if !bytes.is_empty() {
-        crate::descriptor::host::remapped(bytes.as_ptr() as usize, bytes.len());
-    }
-}
-
-pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
-    if !view_guard() {
-        return;
-    }
-    let ranges = crate::inplace::views_of_section(section, offset, len);
-    if ranges.is_empty() {
-        return;
-    }
-    let mut g = guards();
-    for &(at, n) in &ranges {
-        if open_here(&mut g, at, at.saturating_add(n)) {
-            #[cfg(feature = "diagnostics")]
-            ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
 
 struct Mapping {
     changing: Option<Range<usize>>,
@@ -601,16 +123,630 @@ static MAPPING: Mutex<Mapping> = Mutex::new(Mapping {
     readers: Vec::new(),
 });
 static WRITER: Mutex<()> = Mutex::new(());
-static MAPPING_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
-const ALL_MEMORY: Range<usize> = 0..usize::MAX;
 
-fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
-    a.start.max(b.start) < a.end.min(b.end)
+pub struct TitleMemory;
+
+impl WriteJournal {
+    pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+        let mut pieces: Vec<(usize, usize)> = ranges
+            .iter()
+            .filter(|r| r.0 < r.1)
+            .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+            .collect();
+        if pieces.len() < 2 {
+            return;
+        }
+        pieces.sort_unstable();
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let j = &mut *j;
+        if j.kept {
+            return;
+        }
+        j.asked += 1;
+        j.ahead_asked = j.asked;
+        j.ahead.clear();
+        let mut i = 0;
+        while i < pieces.len() {
+            let first = pieces[i].0;
+            let mut last = pieces[i].1;
+            let mut k = i + 1;
+            while k < pieces.len()
+                && pieces[k].0 <= last + AHEAD_GAP
+                && last.max(pieces[k].1) - first <= AHEAD_MAX
+            {
+                last = last.max(pieces[k].1);
+                k += 1;
+            }
+            WriteJournal::ask_run(j, &pieces[i..k]);
+            i = k;
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn slow(us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if us >= 1000 {
+            SLOW[0].fetch_add(1, Relaxed);
+            SLOW[1].fetch_add(us, Relaxed);
+        }
+        SLOW[2].fetch_max(us, Relaxed);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn slow_asks() -> [u64; 3] {
+        [0, 1, 2].map(|i| SLOW[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub(crate) fn ask_ahead_done() {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !j.kept {
+            j.ahead.clear();
+        }
+    }
+
+    pub(crate) fn once() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_ASK_ONCE").is_none_or(|v| v != "0"))
+    }
+
+    pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
+        if !WriteJournal::once() {
+            return;
+        }
+        WriteJournal::ask_once_end();
+        WriteJournal::ask_ahead(ranges);
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let j = &mut *j;
+        if j.ahead.is_empty() {
+            j.asked += 1;
+            j.ahead_asked = j.asked;
+        }
+        for &(start, end) in ranges {
+            if start >= end {
+                continue;
+            }
+            let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+            if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+                && WriteJournal::ask_kernel(j, first, last)
+            {
+                j.ahead.push((first, last));
+            }
+        }
+        j.kept = !j.ahead.is_empty();
+    }
+
+    pub(crate) fn ask_once_end() {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if j.kept {
+            j.kept = false;
+            j.ahead.clear();
+        }
+    }
+
+    pub(crate) fn wrote(at: usize, len: usize) {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if !j.kept || len == 0 {
+            return;
+        }
+        j.asked += 1;
+        let now = j.asked;
+        for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+            j.written.insert(page, now);
+        }
+    }
+
+    fn ask_run(j: &mut WriteJournal, pieces: &[(usize, usize)]) {
+        if pieces.len() < 2 {
+            return;
+        }
+        let first = pieces[0].0;
+        let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+        if WriteJournal::ask_kernel(j, first, last) {
+            j.ahead.push((first, last));
+            return;
+        }
+        let (a, b) = pieces.split_at(pieces.len() / 2);
+        WriteJournal::ask_run(j, a);
+        WriteJournal::ask_run(j, b);
+    }
+
+    fn ask_kernel(j: &mut WriteJournal, first: usize, last: usize) -> bool {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const WRITE_WATCH_FLAG_RESET: u32 = 1;
+        let mut count = (last - first) * PAGE / KERNEL_PAGE;
+        j.found.resize(count.max(j.found.len()), 0);
+        let mut granularity = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        if failed {
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+            WriteJournal::slow(started.elapsed().as_micros() as u64);
+        }
+        let now = j.ahead_asked;
+        for k in 0..count {
+            let page = j.found[k] / PAGE;
+            j.written.insert(page, now);
+        }
+        true
+    }
+
+    pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.ahead
+            .iter()
+            .any(|&(a, b)| a <= first && last <= b)
+            .then(|| {
+                (
+                    j.ahead_asked,
+                    j.written
+                        .range(first..last)
+                        .map(|(&p, &w)| (p, w))
+                        .collect(),
+                )
+            })
+    }
+
+    pub(crate) fn writes(
+        start: usize,
+        end: usize,
+        guarded: bool,
+    ) -> Option<(u64, Vec<(usize, u64)>)> {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const WRITE_WATCH_FLAG_RESET: u32 = 1;
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let j = &mut *j;
+        if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            return Some((
+                j.ahead_asked,
+                j.written
+                    .range(first..last)
+                    .map(|(&p, &w)| (p, w))
+                    .collect(),
+            ));
+        }
+        let mut count = (last - first) * PAGE / KERNEL_PAGE;
+        j.found.resize(count.max(j.found.len()), 0);
+        let mut granularity = 0;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        let guarded = if failed {
+            count = 0;
+            if !guarded {
+                return None;
+            }
+            #[cfg(feature = "diagnostics")]
+            let guarding = std::time::Instant::now();
+            let written = PageGuards::guard(first * PAGE, last * PAGE);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::GuardUs,
+                guarding.elapsed().as_micros() as u64,
+            );
+            written?
+        } else {
+            Vec::new()
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+            WriteJournal::slow(started.elapsed().as_micros() as u64);
+        }
+        j.asked += 1;
+        let now = j.asked;
+        let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
+        for page in pages.collect::<Vec<_>>() {
+            j.written.insert(page, now);
+        }
+        Some((
+            now,
+            j.written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        ))
+    }
+}
+
+impl PageGuards {
+    fn lock() -> std::sync::MutexGuard<'static, PageGuards> {
+        GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+        static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let known = !*ASK
+            .get_or_init(|| std::env::var_os("LEONIDA_GUARD_ASK").is_some_and(|v| v == "1"))
+            && {
+                let g = PageGuards::lock();
+                let first = start / BLOCK;
+                g.protected.contains(&first) || g.absent.contains(&first)
+            };
+        if !known && !PageGuards::is_view(start, end) {
+            return None;
+        }
+        TitleMemory::install();
+        let mut g = PageGuards::lock();
+        let mut written = Vec::new();
+        let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+        let mut uncommitted_until = first;
+        for gap in g.clean.gaps(first, last) {
+            let mut run = None;
+            for block in gap.clone() {
+                if g.absent.contains(&block) {
+                    if block >= uncommitted_until {
+                        uncommitted_until = PageGuards::uncommitted_end(block);
+                    }
+                    if block < uncommitted_until {
+                        if let Some(from) = run.take() {
+                            PageGuards::protect(&mut g, from, block);
+                        }
+                        continue;
+                    }
+                    g.absent.remove(&block);
+                }
+                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                if g.protected.contains(&block) {
+                    g.clean.insert(block, block + 1);
+                } else {
+                    run.get_or_insert(block);
+                    continue;
+                }
+                if let Some(from) = run.take() {
+                    PageGuards::protect(&mut g, from, block);
+                }
+            }
+            if let Some(from) = run.take() {
+                PageGuards::protect(&mut g, from, gap.end);
+            }
+        }
+        Some(written)
+    }
+
+    fn is_view(start: usize, end: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        };
+        static HOLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let holes =
+            *HOLES.get_or_init(|| std::env::var_os("LEONIDA_GUARD_HOLES").is_none_or(|v| v != "0"));
+        let mut at = start;
+        loop {
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            if n == 0 {
+                return false;
+            }
+            if info.Type == MEM_MAPPED {
+                return true;
+            }
+            if info.State == MEM_COMMIT || !holes {
+                return false;
+            }
+            let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+            if next <= at || next >= end {
+                return true;
+            }
+            at = next;
+        }
+    }
+
+    fn protect(g: &mut PageGuards, from: usize, to: usize) {
+        PageGuards::protect_here(g, from, to);
+        if !PageGuards::view_guard() {
+            return;
+        }
+        for (base, bytes) in
+            crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK))
+        {
+            let first = (base / BLOCK).max(from);
+            let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
+            for block in first..last {
+                let shown = crate::inplace::pages_of(block * BLOCK);
+                if shown.len() < 2 || shown.len() > MANY_VIEWS {
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for alias in shown {
+                    let alias = alias / BLOCK;
+                    g.aliased.insert(alias);
+                    if alias != block {
+                        PageGuards::protect_alias(g, alias);
+                    }
+                }
+            }
+        }
+    }
+
+    fn view_guard() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_VIEW_GUARD").is_none_or(|v| v != "0"))
+    }
+
+    fn protect_alias(g: &mut PageGuards, block: usize) {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        if g.protected.contains(&block) {
+            return;
+        }
+        let mut old = 0;
+        if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) }
+            != 0
+        {
+            g.protected.insert(block);
+        }
+    }
+
+    fn protect_here(g: &mut PageGuards, from: usize, to: usize) {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        let set = |from: usize, to: usize| {
+            let mut old = 0;
+            unsafe {
+                VirtualProtect(
+                    (from * BLOCK) as *const _,
+                    (to - from) * BLOCK,
+                    PAGE_READONLY,
+                    &mut old,
+                ) != 0
+            }
+        };
+        let note = |g: &mut PageGuards, from: usize, to: usize| {
+            g.protected.extend(from..to);
+            g.clean.insert(from, to);
+        };
+        if set(from, to) {
+            note(g, from, to);
+            return;
+        }
+        for block in from..to {
+            if set(block, block + 1) {
+                note(g, block, block + 1);
+            } else if block < PageGuards::uncommitted_end(block) {
+                g.absent.insert(block);
+            }
+        }
+    }
+
+    fn uncommitted_end(block: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        };
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+        if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
+            (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
+        } else {
+            block
+        }
+    }
+
+    fn open(g: &mut PageGuards, start: usize, end: usize) -> bool {
+        let any = PageGuards::open_here(g, start, end);
+        if start >= end || g.aliased.is_empty() {
+            return any;
+        }
+        let aliased: Vec<usize> = g
+            .aliased
+            .range(start / BLOCK..end.div_ceil(BLOCK))
+            .copied()
+            .collect();
+        for block in aliased {
+            g.aliased.remove(&block);
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                if alias / BLOCK != block
+                    && PageGuards::open_here(g, alias, alias.saturating_add(BLOCK))
+                {
+                    #[cfg(feature = "diagnostics")]
+                    ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                g.aliased.remove(&(alias / BLOCK));
+            }
+        }
+        any
+    }
+
+    fn open_here(g: &mut PageGuards, start: usize, end: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        let blocks: Vec<usize> = g
+            .protected
+            .range(start / BLOCK..end.div_ceil(BLOCK))
+            .copied()
+            .collect();
+        for &block in &blocks {
+            g.protected.remove(&block);
+            g.clean.remove(block);
+            let mut old = 0;
+            unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        }
+        !blocks.is_empty()
+    }
+}
+
+impl TitleMemory {
+    pub fn will_write(at: usize, len: usize) {
+        PageGuards::open(&mut PageGuards::lock(), at, at.saturating_add(len));
+        crate::descriptor::host::remapped(at, len);
+    }
+
+    pub fn bytes_written(bytes: &[u8]) {
+        if !bytes.is_empty() {
+            crate::descriptor::host::remapped(bytes.as_ptr() as usize, bytes.len());
+        }
+    }
+
+    pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
+        if !PageGuards::view_guard() {
+            return;
+        }
+        let ranges = crate::inplace::views_of_section(section, offset, len);
+        if ranges.is_empty() {
+            return;
+        }
+        let mut g = PageGuards::lock();
+        for &(at, n) in &ranges {
+            if PageGuards::open_here(&mut g, at, at.saturating_add(n)) {
+                #[cfg(feature = "diagnostics")]
+                ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn remapping() -> Remapping {
+        TitleMemory::remapping_range(ALL_MEMORY)
+    }
+
+    pub fn remapping_range(range: Range<usize>) -> Remapping {
+        let writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+        state.changing = Some(range.clone());
+        drop(
+            MAPPING_CHANGED
+                .wait_while(state, |s| {
+                    s.readers.iter().any(|r| Mapping::overlaps(r, &range))
+                })
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        let previous = crate::inplace::physical_spans(&range);
+        Remapping {
+            _writer: writer,
+            range,
+            previous,
+        }
+    }
+
+    pub fn reading() -> Reading {
+        TitleMemory::reading_range(ALL_MEMORY)
+    }
+
+    pub fn reading_range(range: Range<usize>) -> Reading {
+        let state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
+        MAPPING_CHANGED
+            .wait_while(state, |s| s.changing(&range))
+            .unwrap_or_else(|e| e.into_inner())
+            .pin(range)
+    }
+
+    pub(crate) fn reading_now(range: Range<usize>) -> Option<Reading> {
+        let mut state = match MAPPING.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        (!state.changing(&range)).then(|| state.pin(range))
+    }
+
+    pub fn remapped(at: usize, len: usize) {
+        crate::descriptor::host::remapped(at, len);
+        crate::inplace::views_gone(at, len);
+        crate::inplace::title_memory_freeing(at, len);
+        let mut g = PageGuards::lock();
+        let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+        let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
+        for block in absent {
+            g.absent.remove(&block);
+        }
+        let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+        for block in blocks {
+            g.protected.remove(&block);
+            g.clean.remove(block);
+        }
+        let aliased: Vec<usize> = g
+            .aliased
+            .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
+            .copied()
+            .collect();
+        for block in aliased {
+            g.aliased.remove(&block);
+        }
+    }
+
+    fn install() {
+        use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+            EXCEPTION_POINTERS,
+        };
+        unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+            let r = unsafe { &*(*info).ExceptionRecord };
+            const WRITE: usize = 1;
+            if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+                || r.NumberParameters < 2
+                || r.ExceptionInformation[0] != WRITE
+            {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let at = r.ExceptionInformation[1];
+            let mut g = PageGuards::lock();
+            if PageGuards::open(&mut g, at, at + 1) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            if TitleMemory::writable(at) {
+                EXCEPTION_CONTINUE_EXECUTION
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            }
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            AddVectoredExceptionHandler(1, Some(on_write));
+        });
+    }
+
+    fn writable(at: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+        };
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+    }
 }
 
 impl Mapping {
+    fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
+        a.start.max(b.start) < a.end.min(b.end)
+    }
+}
+
+static MAPPING_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+const ALL_MEMORY: Range<usize> = 0..usize::MAX;
+
+impl Mapping {
     fn changing(&self, range: &Range<usize>) -> bool {
-        self.changing.as_ref().is_some_and(|w| overlaps(w, range))
+        self.changing
+            .as_ref()
+            .is_some_and(|w| Mapping::overlaps(w, range))
     }
 
     fn pin(&mut self, range: Range<usize>) -> Reading {
@@ -623,27 +759,6 @@ pub struct Remapping {
     _writer: std::sync::MutexGuard<'static, ()>,
     range: Range<usize>,
     previous: Vec<crate::inplace::PhysicalSpan>,
-}
-
-pub fn title_memory_remapping() -> Remapping {
-    title_memory_remapping_range(ALL_MEMORY)
-}
-
-pub fn title_memory_remapping_range(range: Range<usize>) -> Remapping {
-    let writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
-    let mut state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
-    state.changing = Some(range.clone());
-    drop(
-        MAPPING_CHANGED
-            .wait_while(state, |s| s.readers.iter().any(|r| overlaps(r, &range)))
-            .unwrap_or_else(|e| e.into_inner()),
-    );
-    let previous = crate::inplace::physical_spans(&range);
-    Remapping {
-        _writer: writer,
-        range,
-        previous,
-    }
 }
 
 impl Drop for Remapping {
@@ -670,95 +785,6 @@ impl Drop for Reading {
             MAPPING_CHANGED.notify_all();
         }
     }
-}
-
-pub fn title_memory_reading() -> Reading {
-    title_memory_reading_range(ALL_MEMORY)
-}
-
-pub fn title_memory_reading_range(range: Range<usize>) -> Reading {
-    let state = MAPPING.lock().unwrap_or_else(|e| e.into_inner());
-    MAPPING_CHANGED
-        .wait_while(state, |s| s.changing(&range))
-        .unwrap_or_else(|e| e.into_inner())
-        .pin(range)
-}
-
-pub(crate) fn title_memory_reading_now(range: Range<usize>) -> Option<Reading> {
-    let mut state = match MAPPING.try_lock() {
-        Ok(state) => state,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => return None,
-    };
-    (!state.changing(&range)).then(|| state.pin(range))
-}
-
-pub fn title_memory_remapped(at: usize, len: usize) {
-    crate::descriptor::host::remapped(at, len);
-    crate::inplace::views_gone(at, len);
-    crate::inplace::title_memory_freeing(at, len);
-    let mut g = guards();
-    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
-    for block in absent {
-        g.absent.remove(&block);
-    }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(block);
-    }
-    let aliased: Vec<usize> = g
-        .aliased
-        .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for block in aliased {
-        g.aliased.remove(&block);
-    }
-}
-
-fn install() {
-    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
-    use windows_sys::Win32::System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-        EXCEPTION_POINTERS,
-    };
-    unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
-        let r = unsafe { &*(*info).ExceptionRecord };
-        const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-        let at = r.ExceptionInformation[1];
-        let mut g = guards();
-        if open(&mut g, at, at + 1) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
-        }
-    }
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_write));
-    });
-}
-
-fn writable(at: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
-    };
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
 }
 
 #[cfg(test)]
@@ -816,17 +842,17 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
+        let (_, before) = WriteJournal::writes(start, end, false).expect("watched");
         assert!(before.is_empty());
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
-        let (now, after) = writes(start, end, false).expect("watched");
+        let (now, after) = WriteJournal::writes(start, end, false).expect("watched");
         assert_eq!(after, [(p / PAGE + 1, now)]);
-        let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
+        let (later, again) = WriteJournal::writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
         let mut plain = vec![0u8; PAGE];
         assert!(
-            writes(
+            WriteJournal::writes(
                 plain.as_mut_ptr() as usize,
                 plain.as_ptr() as usize + PAGE,
                 true
@@ -855,7 +881,7 @@ mod tests {
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
         };
         assert_ne!(view, 0);
-        assert!(guard(view, view + 2 * BLOCK).is_some());
+        assert!(PageGuards::guard(view, view + 2 * BLOCK).is_some());
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
         let read = |file: &mut std::fs::File| {
@@ -867,12 +893,12 @@ mod tests {
             !read(&mut file),
             "the kernel does not fault into our handler"
         );
-        writing(view + 100, 13);
+        TitleMemory::will_write(view + 100, 13);
         assert!(read(&mut file));
         let landed = unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) };
         assert_eq!(landed, b"from the disk");
         assert_eq!(
-            guard(view, view + 2 * BLOCK),
+            PageGuards::guard(view, view + 2 * BLOCK),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
         unsafe {
@@ -882,7 +908,7 @@ mod tests {
                 },
             )
         };
-        title_memory_remapped(view, 2 * BLOCK);
+        TitleMemory::remapped(view, 2 * BLOCK);
     }
 
     #[test]
@@ -897,7 +923,7 @@ mod tests {
         struct View(MEMORY_MAPPED_VIEW_ADDRESS);
         impl Drop for View {
             fn drop(&mut self) {
-                title_memory_remapped(self.0.Value as usize, SIZE);
+                TitleMemory::remapped(self.0.Value as usize, SIZE);
                 unsafe { UnmapViewOfFile(self.0) };
             }
         }
@@ -925,13 +951,13 @@ mod tests {
         let late = start + 2 * BLOCK + 3 * KERNEL_PAGE;
         commit(start, BLOCK);
         commit(early, KERNEL_PAGE);
-        let refresh = || guard(start, start + SIZE).unwrap();
+        let refresh = || PageGuards::guard(start, start + SIZE).unwrap();
         assert_eq!(refresh(), [start / PAGE, early / PAGE, late / PAGE]);
         assert!(!refresh().contains(&(late / PAGE)));
 
         commit(late, KERNEL_PAGE);
         for at in [early, late] {
-            assert!(writable(at));
+            assert!(TitleMemory::writable(at));
             unsafe { (at as *mut u8).write_volatile(1) };
         }
         assert_eq!(refresh(), [early / PAGE, late / PAGE]);
@@ -991,25 +1017,31 @@ mod tests {
         };
         let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
         let all: Vec<usize> = (0..3).flat_map(pages).collect();
-        assert!(is_view(p, p + 3 * BLOCK));
+        assert!(PageGuards::is_view(p, p + 3 * BLOCK));
         let middle = map(1);
-        title_memory_remapped(p + BLOCK, BLOCK);
-        assert!(is_view(p, p + 3 * BLOCK));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
+        TitleMemory::remapped(p + BLOCK, BLOCK);
+        assert!(PageGuards::is_view(p, p + 3 * BLOCK));
+        assert_eq!(PageGuards::guard(p, p + 3 * BLOCK), Some(all));
         assert_eq!(
-            guard(p, p + 3 * BLOCK),
+            PageGuards::guard(p, p + 3 * BLOCK),
             Some(Vec::new()),
             "nothing written since"
         );
         unsafe { ((p + BLOCK + 8) as *mut u8).write_volatile(1) };
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
+        assert_eq!(
+            PageGuards::guard(p, p + 3 * BLOCK),
+            Some(pages(1).collect())
+        );
         let first = map(0);
-        title_memory_remapped(p, BLOCK);
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(0).collect()));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        TitleMemory::remapped(p, BLOCK);
+        assert_eq!(
+            PageGuards::guard(p, p + 3 * BLOCK),
+            Some(pages(0).collect())
+        );
+        assert_eq!(PageGuards::guard(p, p + 3 * BLOCK), Some(Vec::new()));
         let mut local = [0u8; 16];
         let at = local.as_mut_ptr() as usize;
-        assert!(!is_view(at, at + local.len()));
+        assert!(!PageGuards::is_view(at, at + local.len()));
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
             UnmapViewOfFile2(GetCurrentProcess(), middle, MEM_PRESERVE_PLACEHOLDER);
@@ -1018,7 +1050,7 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 3 * BLOCK);
+        TitleMemory::remapped(p, 3 * BLOCK);
     }
 
     #[test]
@@ -1076,16 +1108,19 @@ mod tests {
         let first = map(0);
         let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
         let all: Vec<usize> = (0..3).flat_map(pages).collect();
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(all));
+        assert_eq!(PageGuards::guard(p, p + 3 * BLOCK), Some(all));
         assert_eq!(
-            guard(p, p + 3 * BLOCK),
+            PageGuards::guard(p, p + 3 * BLOCK),
             Some(Vec::new()),
             "nothing written since"
         );
         let second = map(1);
-        title_memory_remapped(p + BLOCK, BLOCK);
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(1).collect()));
-        assert_eq!(guard(p, p + 3 * BLOCK), Some(Vec::new()));
+        TitleMemory::remapped(p + BLOCK, BLOCK);
+        assert_eq!(
+            PageGuards::guard(p, p + 3 * BLOCK),
+            Some(pages(1).collect())
+        );
+        assert_eq!(PageGuards::guard(p, p + 3 * BLOCK), Some(Vec::new()));
         unsafe {
             UnmapViewOfFile2(GetCurrentProcess(), first, MEM_PRESERVE_PLACEHOLDER);
             UnmapViewOfFile2(GetCurrentProcess(), second, MEM_PRESERVE_PLACEHOLDER);
@@ -1094,7 +1129,7 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
-        title_memory_remapped(p, 3 * BLOCK);
+        TitleMemory::remapped(p, 3 * BLOCK);
     }
 
     fn two_views(bytes: usize) -> (usize, usize, usize) {
@@ -1129,7 +1164,7 @@ mod tests {
         for blocks in [8, 1024] {
             let size = blocks * BLOCK;
             let (section, main, alias) = two_views(size);
-            assert_eq!(guard(main, main + size).unwrap().len(), blocks);
+            assert_eq!(PageGuards::guard(main, main + size).unwrap().len(), blocks);
             for dirty in [false, true] {
                 let rounds = if dirty { 500 } else { 12_000 };
                 let mut samples = Vec::new();
@@ -1140,7 +1175,7 @@ mod tests {
                         if dirty {
                             unsafe { ((alias + block * BLOCK) as *mut u8).write_volatile(1) };
                         }
-                        let changed = guard(main, main + size).unwrap();
+                        let changed = PageGuards::guard(main, main + size).unwrap();
                         if dirty {
                             assert_eq!(changed, [(main + block * BLOCK) / PAGE]);
                         } else {
@@ -1163,7 +1198,7 @@ mod tests {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
         for &view in views {
-            title_memory_remapped(view, bytes);
+            TitleMemory::remapped(view, bytes);
             unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                     Value: view as *mut _,
@@ -1179,17 +1214,20 @@ mod tests {
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
         assert_eq!(
-            guard(guarded, guarded + SIZE),
+            PageGuards::guard(guarded, guarded + SIZE),
             Some(vec![pages(0), pages(1)])
         );
         assert_eq!(
-            guard(guarded, guarded + SIZE),
+            PageGuards::guard(guarded, guarded + SIZE),
             Some(Vec::new()),
             "nothing written yet"
         );
         unsafe { ((other + BLOCK + 8) as *mut u8).write(1) };
-        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
-        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        assert_eq!(
+            PageGuards::guard(guarded, guarded + SIZE),
+            Some(vec![pages(1)])
+        );
+        assert_eq!(PageGuards::guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
     }
 
@@ -1199,21 +1237,21 @@ mod tests {
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
         assert_eq!(
-            guard(guarded, guarded + SIZE),
+            PageGuards::guard(guarded, guarded + SIZE),
             Some(vec![pages(0), pages(1)])
         );
         assert_eq!(
-            guard(guarded, guarded + SIZE),
+            PageGuards::guard(guarded, guarded + SIZE),
             Some(Vec::new()),
             "nothing written yet"
         );
-        title_memory_remapped(other, SIZE);
+        TitleMemory::remapped(other, SIZE);
         crate::inplace::title_memory_view(other, SIZE, section, 0);
         assert_eq!(
-            guard(guarded, guarded + SIZE),
+            PageGuards::guard(guarded, guarded + SIZE),
             Some(vec![pages(0), pages(1)])
         );
-        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        assert_eq!(PageGuards::guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
     }
 
@@ -1223,20 +1261,23 @@ mod tests {
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
         assert_eq!(
-            guard(guarded, guarded + SIZE),
+            PageGuards::guard(guarded, guarded + SIZE),
             Some(vec![pages(0), pages(1)])
         );
         assert_eq!(
-            guard(guarded, guarded + SIZE),
+            PageGuards::guard(guarded, guarded + SIZE),
             Some(Vec::new()),
             "nothing written yet"
         );
-        writing(other + BLOCK, BLOCK);
-        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
-        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
-        writing(other + BLOCK / 2, BLOCK);
+        TitleMemory::will_write(other + BLOCK, BLOCK);
         assert_eq!(
-            guard(guarded, guarded + SIZE),
+            PageGuards::guard(guarded, guarded + SIZE),
+            Some(vec![pages(1)])
+        );
+        assert_eq!(PageGuards::guard(guarded, guarded + SIZE), Some(Vec::new()));
+        TitleMemory::will_write(other + BLOCK / 2, BLOCK);
+        assert_eq!(
+            PageGuards::guard(guarded, guarded + SIZE),
             Some(vec![pages(0), pages(1)])
         );
         drop_views(section, &[guarded, other], SIZE);
@@ -1248,40 +1289,46 @@ mod tests {
         let (section, one, two) = two_views(SIZE);
         let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
         assert_eq!(
-            guard(one, one + SIZE),
+            PageGuards::guard(one, one + SIZE),
             Some(vec![pages(one, 0), pages(one, 1)])
         );
         assert_eq!(
-            guard(two, two + SIZE),
+            PageGuards::guard(two, two + SIZE),
             Some(vec![pages(two, 0), pages(two, 1)]),
             "the second view's first check"
         );
         assert_eq!(
-            guard(one, one + SIZE),
+            PageGuards::guard(one, one + SIZE),
             Some(Vec::new()),
             "nothing written yet"
         );
         assert_eq!(
-            guard(two, two + SIZE),
+            PageGuards::guard(two, two + SIZE),
             Some(Vec::new()),
             "nothing written yet"
         );
         unsafe { ((two + BLOCK + 8) as *mut u8).write(1) };
-        assert_eq!(guard(one, one + SIZE), Some(vec![pages(one, 1)]));
         assert_eq!(
-            guard(two, two + SIZE),
+            PageGuards::guard(one, one + SIZE),
+            Some(vec![pages(one, 1)])
+        );
+        assert_eq!(
+            PageGuards::guard(two, two + SIZE),
             Some(vec![pages(two, 1)]),
             "written through this view, checked second"
         );
         unsafe { ((one + 8) as *mut u8).write(1) };
-        assert_eq!(guard(two, two + SIZE), Some(vec![pages(two, 0)]));
         assert_eq!(
-            guard(one, one + SIZE),
+            PageGuards::guard(two, two + SIZE),
+            Some(vec![pages(two, 0)])
+        );
+        assert_eq!(
+            PageGuards::guard(one, one + SIZE),
             Some(vec![pages(one, 0)]),
             "written through this view, checked second"
         );
-        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
-        assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
+        assert_eq!(PageGuards::guard(one, one + SIZE), Some(Vec::new()));
+        assert_eq!(PageGuards::guard(two, two + SIZE), Some(Vec::new()));
         drop_views(section, &[one, two], SIZE);
     }
 
@@ -1292,28 +1339,28 @@ mod tests {
         for n in 0..MANY_VIEWS {
             crate::inplace::title_memory_view(filler + n * BLOCK, BLOCK, section, 0);
         }
-        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
-        assert!(writable(two), "another view of it is left alone");
+        assert_eq!(PageGuards::guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        assert!(
+            TitleMemory::writable(two),
+            "another view of it is left alone"
+        );
         unsafe { ((one + 8) as *mut u8).write(1) };
-        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
-        title_memory_remapped(filler, MANY_VIEWS * BLOCK);
+        assert_eq!(PageGuards::guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        TitleMemory::remapped(filler, MANY_VIEWS * BLOCK);
         drop_views(section, &[one, two], BLOCK);
     }
 
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
         let top = usize::MAX - 16;
-        writing(top, PAGE);
-        title_memory_remapped(top, usize::MAX);
+        TitleMemory::will_write(top, PAGE);
+        TitleMemory::remapped(top, usize::MAX);
     }
 }
 
 #[cfg(test)]
 mod mapping_tests {
-    use super::{
-        title_memory_reading, title_memory_reading_range, title_memory_remapping,
-        title_memory_remapping_range,
-    };
+    use super::TitleMemory;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
@@ -1321,13 +1368,13 @@ mod mapping_tests {
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
         let changed = Arc::new(AtomicBool::new(false));
-        let reading = title_memory_reading();
+        let reading = TitleMemory::reading();
         let (began, wait) = mpsc::channel();
         let change = {
             let changed = changed.clone();
             std::thread::spawn(move || {
                 began.send(()).unwrap();
-                let _changing = title_memory_remapping_range(0x10000..0x20000);
+                let _changing = TitleMemory::remapping_range(0x10000..0x20000);
                 changed.store(true, Ordering::SeqCst);
             })
         };
@@ -1341,13 +1388,13 @@ mod mapping_tests {
         change.join().unwrap();
         assert!(changed.load(Ordering::SeqCst));
         let read = Arc::new(AtomicBool::new(false));
-        let changing = title_memory_remapping();
+        let changing = TitleMemory::remapping();
         let (began, wait) = mpsc::channel();
         let reader = {
             let read = read.clone();
             std::thread::spawn(move || {
                 began.send(()).unwrap();
-                let _reading = title_memory_reading_range(0x30000..0x40000);
+                let _reading = TitleMemory::reading_range(0x30000..0x40000);
                 read.store(true, Ordering::SeqCst);
             })
         };

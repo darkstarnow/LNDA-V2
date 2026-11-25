@@ -254,7 +254,7 @@ impl ReadbackMapping {
     }
 
     pub(crate) fn for_write(&self) -> Option<crate::watch::Reading> {
-        let guard = crate::watch::title_memory_reading();
+        let guard = crate::watch::TitleMemory::reading();
         self.0.load(Ordering::Acquire).then_some(guard)
     }
 }
@@ -276,7 +276,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
                 .push(at + k * K64);
         }
     }
-    crate::watch::views_mapped(section, offset, len);
+    crate::watch::TitleMemory::views_mapped(section, offset, len);
 }
 
 pub(crate) fn views_gone(at: usize, len: usize) {

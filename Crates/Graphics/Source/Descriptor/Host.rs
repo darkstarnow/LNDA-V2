@@ -1043,9 +1043,12 @@ impl HostHeap {
             || desc[1] != 4
             || desc[4] >= resource[7] >> 16
             || textures.rechecks.contains_key(&index)
-            || crate::texture::mapped_bytes(start as *const u8, usize::try_from(len).ok()?) != len
+            || crate::texture::TitleMemoryMap::mapped_bytes(
+                start as *const u8,
+                usize::try_from(len).ok()?,
+            ) != len
             || crate::resource::PlacedTextures::writable_texture_overlaps(start, end)
-            || crate::texture::host_written_overlaps(start, end)
+            || crate::texture::HostWrites::overlaps(start, end)
         {
             return None;
         }
@@ -1087,7 +1090,7 @@ impl HostHeap {
         start.checked_add(len).is_some_and(|end| {
             mapped == len
                 && !crate::resource::PlacedTextures::writable_texture_overlaps(start, end)
-                && !crate::texture::host_written_overlaps(start, end)
+                && !crate::texture::HostWrites::overlaps(start, end)
         })
     }
 
@@ -1135,7 +1138,8 @@ impl HostHeap {
             if began.elapsed() > SPAN {
                 break;
             }
-            let changed = crate::texture::fingerprint(seen.at.0, seen.at.1) != seen.print;
+            let changed =
+                crate::texture::TitleMemoryMap::fingerprint(seen.at.0, seen.at.1) != seen.print;
             found[usize::from(changed)] += 1;
             if changed {
                 static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1258,7 +1262,8 @@ impl HostHeap {
         let mut restored = 0;
         for (index, key) in batch {
             let extent = self.mapped_displaced_view(index, key);
-            let handle = handle(index).filter(|&at| crate::texture::committed(at as *const u8, 12));
+            let handle = handle(index)
+                .filter(|&at| crate::texture::TitleMemoryMap::committed(at as *const u8, 12));
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             if placed.displaced.get(&index) != Some(&key) {
@@ -1327,7 +1332,7 @@ impl HostHeap {
             }
             end
         };
-        crate::texture::any_mapped(start as usize, (end - start) as usize)
+        crate::texture::TitleMemoryMap::any_mapped(start as usize, (end - start) as usize)
             .then_some((resource, start, end))
     }
 
@@ -1355,7 +1360,7 @@ impl HostHeap {
                 if page.0 != handle >> 12 {
                     page = (
                         handle >> 12,
-                        crate::texture::committed(handle as *const u8, 12),
+                        crate::texture::TitleMemoryMap::committed(handle as *const u8, 12),
                     );
                 }
                 if !page.1 {
@@ -1410,7 +1415,7 @@ impl HostHeap {
                     placed.claim(index, start, start.saturating_add(bytes), &resource);
                 (bytes, claim, against)
             };
-            if !crate::texture::any_mapped(start as usize, bytes as usize) {
+            if !crate::texture::TitleMemoryMap::any_mapped(start as usize, bytes as usize) {
                 counts[4] += 1;
                 continue;
             }
@@ -2139,7 +2144,8 @@ impl HostHeap {
             let bytes = placed.bytes(resource, first).unwrap_or(0);
             let (claim, overlap) =
                 placed.claim(index, start, start.saturating_add(bytes), resource);
-            let mapped = crate::texture::mapped_bytes(start as *const u8, bytes as usize);
+            let mapped =
+                crate::texture::TitleMemoryMap::mapped_bytes(start as *const u8, bytes as usize);
             format!(" mip={first} visible={mapped}/{bytes} claim={claim:?} overlap={overlap:x?}")
         } else {
             String::new()
@@ -3568,7 +3574,9 @@ mod tests {
     #[test]
     fn a_fingerprint_sees_changes() {
         let mut memory = vec![3u8; 1 << 20];
-        let print = |m: &[u8]| crate::texture::fingerprint(m.as_ptr() as u64, m.len() as u64);
+        let print = |m: &[u8]| {
+            crate::texture::TitleMemoryMap::fingerprint(m.as_ptr() as u64, m.len() as u64)
+        };
         let before = print(&memory);
         assert_eq!(print(&memory), before);
         let last = memory.len() - 1;

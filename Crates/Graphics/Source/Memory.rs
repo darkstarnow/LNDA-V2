@@ -145,7 +145,7 @@ impl Memory {
     }
 
     fn page_owner(start: u64) -> Option<(Arc<Shadow>, u32)> {
-        if !crate::texture::committed(start as *const u8, PAGE as usize) {
+        if !crate::texture::TitleMemoryMap::committed(start as *const u8, PAGE as usize) {
             return None;
         }
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);

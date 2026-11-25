@@ -141,7 +141,7 @@ fn sweep() {
     }
     crate::pipeline::PipelineCache::trim();
     crate::shadow::let_go_idle();
-    crate::texture::let_go_idle();
+    crate::texture::TextureUploads::let_go_idle();
     crate::resource::HostTextures::let_go_idle();
 }
 
@@ -3886,7 +3886,7 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         let mut settled = std::time::Duration::ZERO;
-        if crate::watch::once() {
+        if crate::watch::WriteJournal::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> =
                 std::collections::HashMap::new();
             for list in runs {
@@ -3902,12 +3902,12 @@ impl Host {
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
-            crate::watch::ask_once(&ranges);
+            crate::watch::WriteJournal::ask_once(&ranges);
             if behind && stale_under_flights(runs) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
-                crate::watch::ask_once(&ranges);
+                crate::watch::WriteJournal::ask_once(&ranges);
             }
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
@@ -3931,7 +3931,7 @@ impl Host {
         }
         record_preludes(plans);
         batch.flush();
-        crate::watch::ask_once_end();
+        crate::watch::WriteJournal::ask_once_end();
         {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
@@ -5071,7 +5071,7 @@ impl HostList {
                     }
                     batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    crate::watch::wrote(dst, len);
+                    crate::watch::WriteJournal::wrote(dst, len);
                     len
                 }
                 Step::Fill(_) | Step::Fills(_) => {
@@ -5105,7 +5105,7 @@ impl HostList {
                     }
                     work();
                     if matches!(step, Step::Run(_)) {
-                        crate::watch::ask_once_end();
+                        crate::watch::WriteJournal::ask_once_end();
                     }
                     #[cfg(feature = "diagnostics")]
                     {
@@ -5399,7 +5399,7 @@ impl Batch {
                 .filter(|r| !r.0.unwatched())
                 .map(|r| (r.1, r.2))
                 .collect();
-            crate::watch::ask_ahead(&ranges);
+            crate::watch::WriteJournal::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
@@ -5424,7 +5424,7 @@ impl Batch {
             }
         }
         if ahead {
-            crate::watch::ask_ahead_done();
+            crate::watch::WriteJournal::ask_ahead_done();
         }
     }
 }
@@ -5445,11 +5445,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     static ASK: OnceLock<bool> = OnceLock::new();
     let ask_first = title_dst
         && *ASK.get_or_init(|| std::env::var_os("LEONIDA_COPY_ASK").is_some_and(|v| v == "1"));
-    if ask_first && !crate::texture::committed(dst, len) {
+    if ask_first && !crate::texture::TitleMemoryMap::committed(dst, len) {
         return;
     }
     if title_dst {
-        crate::watch::writing(dst as usize, len);
+        crate::watch::TitleMemory::will_write(dst as usize, len);
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
@@ -5462,7 +5462,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if whole {
         return;
     }
-    if title_dst && !ask_first && !crate::texture::committed(dst, len) {
+    if title_dst && !ask_first && !crate::texture::TitleMemoryMap::committed(dst, len) {
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -5925,7 +5925,7 @@ impl Meter {
         let card = crate::shadow::card_stats();
         let card_fetch_copies = CARD_FETCH_COPIES.swap(0, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        let slow = crate::watch::slow_asks();
+        let slow = crate::watch::WriteJournal::slow_asks();
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::PipelineDrops::take();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {

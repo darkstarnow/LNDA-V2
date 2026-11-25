@@ -191,7 +191,7 @@ impl Owners {
             return 0;
         };
         let range = address..end;
-        let _mapped = crate::watch::title_memory_reading_range(range.clone());
+        let _mapped = crate::watch::TitleMemory::reading_range(range.clone());
         let parts = self.current(
             &changes.lock().unwrap_or_else(|e| e.into_inner()),
             shadow,
@@ -199,7 +199,7 @@ impl Owners {
         );
         let write = |span: Range<usize>| {
             let n = span.len();
-            crate::watch::writing(span.start, n);
+            crate::watch::TitleMemory::will_write(span.start, n);
             crate::host::write_mapped(
                 span.start as *mut u8,
                 data[span.start - address..].as_ptr(),
