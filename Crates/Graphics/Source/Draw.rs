@@ -1317,8 +1317,9 @@ impl State {
                     };
                 }
                 if !compute
-                    && crate::material_demand::enabled()
-                    && let Some(fields) = crate::material_demand::fields(&stage.shader.hash)
+                    && crate::material_demand::MaterialDemand::enabled()
+                    && let Some(fields) =
+                        crate::material_demand::MaterialDemand::fields(&stage.shader.hash)
                     && t.host
                         .user_data
                         .iter()
@@ -1336,9 +1337,11 @@ impl State {
                     && !heap.samplers()
                     && let Some(&bound) = values.get(8)
                     && Some(u64::from(bound)) == table.checked_sub(heap.start)
-                    && crate::material_demand::wants(heap, record, fields)
+                    && crate::material_demand::MaterialDemand::wants(heap, record, fields)
                 {
-                    crate::material_demand::record(list, heap, *table, record, fields);
+                    crate::material_demand::MaterialDemand::record(
+                        list, heap, *table, record, fields,
+                    );
                 }
                 unsafe {
                     if compute {
@@ -1941,11 +1944,11 @@ impl State {
             HEAP_TEXTURES_RECHECKED[1].fetch_add(changed, Ordering::Relaxed);
             HEAP_TEXTURES_RECHECKED[2].store(waiting, Ordering::Relaxed);
         }
-        let wanted =
-            crate::material_demand::enabled().then(|| host.material_demand.take(heap, host, frame));
+        let wanted = crate::material_demand::MaterialDemand::enabled()
+            .then(|| host.material_demand.take(heap, host, frame));
         let (mut due, census) = host.texture_slots_due(frame, 4096);
         if let Some(wanted) = wanted {
-            crate::material_demand::promote(&mut due, &wanted, frame);
+            crate::material_demand::MaterialDemand::promote(&mut due, &wanted, frame);
         }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
@@ -2307,7 +2310,7 @@ impl State {
             unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
         }
         #[cfg(feature = "diagnostics")]
-        crate::memory::ray_probe::after_dispatch(list, p);
+        crate::memory::ray_probe::RayProbe::after_dispatch(list, p);
         #[cfg(feature = "diagnostics")]
         crate::capture::InputDump::dump_with_input(list, self.pipeline as This, &[], input);
         #[cfg(feature = "diagnostics")]
@@ -3454,7 +3457,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         if kind == DISPATCH {
-            crate::memory::ray_probe::after_dispatch(list, p);
+            crate::memory::ray_probe::RayProbe::after_dispatch(list, p);
             crate::capture::InputDump::dump_after(list, self.pipeline as This, &[]);
         } else {
             self.dump_after(list);

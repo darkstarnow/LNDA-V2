@@ -4,88 +4,93 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::host::{Host, HostList, StateBits};
 use crate::pipeline::host::HostPipeline;
 
-pub(crate) fn after_dispatch(list: &HostList, pipeline: &HostPipeline) {
-    if !ray_probe_enabled() || pipeline.stages[0].shader.hash != RAY_PROBE_HASH {
-        return;
-    }
-    let frame = crate::queue::Presenter::presented() + 1;
-    if !pipeline.stages[0]
-        .translated()
-        .host
-        .root_uavs
-        .contains(&leonida_shader::emit::SLOT_FAULTS)
-    {
-        tracing::warn!(
-            shader = RAY_PROBE_HASH,
-            frame,
-            "ray intersection fault UAV unavailable"
-        );
-        return;
-    }
-    let guard = super::MEMORY.lock().unwrap_or_else(|e| e.into_inner());
-    let faults = guard.as_ref().map(|memory| memory.faults.0.clone());
-    drop(guard);
-    let Some(readback) = faults.and_then(|faults| copy_counters(list, &faults)) else {
-        tracing::warn!(
-            shader = RAY_PROBE_HASH,
-            frame,
-            "ray intersection readback unavailable"
-        );
-        return;
-    };
-    list.defer_after(move || {
-        let Some(words) = read_counters(&readback) else {
-            tracing::warn!(shader = RAY_PROBE_HASH, frame, "ray intersection readback unavailable");
+pub(crate) struct RayProbe;
+
+impl RayProbe {
+    pub(crate) fn after_dispatch(list: &HostList, pipeline: &HostPipeline) {
+        if !ray_probe_enabled() || pipeline.stages[0].shader.hash != RAY_PROBE_HASH {
+            return;
+        }
+        let frame = crate::queue::Presenter::presented() + 1;
+        if !pipeline.stages[0]
+            .translated()
+            .host
+            .root_uavs
+            .contains(&leonida_shader::emit::SLOT_FAULTS)
+        {
+            tracing::warn!(
+                shader = RAY_PROBE_HASH,
+                frame,
+                "ray intersection fault UAV unavailable"
+            );
+            return;
+        }
+        let guard = super::MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        let faults = guard.as_ref().map(|memory| memory.faults.0.clone());
+        drop(guard);
+        let Some(readback) = faults.and_then(|faults| RayProbe::copy_counters(list, &faults))
+        else {
+            tracing::warn!(
+                shader = RAY_PROBE_HASH,
+                frame,
+                "ray intersection readback unavailable"
+            );
             return;
         };
-        let [visits, candidates, node_lo, node_hi, distance, extent, bary_u, bary_v] = words;
-        tracing::info!(
-            target: "leonida_graphics::trace",
-            shader = RAY_PROBE_HASH, frame,
-            active_node_visits = visits, finite_triangle_candidates = candidates,
-            sample_available = candidates != 0,
-            first_node_lo = format_args!("{node_lo:#010x}"), first_node_hi = format_args!("{node_hi:#010x}"),
-            first_distance_bits = format_args!("{distance:#010x}"), first_extent_bits = format_args!("{extent:#010x}"),
-            first_bary_u_numerator_bits = format_args!("{bary_u:#010x}"),
-            first_bary_v_numerator_bits = format_args!("{bary_v:#010x}"),
-            "cumulative ray intersection counters after GPU fence"
-        );
-    });
-}
-
-fn copy_counters(list: &HostList, faults: &ID3D12Resource) -> Option<ID3D12Resource> {
-    let bytes = u64::from(RAY_PROBE_DWORDS) * 4;
-    let readback = Host::instance()?.read_back_buffer(bytes)?;
-    let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    unsafe {
-        list.list
-            .ResourceBarrier(&[StateBits::transition(faults, uav, copy)]);
-        list.list
-            .CopyBufferRegion(&readback, 0, faults, u64::from(MEMORY_FAULTS) * 4, bytes);
-        list.list.ResourceBarrier(&[StateBits::transition(
-            faults,
-            copy,
-            D3D12_RESOURCE_STATE_COMMON,
-        )]);
+        list.defer_after(move || {
+            let Some(words) = RayProbe::read_counters(&readback) else {
+                tracing::warn!(shader = RAY_PROBE_HASH, frame, "ray intersection readback unavailable");
+                return;
+            };
+            let [visits, candidates, node_lo, node_hi, distance, extent, bary_u, bary_v] = words;
+            tracing::info!(
+                target: "leonida_graphics::trace",
+                shader = RAY_PROBE_HASH, frame,
+                active_node_visits = visits, finite_triangle_candidates = candidates,
+                sample_available = candidates != 0,
+                first_node_lo = format_args!("{node_lo:#010x}"), first_node_hi = format_args!("{node_hi:#010x}"),
+                first_distance_bits = format_args!("{distance:#010x}"), first_extent_bits = format_args!("{extent:#010x}"),
+                first_bary_u_numerator_bits = format_args!("{bary_u:#010x}"),
+                first_bary_v_numerator_bits = format_args!("{bary_v:#010x}"),
+                "cumulative ray intersection counters after GPU fence"
+            );
+        });
     }
-    list.keep(faults);
-    list.keep(&readback);
-    Some(readback)
-}
 
-fn read_counters(readback: &ID3D12Resource) -> Option<[u32; RAY_PROBE_DWORDS as usize]> {
-    let mut data = std::ptr::null_mut();
-    unsafe {
-        let range = D3D12_RANGE {
-            Begin: 0,
-            End: RAY_PROBE_DWORDS as usize * 4,
-        };
-        readback.Map(0, Some(&range), Some(&mut data)).ok()?;
-        let data = std::ptr::NonNull::new(data)?;
-        let words = data.cast::<[u32; RAY_PROBE_DWORDS as usize]>().read();
-        readback.Unmap(0, Some(&D3D12_RANGE::default()));
-        Some(words)
+    fn copy_counters(list: &HostList, faults: &ID3D12Resource) -> Option<ID3D12Resource> {
+        let bytes = u64::from(RAY_PROBE_DWORDS) * 4;
+        let readback = Host::instance()?.read_back_buffer(bytes)?;
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        unsafe {
+            list.list
+                .ResourceBarrier(&[StateBits::transition(faults, uav, copy)]);
+            list.list
+                .CopyBufferRegion(&readback, 0, faults, u64::from(MEMORY_FAULTS) * 4, bytes);
+            list.list.ResourceBarrier(&[StateBits::transition(
+                faults,
+                copy,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        list.keep(faults);
+        list.keep(&readback);
+        Some(readback)
+    }
+
+    fn read_counters(readback: &ID3D12Resource) -> Option<[u32; RAY_PROBE_DWORDS as usize]> {
+        let mut data = std::ptr::null_mut();
+        unsafe {
+            let range = D3D12_RANGE {
+                Begin: 0,
+                End: RAY_PROBE_DWORDS as usize * 4,
+            };
+            readback.Map(0, Some(&range), Some(&mut data)).ok()?;
+            let data = std::ptr::NonNull::new(data)?;
+            let words = data.cast::<[u32; RAY_PROBE_DWORDS as usize]>().read();
+            readback.Unmap(0, Some(&D3D12_RANGE::default()));
+            Some(words)
+        }
     }
 }
 
@@ -117,11 +122,13 @@ mod tests {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             )]);
         }
-        let readback = copy_counters(&list, &faults).unwrap();
+        let readback = RayProbe::copy_counters(&list, &faults).unwrap();
         let observed = std::sync::Arc::new(std::sync::OnceLock::new());
         let output = observed.clone();
         list.defer_after(move || {
-            output.set(read_counters(&readback).unwrap()).unwrap();
+            output
+                .set(RayProbe::read_counters(&readback).unwrap())
+                .unwrap();
         });
         list.close();
         assert!(observed.get().is_none());

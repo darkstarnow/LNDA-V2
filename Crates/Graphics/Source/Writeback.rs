@@ -7,22 +7,45 @@ static STARTED: AtomicU64 = AtomicU64::new(0);
 static PUBLISHED: AtomicU64 = AtomicU64::new(0);
 static LAST_CHANGE: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn starting(number: u64) {
-    STARTED.store(number, Ordering::Release);
-}
-
-pub(crate) fn published(number: u64) {
-    PUBLISHED.fetch_max(number, Ordering::Release);
-}
-
-pub(crate) fn changed_since(number: u64) -> bool {
-    LAST_CHANGE.load(Ordering::Acquire) >= number
-}
-
 #[derive(Default)]
 struct Changes {
     intervals: BTreeMap<usize, (usize, u64)>,
     retired: u64,
+}
+
+pub(crate) struct WritebackLog;
+
+impl WritebackLog {
+    pub(crate) fn starting(number: u64) {
+        STARTED.store(number, Ordering::Release);
+    }
+
+    pub(crate) fn published(number: u64) {
+        PUBLISHED.fetch_max(number, Ordering::Release);
+    }
+
+    pub(crate) fn changed_since(number: u64) -> bool {
+        LAST_CHANGE.load(Ordering::Acquire) >= number
+    }
+
+    pub(crate) fn remapped(range: Range<usize>) {
+        let mut changes = CHANGED.lock().unwrap_or_else(|e| e.into_inner());
+        let started = STARTED.load(Ordering::Acquire);
+        let finished = PUBLISHED.load(Ordering::Acquire);
+        changes.record(range, started, finished);
+        if started > finished {
+            LAST_CHANGE.store(started, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn needs_new_snapshot(from: usize, to: usize, busy: &[(usize, usize)]) -> bool {
+        let finished = PUBLISHED.load(Ordering::Acquire);
+        if from >= to || LAST_CHANGE.load(Ordering::Acquire) <= finished {
+            return false;
+        }
+        let changes = CHANGED.lock().unwrap_or_else(|e| e.into_inner());
+        changes.intersects_pending(from, to, busy, finished)
+    }
 }
 
 impl Changes {
@@ -81,25 +104,6 @@ static CHANGED: Mutex<Changes> = Mutex::new(Changes {
     intervals: BTreeMap::new(),
     retired: 0,
 });
-
-pub(crate) fn remapped(range: Range<usize>) {
-    let mut changes = CHANGED.lock().unwrap_or_else(|e| e.into_inner());
-    let started = STARTED.load(Ordering::Acquire);
-    let finished = PUBLISHED.load(Ordering::Acquire);
-    changes.record(range, started, finished);
-    if started > finished {
-        LAST_CHANGE.store(started, Ordering::Release);
-    }
-}
-
-pub(crate) fn needs_new_snapshot(from: usize, to: usize, busy: &[(usize, usize)]) -> bool {
-    let finished = PUBLISHED.load(Ordering::Acquire);
-    if from >= to || LAST_CHANGE.load(Ordering::Acquire) <= finished {
-        return false;
-    }
-    let changes = CHANGED.lock().unwrap_or_else(|e| e.into_inner());
-    changes.intersects_pending(from, to, busy, finished)
-}
 
 type LaterWriters = BTreeMap<u64, Vec<(u64, Range<usize>)>>;
 

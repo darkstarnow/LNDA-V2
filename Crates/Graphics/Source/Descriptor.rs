@@ -1219,7 +1219,7 @@ mod tests {
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
         }
-        crate::material_demand::record(&list, heap, heap.start, 0, &[0, 16, 20]);
+        crate::material_demand::MaterialDemand::record(&list, heap, heap.start, 0, &[0, 16, 20]);
         list.close();
         device.execute(&[&list]);
         let mut due: Vec<_> = (32..48).map(|n| (n, 1, false)).collect();
@@ -1233,7 +1233,7 @@ mod tests {
             [(3, false), (5, true), (6, true)]
         );
         assert_eq!(record_bytes, [0; 8]);
-        crate::material_demand::promote(&mut due, &wanted, frame);
+        crate::material_demand::MaterialDemand::promote(&mut due, &wanted, frame);
         assert_eq!(due[(frame % 4) as usize], write);
         assert_eq!(record_bytes[0], 0);
         let mut newer = tex;

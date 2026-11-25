@@ -213,7 +213,7 @@ impl ShaderStore {
             Some(part) => leonida_shader::native_programs(part.data).map_err(|e| e.to_string())?,
             None => Vec::new(),
         };
-        let host = crate::shader_cache::host_shader(container)?;
+        let host = crate::shader_cache::ShaderCache::host_shader(container)?;
         let stores = programs.is_empty() || programs.iter().any(ShaderStore::stores);
         let compute_threads = programs.iter().find_map(|p| match &p.io {
             leonida_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => {

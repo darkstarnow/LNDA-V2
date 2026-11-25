@@ -845,7 +845,7 @@ impl Presenter {
         );
         #[cfg(windows)]
         if frame >= 256 {
-            let (hits, misses) = crate::shader_cache::counts();
+            let (hits, misses) = crate::shader_cache::ShaderCache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }

@@ -1222,7 +1222,7 @@ impl LateRun {
     ) -> crate::writeback::Owners {
         let first = flights.next().expect("at least one finished flight");
         let mut owners = crate::writeback::Owners::single(first.number);
-        if !crate::writeback::changed_since(first.number) {
+        if !crate::writeback::WritebackLog::changed_since(first.number) {
             return owners;
         }
         for flight in flights {
@@ -1280,7 +1280,7 @@ impl LateRun {
                     .map(crate::texback::Back::destination)
                     .collect();
                 if !destinations.is_empty() {
-                    crate::texback::add_destination_aliases(&mut destinations);
+                    crate::texback::TextureReadback::add_destination_aliases(&mut destinations);
                     LateRun::join_ranges(&mut pending.textures, destinations);
                 }
             }
@@ -1345,7 +1345,11 @@ impl LateRun {
                     }
                     Step::Run(_) => return Some(WHY_RUN),
                     Step::Refresh(_, at, len) | Step::GpuWrite(_, at, len) => {
-                        if crate::writeback::needs_new_snapshot(*at, at + len, &written.buffers) {
+                        if crate::writeback::WritebackLog::needs_new_snapshot(
+                            *at,
+                            at + len,
+                            &written.buffers,
+                        ) {
                             return Some(WHY_READ);
                         }
                         if LateRun::touches(&written.textures, *at, at + len) {
@@ -1768,7 +1772,7 @@ impl LateRun {
 
     fn read_backs(list: &HostList) {
         for back in &list.deferred().texture_backs {
-            crate::texback::land(back);
+            crate::texback::TextureReadback::land(back);
         }
         for work in &list.deferred().after {
             work();
@@ -3966,7 +3970,7 @@ impl Host {
             }
         }
         if last > 0 {
-            crate::writeback::published(last);
+            crate::writeback::WritebackLog::published(last);
             FINISHED.store(last, Ordering::Release);
             Retirement::bury(last);
         }
@@ -4383,7 +4387,7 @@ impl Host {
                 }
             }
             if last > 0 {
-                crate::writeback::published(last);
+                crate::writeback::WritebackLog::published(last);
                 FINISHED.store(last, Ordering::Release);
                 Retirement::bury(last);
             }
@@ -4445,7 +4449,7 @@ impl Host {
         crate::copystat::CopyStats::submission_begins();
         let was_working = HostTrail::working(true);
         HostTrail::submitting(1, runs.len());
-        crate::writeback::starting(STARTED.load(Ordering::Relaxed) + 1);
+        crate::writeback::WritebackLog::starting(STARTED.load(Ordering::Relaxed) + 1);
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = LateRun::late_blocked(runs) {
@@ -4571,7 +4575,7 @@ impl Host {
                         .map(crate::texback::Back::destination),
                 );
             }
-            crate::texback::add_destination_aliases(&mut texture_writes);
+            crate::texback::TextureReadback::add_destination_aliases(&mut texture_writes);
             let writes = runs
                 .iter()
                 .flat_map(|l| l.deferred().writes.clone())
@@ -4710,7 +4714,7 @@ impl Host {
         }
         let back = LateRun::declared_writes(runs, false);
         LateRun::hand_back(&back, &owners);
-        crate::writeback::published(this_submission);
+        crate::writeback::WritebackLog::published(this_submission);
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -5265,7 +5269,7 @@ impl HostList {
     }
 
     pub(crate) fn texture_written(&self, resource: crate::object::This) {
-        if !crate::texback::wanted(resource) {
+        if !crate::texback::TextureReadback::wanted(resource) {
             return;
         }
         let mut deferred = self.deferred();
@@ -5288,7 +5292,9 @@ impl HostList {
                 continue;
             };
             self.settle(&copy, COPY_SOURCE);
-            if let Some(back) = crate::texback::record(&self.list, resource, &copy.texture) {
+            if let Some(back) =
+                crate::texback::TextureReadback::record(&self.list, resource, &copy.texture)
+            {
                 self.deferred().texture_backs.push(back);
             }
         }
@@ -6355,7 +6361,7 @@ impl Meter {
             }
         }
         let (cpu_pct, gpu_pct, ram_mb) = (self.cpu_pct, self.gpu_pct, self.ram_mb);
-        crate::debug_hud::update(hwnd, || {
+        crate::debug_hud::DebugHud::update(hwnd, || {
             format!(
                 "Leonida diagnostics\n{fps:.1} FPS   {ms:.1} ms/frame   {draws:.0} draws/frame\nGPU wait {gpu:.1} ms   CPU prep {cpu:.1} ms   Copy-back {back_ms:.1} ms\nDropped {dropped:.0}/frame   RAM {ram_mb:.0} MB"
             )

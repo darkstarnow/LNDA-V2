@@ -34,7 +34,7 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(windows)]
     {
         leonida_graphics::pipeline::PipelineCache::use_dir(dir.with_file_name("pipelines"));
-        leonida_graphics::shader_cache::use_shader_cache(dir);
+        leonida_graphics::shader_cache::ShaderCache::use_dir(dir);
     }
     #[cfg(not(windows))]
     let _ = dir;

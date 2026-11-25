@@ -3733,7 +3733,7 @@ float4 lit() : SV_Target { return 1.0; }
                 ),
                 S_OK
             );
-            if !crate::texback::wanted(title) {
+            if !crate::texback::TextureReadback::wanted(title) {
                 GpuResource::release(title);
                 ResourceHeap::release(heap);
                 return;

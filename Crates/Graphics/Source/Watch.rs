@@ -768,7 +768,7 @@ impl Drop for Remapping {
         crate::inplace::SectionViews::physical_changes(
             &self.previous,
             &current,
-            crate::writeback::remapped,
+            crate::writeback::WritebackLog::remapped,
         );
         MAPPING.lock().unwrap_or_else(|e| e.into_inner()).changing = None;
         MAPPING_CHANGED.notify_all();
