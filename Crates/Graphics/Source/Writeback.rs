@@ -72,7 +72,7 @@ impl Changes {
             .next_back()
             .map_or(from, |(&at, _)| at);
         self.intervals.range(start..to).any(|(&a, &(b, since))| {
-            since > finished && crate::host::touches(busy, a.max(from), b.min(to))
+            since > finished && crate::host::LateRun::touches(busy, a.max(from), b.min(to))
         })
     }
 }
@@ -200,7 +200,7 @@ impl Owners {
         let write = |span: Range<usize>| {
             let n = span.len();
             crate::watch::TitleMemory::will_write(span.start, n);
-            crate::host::write_mapped(
+            crate::host::TitleCopy::write_mapped(
                 span.start as *mut u8,
                 data[span.start - address..].as_ptr(),
                 n,

@@ -4,7 +4,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{Descriptors, VIEW_TAG, View};
-use crate::host::host;
+use crate::host::Host;
 
 pub(crate) const FIRST_RAW_PAGE_SLOTS: u32 = 1024;
 
@@ -510,7 +510,7 @@ pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn device_removed() -> Option<String> {
-    let host = host()?;
+    let host = Host::instance()?;
     let reason = unsafe { host.device.GetDeviceRemovedReason() };
     reason.err().map(|e| e.to_string())
 }
@@ -589,7 +589,7 @@ const UNCAPPED_VIEWS: u32 = 1 << 21;
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let Some(host) = host() else { return };
+        let Some(host) = Host::instance() else { return };
         let fits = |count: u32| {
             let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
                 host.device
@@ -620,7 +620,7 @@ const NULL_BLOCK: u32 = 1 << 16;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
-        let host = host()?;
+        let host = Host::instance()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
         } else {
@@ -697,7 +697,9 @@ impl HostHeap {
                     std::ptr::write_bytes(data, 0, bytes as usize);
                     buffer.GetGPUVirtualAddress()
                 };
-                crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
+                crate::host::HostSetup::name(&buffer, || {
+                    "element strides by view heap slot".to_owned()
+                });
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
@@ -747,7 +749,9 @@ impl HostHeap {
         kind: D3D12_DESCRIPTOR_HEAP_TYPE,
         total: u32,
     ) -> windows::core::Result<()> {
-        let Some(host) = host() else { return Ok(()) };
+        let Some(host) = Host::instance() else {
+            return Ok(());
+        };
         unsafe {
             let block: ID3D12DescriptorHeap =
                 host.device
@@ -805,7 +809,7 @@ impl HostHeap {
 }
 
 fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+    let Some(host) = Host::instance() else { return };
     let desc = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -926,7 +930,7 @@ impl HostHeap {
         let _made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         if self.addresses.get().is_none() {
             let bytes = (u64::from(self.count) + 2) * 8;
-            let (buffer, data) = host()?.upload_buffer(bytes)?;
+            let (buffer, data) = Host::instance()?.upload_buffer(bytes)?;
             unsafe {
                 std::ptr::write_bytes(data, 0, bytes as usize);
                 data.cast::<u64>().write(u64::from(self.count));
@@ -1215,7 +1219,7 @@ impl HostHeap {
         if mode == 0 || self.sampler {
             return;
         }
-        let now = crate::host::now_ms();
+        let now = crate::host::HostClock::now_ms();
         let Ok(mut sweep) = self.texture_sweep.try_lock() else {
             return;
         };
@@ -1676,7 +1680,7 @@ impl HostHeap {
                     .load(std::sync::atomic::Ordering::Relaxed)
             {
                 let count = slots.len() as u32;
-                if let (Some(block), Some(host)) = (&self.null_views, host()) {
+                if let (Some(block), Some(host)) = (&self.null_views, Host::instance()) {
                     let source = unsafe { block.GetCPUDescriptorHandleForHeapStart() };
                     self.copy_nulls(
                         host,
@@ -1697,7 +1701,7 @@ impl HostHeap {
                     .collect();
                 drop(kept);
                 if !resources.is_empty() {
-                    crate::host::retire(resources);
+                    crate::host::Retirement::retire(resources);
                 }
             }
             self.free
@@ -1730,12 +1734,12 @@ impl HostHeap {
         if let Some(slot) = kept.get_mut(index as usize)
             && let Some(old) = std::mem::replace(slot, resource)
         {
-            crate::host::retire(old);
+            crate::host::Retirement::retire(old);
         }
     }
 
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
-        let Some(host) = host() else { return };
+        let Some(host) = Host::instance() else { return };
         let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
@@ -1826,7 +1830,7 @@ impl HostHeap {
     }
 
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
-        let Some(host) = host() else { return };
+        let Some(host) = Host::instance() else { return };
         let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
@@ -1854,7 +1858,7 @@ impl HostHeap {
 
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
         self.keep(index, None);
-        let Some(host) = host() else { return };
+        let Some(host) = Host::instance() else { return };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -1885,7 +1889,7 @@ impl HostHeap {
 
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
-        let Some(host) = host() else { return };
+        let Some(host) = Host::instance() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
             SizeInBytes: constant_size(size),
@@ -2575,7 +2579,7 @@ fn buffer_srv(
     if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
         desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     }
-    let host = host()?;
+    let host = Host::instance()?;
     unsafe {
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
@@ -2665,7 +2669,7 @@ fn buffer_uav(
         );
         return None;
     }
-    let host = host()?;
+    let host = Host::instance()?;
     unsafe {
         host.device.CreateUnorderedAccessView(
             &shadow.buffer,
@@ -2778,7 +2782,7 @@ fn twin_uav(
 }
 
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
-    let host = host()?;
+    let host = Host::instance()?;
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
@@ -3027,7 +3031,7 @@ fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
     if desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 || !colour {
         return false;
     }
-    let (Some(host), Some(texture)) = (host(), magenta()) else {
+    let (Some(host), Some(texture)) = (Host::instance(), magenta()) else {
         return false;
     };
     unsafe { host.device.CreateShaderResourceView(texture, None, at) };
@@ -3060,7 +3064,7 @@ fn magenta() -> Option<&'static ID3D12Resource> {
             };
             let mut texture: Option<ID3D12Resource> = None;
             unsafe {
-                host()?
+                Host::instance()?
                     .device
                     .CreateCommittedResource(
                         &heap,
@@ -3085,7 +3089,7 @@ fn magenta() -> Option<&'static ID3D12Resource> {
 }
 
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+    let Some(host) = Host::instance() else { return };
     let is_buffer =
         |r: &usize| crate::resource::GpuResource::buffer_bytes(*r as crate::object::This).is_some();
     let (buffer, dimension) = match view {
@@ -3168,7 +3172,7 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 }
 
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+    let Some(host) = Host::instance() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
         ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -3192,7 +3196,7 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     if !TEXTURES.contains(&words[1]) {
         return null_view(at);
     }
-    let Some(host) = host() else { return };
+    let Some(host) = Host::instance() else { return };
     let mut w = [0u32; 10];
     w[1] = words[1];
     match words[1] {
@@ -3211,7 +3215,7 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+    let Some(host) = Host::instance() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -3256,7 +3260,7 @@ mod tests {
 
     #[test]
     fn placed_buffer_slots_follow_new_and_released_owners() {
-        let Some(_) = host() else { return };
+        let Some(_) = Host::instance() else { return };
         #[repr(align(256))]
         struct Aligned([u8; 512]);
         static DATA: Aligned = Aligned([0; 512]);
@@ -3305,7 +3309,7 @@ mod tests {
 
     #[test]
     fn null_typed_srv_rebinds_when_a_new_owner_places_it_on_an_element() {
-        host().expect("D3D12 test device");
+        Host::instance().expect("D3D12 test device");
         #[repr(align(256))]
         struct Aligned([u8; 1024]);
         static DATA: Aligned = Aligned([0; 1024]);
@@ -3454,7 +3458,7 @@ mod tests {
     #[cfg(feature = "diagnostics")]
     #[test]
     fn a_magenta_texture_is_made() {
-        let Some(host) = host() else {
+        let Some(host) = Host::instance() else {
             return;
         };
         let Some(heap) = HostHeap::new(false, 4) else {
@@ -3470,7 +3474,7 @@ mod tests {
 
     #[test]
     fn null_3d_uav_is_accepted_by_the_device() {
-        let Some(host) = host() else {
+        let Some(host) = Host::instance() else {
             return;
         };
         let Some(heap) = HostHeap::new(false, 4) else {
@@ -4094,7 +4098,7 @@ mod tests {
 
     #[test]
     fn discarded_dynamic_ranges_unpin_only_their_own_resources() {
-        let Some(host) = host() else { return };
+        let Some(host) = Host::instance() else { return };
         let heap = HostHeap::new(false, 4).unwrap();
         let (buffer, _) = host.upload_buffer(256).unwrap();
         heap.set_texture_pressure(true);
@@ -4112,7 +4116,7 @@ mod tests {
 
     #[test]
     fn changed_mip_views_can_use_resident_textures_under_pressure() {
-        if crate::host::host().is_none() {
+        if crate::host::Host::instance().is_none() {
             return;
         }
         static GUEST_BYTES: [u8; 65536] = [0; 65536];

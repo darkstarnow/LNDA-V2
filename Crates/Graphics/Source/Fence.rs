@@ -109,8 +109,8 @@ impl Fence {
 
     fn block_until(&self, value: u64) -> HRESULT {
         #[cfg(windows)]
-        if crate::host::late() {
-            crate::host::settle_for_fence();
+        if crate::host::LateRun::on() {
+            crate::host::LateRun::settle_for_fence();
             if self.reached(value) {
                 return S_OK;
             }

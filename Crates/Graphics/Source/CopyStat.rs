@@ -582,10 +582,10 @@ fn log_memory() {
         .iter()
         .map(|k| k.load(Relaxed))
         .collect();
-    let card = crate::host::host()
+    let card = crate::host::Host::instance()
         .and_then(|h| h.video_memory())
         .unwrap_or_default();
-    if let Some(h) = crate::host::host() {
+    if let Some(h) = crate::host::Host::instance() {
         h.log_video_memory("with the memory line");
     }
     static LINES: AtomicU64 = AtomicU64::new(0);

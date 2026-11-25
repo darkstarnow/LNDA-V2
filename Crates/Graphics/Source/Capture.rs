@@ -234,7 +234,7 @@ pub(crate) fn read_indirect(
 ) {
     struct Readback(ID3D12Resource);
     unsafe impl Send for Readback {}
-    let Some(host) = crate::host::host() else {
+    let Some(host) = crate::host::Host::instance() else {
         return;
     };
     let len = u64::from(stride) * u64::from(max.max(1));
@@ -279,9 +279,9 @@ pub(crate) fn read_indirect(
                     D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 );
-                l.ResourceBarrier(&[crate::host::transition(scratch, args, copy)]);
+                l.ResourceBarrier(&[crate::host::StateBits::transition(scratch, args, copy)]);
                 l.CopyBufferRegion(&buffer, 0, scratch, at, len);
-                l.ResourceBarrier(&[crate::host::transition(scratch, copy, args)]);
+                l.ResourceBarrier(&[crate::host::StateBits::transition(scratch, copy, args)]);
             }
             Records::Title(copy, at) => l.CopyBufferRegion(&buffer, 0, copy, at, len),
         }
@@ -367,7 +367,7 @@ pub(crate) fn read_input(
     selector: &'static InputSelector,
     resource: usize,
 ) -> Option<InputDump> {
-    let host = crate::host::host()?;
+    let host = crate::host::Host::instance()?;
     let copy = crate::resource::HostTextures::host_copy(resource as crate::object::This)?;
     let desc = unsafe { copy.texture.GetDesc() };
     if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
@@ -476,7 +476,7 @@ pub(crate) fn dump_with_input(
     if after.is_none() {
         return;
     }
-    let Some(host) = crate::host::host() else {
+    let Some(host) = crate::host::Host::instance() else {
         return;
     };
     for (i, &resource) in textures.iter().enumerate() {
@@ -736,7 +736,7 @@ pub(crate) fn note_target(resource: crate::object::This) {
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
-    let Some(host) = crate::host::host() else {
+    let Some(host) = crate::host::Host::instance() else {
         return;
     };
     for (i, (resource, copy)) in targets.iter().enumerate() {
@@ -768,12 +768,12 @@ fn dump_one(
     d: &D3D12_RESOURCE_DESC,
 ) {
     let Ok(list) = host.new_list() else { return };
-    let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
+    let state = D3D12_RESOURCE_STATES(crate::host::StateBits::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     let read = unsafe {
         if state != copy {
             list.list
-                .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
+                .ResourceBarrier(&[crate::host::StateBits::transition(texture, state, copy)]);
         }
         let read = read_back(&host.device, &list.list, texture);
         let stencil = (matches!(d.Format.0, 19..=22 | 44..=47)
@@ -783,7 +783,7 @@ fn dump_one(
             .flatten();
         if state != copy {
             list.list
-                .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
+                .ResourceBarrier(&[crate::host::StateBits::transition(texture, copy, state)]);
         }
         (read, stencil)
     };
@@ -1285,7 +1285,7 @@ mod tests {
 
     #[test]
     fn read_indirect_copies_records_and_count_into_a_list_that_runs() {
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             return;
         };
         let (buffer, data) = host.shared_buffer(1 << 16).unwrap();
@@ -1305,7 +1305,7 @@ mod tests {
 
     #[test]
     fn draw_attempts_count_title_draws_run_or_not_and_no_dispatches() {
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             return;
         };
         let list = host.new_list().unwrap();

@@ -6,7 +6,7 @@ use leonida_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
-use crate::host::{HostList, host};
+use crate::host::{Host, HostList};
 use crate::shadow::Shadow;
 
 #[cfg(feature = "diagnostics")]
@@ -137,8 +137,8 @@ impl Memory {
     }
 
     fn table(dwords: u64, what: &str) -> Option<(ID3D12Resource, *mut u32, u64)> {
-        let (buffer, data) = host()?.shared_buffer(dwords * 4)?;
-        crate::host::name(&buffer, || format!("title memory by address: {what}"));
+        let (buffer, data) = Host::instance()?.shared_buffer(dwords * 4)?;
+        crate::host::HostSetup::name(&buffer, || format!("title memory by address: {what}"));
         unsafe { std::ptr::write_bytes(data, 0, (dwords * 4) as usize) };
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         Some((buffer, data.cast(), gpu))
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!(slot(&memory, fault), 0);
         assert!(!memory.refused.contains(&(fault / PAGE)));
         assert!(memory.speculative_skips > 0);
-        let host = crate::host::host().unwrap();
+        let host = crate::host::Host::instance().unwrap();
         let shader = r#"
             ByteAddressBuffer directory : register(t0);
             RWByteAddressBuffer faults : register(u0);
@@ -559,7 +559,7 @@ mod tests {
             [numthreads(1,1,1)] void main() {
                 if (!directory.Load(page * 8)) faults.Store(bucket * 4, page);
             }"#;
-        let code = crate::host::compile(
+        let code = crate::host::PlanePass::compile(
             shader,
             windows::core::s!("main"),
             windows::core::s!("cs_5_1"),

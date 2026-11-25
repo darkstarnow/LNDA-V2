@@ -1,7 +1,7 @@
 use leonida_shader::emit::{MEMORY_FAULTS, RAY_PROBE_DWORDS, RAY_PROBE_HASH, ray_probe_enabled};
 use windows::Win32::Graphics::Direct3D12::*;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{Host, HostList, StateBits};
 use crate::pipeline::host::HostPipeline;
 
 pub(crate) fn after_dispatch(list: &HostList, pipeline: &HostPipeline) {
@@ -55,15 +55,19 @@ pub(crate) fn after_dispatch(list: &HostList, pipeline: &HostPipeline) {
 
 fn copy_counters(list: &HostList, faults: &ID3D12Resource) -> Option<ID3D12Resource> {
     let bytes = u64::from(RAY_PROBE_DWORDS) * 4;
-    let readback = host()?.read_back_buffer(bytes)?;
+    let readback = Host::instance()?.read_back_buffer(bytes)?;
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     unsafe {
-        list.list.ResourceBarrier(&[transition(faults, uav, copy)]);
+        list.list
+            .ResourceBarrier(&[StateBits::transition(faults, uav, copy)]);
         list.list
             .CopyBufferRegion(&readback, 0, faults, u64::from(MEMORY_FAULTS) * 4, bytes);
-        list.list
-            .ResourceBarrier(&[transition(faults, copy, D3D12_RESOURCE_STATE_COMMON)]);
+        list.list.ResourceBarrier(&[StateBits::transition(
+            faults,
+            copy,
+            D3D12_RESOURCE_STATE_COMMON,
+        )]);
     }
     list.keep(faults);
     list.keep(&readback);
@@ -94,7 +98,7 @@ mod tests {
         if std::env::var("LEONIDA_D3D12_WARP").as_deref() != Ok("1") {
             return;
         }
-        let host = host().expect("WARP device");
+        let host = Host::instance().expect("WARP device");
         assert!(host.is_software());
         let expected = [123, 1, 0xa1234567, 0x1f, 0x41800000, 0x42000000, 17, 23];
         let (faults, mapped, _) =
@@ -107,7 +111,7 @@ mod tests {
                 .add(MEMORY_FAULTS as usize)
                 .cast::<[u32; 8]>()
                 .write(expected);
-            list.list.ResourceBarrier(&[transition(
+            list.list.ResourceBarrier(&[StateBits::transition(
                 &faults,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

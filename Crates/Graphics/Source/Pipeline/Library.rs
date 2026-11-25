@@ -171,7 +171,10 @@ pub(crate) fn label(text: String) {
 struct Call(u32, u64);
 
 fn call(what: &'static str, name: &str) -> Call {
-    let (thread, since) = (crate::host::thread_id(), crate::host::now_us());
+    let (thread, since) = (
+        crate::host::HostClock::thread_id(),
+        crate::host::HostClock::now_us(),
+    );
     let label = LABEL.with(|l| l.borrow().clone());
     CALLS.lock().unwrap_or_else(|e| e.into_inner()).push((
         thread,
@@ -193,7 +196,7 @@ impl Drop for Call {
 
 pub(crate) fn removal_note() -> String {
     use std::fmt::Write;
-    let now = crate::host::now_us();
+    let now = crate::host::HostClock::now_us();
     let mut text = String::from("pipeline library: ");
     {
         let calls = CALLS.lock().unwrap_or_else(|e| e.into_inner());
@@ -217,7 +220,7 @@ pub(crate) fn removal_note() -> String {
         text.push_str("; its file is not mapped");
         return text;
     }
-    let ago = |ms: u64| crate::host::now_ms().saturating_sub(ms) as f64 / 1000.0;
+    let ago = |ms: u64| crate::host::HostClock::now_ms().saturating_sub(ms) as f64 / 1000.0;
     let _ = write!(
         text,
         "; its file is mapped ({len} bytes), the handle {}",
@@ -284,8 +287,9 @@ pub(crate) fn trim() {
     {
         return;
     }
-    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-    if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
+    let quiet_ms =
+        crate::host::HostClock::ram_idle_ms(crate::host::HostClock::available_physical_ram());
+    if crate::host::HostClock::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
         || TRIMMED.swap(true, Ordering::Relaxed)
     {
         return;
@@ -293,8 +297,8 @@ pub(crate) fn trim() {
     let work = move || {
         unsafe { windows_sys::Win32::System::Memory::VirtualUnlock(at as *const _, len) };
         TRIMMED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-        TRIMMED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
-        crate::host::trail(|| {
+        TRIMMED_AT.store(crate::host::HostClock::now_ms(), Ordering::Relaxed);
+        crate::host::HostTrail::trail(|| {
             format!("pipeline library: the mapped file's pages let go from memory ({len} bytes)")
         });
     };
@@ -343,7 +347,10 @@ fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
-            let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
+            let device = crate::host::Host::instance()?
+                .device
+                .cast::<ID3D12Device1>()
+                .ok()?;
             let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
             let library = open(&device, blob);
             if library.is_none() {
@@ -375,7 +382,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                 if let Blob::Mapped(file) = &blob {
                     VIEW[1].store(file.len, Ordering::Relaxed);
                     VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
-                    LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+                    LOADED_AT.store(crate::host::HostClock::now_ms(), Ordering::Relaxed);
                 }
                 return Some(Library {
                     library,
@@ -431,12 +438,12 @@ pub(crate) fn pipeline(
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
-    LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
+    LOADED_AT.store(crate::host::HostClock::now_ms(), Ordering::Relaxed);
     TRIMMED.store(false, Ordering::Relaxed);
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
-            crate::host::trail(|| {
+            crate::host::HostTrail::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!(
                     "pipeline library: loaded {label} in {:.1} ms",
@@ -452,7 +459,7 @@ pub(crate) fn pipeline(
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
-    crate::host::trail(|| {
+    crate::host::HostTrail::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
             "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
@@ -517,10 +524,10 @@ pub(crate) fn save(now: bool) {
     if bytes > 0 && library_written.is_ok() {
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
-            REPLACED[1].store(crate::host::now_ms(), Ordering::Relaxed);
+            REPLACED[1].store(crate::host::HostClock::now_ms(), Ordering::Relaxed);
             REPLACED[0].fetch_add(1, Ordering::Relaxed);
         }
-        crate::host::trail(|| {
+        crate::host::HostTrail::trail(|| {
             format!(
                 "pipeline library: saved {bytes} bytes, {}",
                 if in_place {
@@ -623,7 +630,8 @@ mod tests {
 
     #[test]
     fn a_rejected_blob_gives_an_empty_library() {
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        let Some(device) =
+            crate::host::Host::instance().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
         else {
             return;
         };

@@ -4,7 +4,7 @@ use windows_sys::Win32::System::Memory::*;
 
 #[test]
 fn a_raw_gpu_write_follows_the_recorded_owner_of_a_reused_page() {
-    let Some(host) = host() else {
+    let Some(host) = Host::instance() else {
         assert!(std::env::var_os("LEONIDA_D3D12_WARP").is_none());
         return;
     };
@@ -36,7 +36,7 @@ fn a_raw_gpu_write_follows_the_recorded_owner_of_a_reused_page() {
             uint2 entry = directory.Load2(page * 8);
             if (entry.x) pages[entry.x].Store(entry.y + offset, marker);
         }"#;
-    let code = crate::host::compile(source, s!("main"), s!("cs_5_1")).unwrap();
+    let code = crate::host::PlanePass::compile(source, s!("main"), s!("cs_5_1")).unwrap();
     let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &code) }.unwrap();
     let pso: ID3D12PipelineState = unsafe {
         host.device

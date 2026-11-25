@@ -454,11 +454,9 @@ impl DispatchShape {
         };
         let mut signature: Option<ID3D12CommandSignature> = None;
         let result = unsafe {
-            crate::host::host()?.device.CreateCommandSignature(
-                &desc,
-                None::<&ID3D12RootSignature>,
-                &mut signature,
-            )
+            crate::host::Host::instance()?
+                .device
+                .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature)
         };
         if let Err(e) = result {
             once!(error = %e, kind, stride, "host command signature refused");
@@ -591,7 +589,7 @@ impl ViewInspector {
     #[cfg(feature = "diagnostics")]
     fn print_4k(at: u64) -> String {
         let mut bytes = [0u8; 4096];
-        if at == 0 || !crate::host::read_into(at as *const u8, &mut bytes) {
+        if at == 0 || !crate::host::TitleCopy::read_into(at as *const u8, &mut bytes) {
             return "unreadable".into();
         }
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
@@ -745,7 +743,7 @@ impl FixedState {
         crate::capture::op(std::ptr::from_ref(list) as usize, || {
             format!("DEPTH BOUNDS {min}..{max}")
         });
-        if crate::host::host().is_some_and(|h| h.depth_bounds())
+        if crate::host::Host::instance().is_some_and(|h| h.depth_bounds())
             && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
         {
             unsafe { l1.OMSetDepthBounds(min, max) };
@@ -845,7 +843,7 @@ impl State {
     }
 
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             return;
         };
         self.target_handles.clear();
@@ -1220,7 +1218,7 @@ impl State {
         }
         let l = &list.list;
         self.early_textures(list, p, compute);
-        if crate::host::walls_trace() {
+        if crate::host::HostTrail::walls_trace() {
             self.walls_census(p, compute);
         }
         if self.host_heaps != self.heaps {
@@ -1697,7 +1695,7 @@ impl State {
                     slot = index,
                     "the host device went while buffer views of the heap were made; one of: {last:#?}"
                 );
-                crate::host::log_removal_context();
+                crate::host::HostTrail::log_removal_context();
             }
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
                 continue;
@@ -1838,7 +1836,7 @@ impl State {
             return;
         }
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let now = crate::host::now_ms().max(1);
+        let now = crate::host::HostClock::now_ms().max(1);
         let next = NEXT.load(Ordering::Relaxed);
         let due_now = if next == 0 { !room } else { now >= next };
         if !due_now
@@ -1945,7 +1943,7 @@ impl State {
         }
         Self::card_accounting(heap, host, frame, room);
         static PASSED: AtomicU64 = AtomicU64::new(0);
-        let now = crate::host::now_ms();
+        let now = crate::host::HostClock::now_ms();
         let took = now
             .saturating_sub(PASSED.swap(now, Ordering::Relaxed))
             .max(1);
@@ -2102,7 +2100,7 @@ impl State {
                     slot = index,
                     "the host device went while textures picked by index were made ready; last: {text}"
                 );
-                crate::host::log_removal_context();
+                crate::host::HostTrail::log_removal_context();
                 return;
             }
             let (bytes, whole) =
@@ -2480,7 +2478,10 @@ impl State {
                     Self::slot_words(&mut text, heap, &label, address, len as usize);
                     if u.slot == 1 && u.table_offset_dwords == DRAW_CONSTANTS && len >= 0x20 {
                         let mut word = [0u8; 4];
-                        if crate::host::read_into((address + 0x1c) as *const u8, &mut word) {
+                        if crate::host::TitleCopy::read_into(
+                            (address + 0x1c) as *const u8,
+                            &mut word,
+                        ) {
                             material = Some(u32::from_le_bytes(word));
                         }
                     }
@@ -2566,7 +2567,8 @@ impl State {
     ) {
         use std::fmt::Write;
         let mut bytes = vec![0u8; len.min(512) & !3];
-        if bytes.is_empty() || !crate::host::read_into(address as *const u8, &mut bytes) {
+        if bytes.is_empty() || !crate::host::TitleCopy::read_into(address as *const u8, &mut bytes)
+        {
             let _ = write!(
                 text,
                 "\n    ~raw {label} at {address:#x} bytes {len}: unreadable"
@@ -3568,7 +3570,7 @@ mod tests {
     #[test]
     fn recorded_root_views_follow_the_buffer_at_a_reused_address() {
         use windows::core::{IUnknown, s};
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             assert!(
                 std::env::var_os("LEONIDA_D3D12_WARP").is_none(),
                 "WARP unavailable"
@@ -3601,7 +3603,7 @@ mod tests {
         let list = host.new_list().unwrap();
         let signature = r#"[RootSignature("DescriptorTable(SRV(t0)),DescriptorTable(UAV(u0))")]
             [numthreads(1,1,1)] void main() {}"#;
-        let code = crate::host::compile(signature, s!("main"), s!("cs_5_1")).unwrap();
+        let code = crate::host::PlanePass::compile(signature, s!("main"), s!("cs_5_1")).unwrap();
         let root: ID3D12RootSignature =
             unsafe { host.device.CreateRootSignature(0, &code).unwrap() };
         unsafe {
@@ -3645,7 +3647,7 @@ mod tests {
         use crate::descriptor::Descriptors;
         use crate::descriptor::host::{HostHeap, placed_texture};
         use windows::core::{IUnknown, s};
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             assert!(
                 std::env::var_os("LEONIDA_D3D12_WARP").is_none(),
                 "WARP device unavailable"
@@ -3653,7 +3655,7 @@ mod tests {
             return;
         };
         let pipeline = |source: &str| unsafe {
-            let code = crate::host::compile(source, s!("main"), s!("cs_5_1")).unwrap();
+            let code = crate::host::PlanePass::compile(source, s!("main"), s!("cs_5_1")).unwrap();
             let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).unwrap();
             let pso: ID3D12PipelineState = host
                 .device
@@ -3766,11 +3768,12 @@ mod tests {
                 list.list
                     .SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
                 list.list.Dispatch(1, 1, 1);
-                list.list.ResourceBarrier(&[crate::host::transition(
-                    &output,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
+                list.list
+                    .ResourceBarrier(&[crate::host::StateBits::transition(
+                        &output,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
                 list.list.CopyBufferRegion(&readback, 0, &output, 0, 64);
             }
             list.close();

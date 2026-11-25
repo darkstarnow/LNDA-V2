@@ -355,7 +355,7 @@ impl ResourceFormat {
             static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
             let refused = REFUSED.get_or_init(|| {
                 STAND_INS.map(|(f, _)| {
-                    let Some(host) = crate::host::host() else {
+                    let Some(host) = crate::host::Host::instance() else {
                         return false;
                     };
                     let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
@@ -829,8 +829,10 @@ impl GpuResource {
                     "depth texture with unordered access"
                 );
             }
-            let state =
-                crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+            let state = crate::host::StateBits::legal_state(
+                &texture,
+                crate::host::StateBits::texture_state(r.host.state),
+            );
             let mut host = HostTexture::new(texture, state);
             host.filled = GpuResource::fills(&r.desc);
             if host.filled {
@@ -845,7 +847,7 @@ impl GpuResource {
             *made = Some((std::sync::Arc::new(host), twin));
             crate::descriptor::ViewWaits::made(this as usize);
         }
-        r.host.used.store(crate::host::moment(), Relaxed);
+        r.host.used.store(crate::host::HostClock::moment(), Relaxed);
         made.clone()
     }
 
@@ -1182,7 +1184,7 @@ impl Twin {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         }
-        let host = crate::host::host()?;
+        let host = crate::host::Host::instance()?;
         let mut d = *desc;
         d.layout = 0;
         d.alignment = 0;
@@ -1210,7 +1212,7 @@ impl Twin {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         };
-        crate::host::name(&texture, || {
+        crate::host::HostSetup::name(&texture, || {
             format!("depth twin {}x{} f{}", d.width, d.height, d.format)
         });
         let through = if stencil {
@@ -1262,7 +1264,7 @@ impl Twin {
                 tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
             }
             texture.map(|texture| {
-                crate::host::name(&texture, || {
+                crate::host::HostSetup::name(&texture, || {
                     format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
                 });
                 std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS))
@@ -1643,7 +1645,7 @@ impl HostTextures {
         if filled < FLOOR {
             return true;
         }
-        match crate::host::host().and_then(|h| h.video_memory()) {
+        match crate::host::Host::instance().and_then(|h| h.video_memory()) {
             Some([budget, used, ..]) => used < budget / 100 * HostTextures::room_percent(),
             None => filled < WITHOUT_BUDGET,
         }
@@ -1700,7 +1702,7 @@ impl HostTextures {
         {
             *slot = now.saturating_sub(before.swap(now, Relaxed));
         }
-        let video = crate::host::host().and_then(|h| h.video_memory());
+        let video = crate::host::Host::instance().and_then(|h| h.video_memory());
         let noted_us = began.elapsed().as_micros() as u64;
         let walk = move || {
             fn texels(m: &texture::Mip) -> u64 {
@@ -1866,7 +1868,9 @@ impl HostTextures {
         if !*ON.get_or_init(|| std::env::var_os("LEONIDA_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
             return;
         }
-        let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+        let idle_ms = crate::host::HostClock::vram_idle_ms(
+            crate::host::Host::instance().and_then(|h| h.video_memory()),
+        );
         let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
         let all = PlacedTextures::tracked();
         for &at in all.iter() {
@@ -1877,9 +1881,12 @@ impl HostTextures {
             let gone = {
                 let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
                 let idle = made.as_ref().is_some_and(|(host, _)| {
-                    crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
-                        && std::sync::Arc::strong_count(host) == 1
-                        && crate::host::references(&host.texture) == 1
+                    crate::host::HostClock::long_ago(
+                        r.host.used.load(Relaxed),
+                        idle_ms,
+                        IDLE_FRAMES,
+                    ) && std::sync::Arc::strong_count(host) == 1
+                        && crate::host::Retirement::references(&host.texture) == 1
                 });
                 if idle {
                     crate::texture::TextureUploads::unstage(at as This);
@@ -1897,11 +1904,11 @@ impl HostTextures {
                 if first.is_none() {
                     first = Some(at);
                 }
-                crate::host::retire(host);
+                crate::host::Retirement::retire(host);
             }
         }
         if went > 0 {
-            crate::host::trail(|| {
+            crate::host::HostTrail::trail(|| {
                 format!(
                     "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
                     bytes >> 10,
@@ -1936,7 +1943,7 @@ impl HostTextures {
                             && !crate::texture::TitleMemoryMap::committed(r.data().cast_const(), 1)
                         {
                             count[8] += host.bytes * EVERY;
-                            if crate::host::references(&host.texture) > 1 {
+                            if crate::host::Retirement::references(&host.texture) > 1 {
                                 count[9] += host.bytes * EVERY;
                             }
                         }
@@ -1953,7 +1960,7 @@ impl HostTextures {
 
     #[cfg(windows)]
     fn bytes_of(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             return 0;
         };
         unsafe {
@@ -2012,7 +2019,7 @@ impl HostTextures {
         if desc.dimension == BUFFER {
             return None;
         }
-        let host = crate::host::host()?;
+        let host = crate::host::Host::instance()?;
         let mut d = *desc;
         d.layout = 0;
         d.alignment = 0;
@@ -2057,9 +2064,9 @@ impl HostTextures {
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(crate::host::legal_for(
+                D3D12_RESOURCE_STATES(crate::host::StateBits::legal_for(
                     d.flags,
-                    crate::host::texture_state(state),
+                    crate::host::StateBits::texture_state(state),
                 ) as i32),
                 clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
                 &mut texture,
@@ -2069,7 +2076,7 @@ impl HostTextures {
             tracing::warn!(error = %e, desc = ?d, "no host texture");
         }
         if let Some(t) = &texture {
-            crate::host::name(t, || {
+            crate::host::HostSetup::name(t, || {
                 format!(
                     "texture {}x{} f{} flags {:#x}",
                     d.width, d.height, d.format, d.flags
@@ -2247,9 +2254,9 @@ impl Drop for GpuResource {
             }
         }
         if let Some((host, twin)) = made {
-            crate::host::retire(host);
+            crate::host::Retirement::retire(host);
             if let Some(twin) = twin {
-                crate::host::retire(twin);
+                crate::host::Retirement::retire(twin);
             }
         }
         crate::texture::HostWrites::forget(
@@ -2546,7 +2553,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn addressable_render_xor_texture_uploads_from_guest_memory() {
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             assert!(
                 std::env::var_os("LEONIDA_D3D12_WARP").is_none(),
                 "requested WARP device unavailable"
@@ -2692,7 +2699,7 @@ mod tests {
     #[test]
     fn submission_preludes_preserve_each_intermediate_texture_value() {
         use windows::Win32::Graphics::Direct3D12::*;
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             return;
         };
         let null = std::ptr::null();
@@ -2775,7 +2782,7 @@ mod tests {
     #[test]
     fn buffer_data_reaches_the_host_texture() {
         use windows::Win32::Graphics::Direct3D12::*;
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             return;
         };
         let null = std::ptr::null();
@@ -2930,11 +2937,12 @@ mod tests {
             footprint: to.footprint,
         };
         unsafe {
-            back.list.ResourceBarrier(&[crate::host::transition(
-                host_image,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
+            back.list
+                .ResourceBarrier(&[crate::host::StateBits::transition(
+                    host_image,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
             back.list.CopyTextureRegion(
                 (&raw const out_to).cast(),
                 0,
@@ -2971,7 +2979,7 @@ mod tests {
     fn a_depth_texture_and_its_twin_copy_into_each_other() {
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             return;
         };
         let null = std::ptr::null();
@@ -3074,7 +3082,7 @@ mod tests {
             D3D12_RESOURCE_STATE_COPY_SOURCE,
             D3D12_RESOURCE_STATE_COPY_DEST,
         );
-        let moved = crate::host::transition;
+        let moved = crate::host::StateBits::transition;
         let list = host.new_list().unwrap();
         unsafe {
             let l = &list.list;
@@ -3121,7 +3129,7 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             return;
         };
         let null = std::ptr::null();
@@ -3228,7 +3236,7 @@ mod tests {
             D3D12_RESOURCE_STATE_COPY_SOURCE,
             D3D12_RESOURCE_STATE_COPY_DEST,
         );
-        let moved = crate::host::transition;
+        let moved = crate::host::StateBits::transition;
 
         let fill = host.new_list().unwrap();
         unsafe {
@@ -3298,7 +3306,7 @@ mod tests {
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
         use windows::core::s;
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             assert!(
                 std::env::var_os("LEONIDA_D3D12_WARP").is_none(),
                 "requested WARP device could not be created"
@@ -3444,7 +3452,7 @@ mod tests {
             D3D12_RESOURCE_STATE_DEPTH_WRITE,
             D3D12_RESOURCE_STATE_RENDER_TARGET,
         );
-        let moved = crate::host::transition;
+        let moved = crate::host::StateBits::transition;
 
         let fill = host.new_list().unwrap();
         unsafe {
@@ -3487,8 +3495,8 @@ float4 corner(uint i : SV_VertexID) : SV_Position {
 }
 float4 lit() : SV_Target { return 1.0; }
 "#;
-        let vs = crate::host::compile(SOURCE, s!("corner"), s!("vs_5_1")).unwrap();
-        let ps = crate::host::compile(SOURCE, s!("lit"), s!("ps_5_1")).unwrap();
+        let vs = crate::host::PlanePass::compile(SOURCE, s!("corner"), s!("vs_5_1")).unwrap();
+        let ps = crate::host::PlanePass::compile(SOURCE, s!("lit"), s!("ps_5_1")).unwrap();
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
@@ -3598,7 +3606,7 @@ float4 lit() : SV_Target { return 1.0; }
     #[test]
     fn sparse_input_capture_preserves_the_bound_state_and_pre_dispatch_pixels() {
         use windows::Win32::Graphics::Direct3D12::*;
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             assert!(
                 std::env::var_os("LEONIDA_D3D12_WARP").is_none(),
                 "requested WARP device unavailable"
@@ -3695,7 +3703,7 @@ float4 lit() : SV_Target { return 1.0; }
     #[test]
     fn texture_copyback_preserves_padding_and_owns_the_destination() {
         use windows::Win32::Graphics::Direct3D12::*;
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             assert!(
                 std::env::var_os("LEONIDA_D3D12_WARP").is_none(),
                 "requested WARP device could not be created"
@@ -3799,7 +3807,7 @@ float4 lit() : SV_Target { return 1.0; }
             list.texture_written(title);
             assert_eq!(GpuResource::release(title), 1);
             list.close();
-            if crate::host::late() {
+            if crate::host::LateRun::on() {
                 let mut from_next_list = vec![0x42u8; size];
                 let consumer = host.new_list().unwrap();
                 consumer.defer_fill(from_next_list.as_mut_ptr(), at as *const u8, size);
@@ -3817,7 +3825,7 @@ float4 lit() : SV_Target { return 1.0; }
                     host.execute_late(vec![producer], vec![0]);
                     host.execute_late(vec![consumer], vec![0]);
                 }
-                crate::host::settle_for_fence();
+                crate::host::LateRun::settle_for_fence();
                 signal.join().unwrap();
                 assert_eq!(
                     from_next_list
@@ -3856,7 +3864,7 @@ float4 lit() : SV_Target { return 1.0; }
             assert_eq!(GpuResource::release(second), 1);
             drop(abandoned);
             let references = ResourceHeap::release(heap);
-            if !crate::host::late() {
+            if !crate::host::LateRun::on() {
                 assert_eq!(references, 0, "no texture reference leaked");
             }
             eprintln!(

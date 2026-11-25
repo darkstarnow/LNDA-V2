@@ -201,7 +201,7 @@ impl Device {
     #[cfg(windows)]
     fn title_words(at: usize) -> Option<Vec<u64>> {
         let mut bytes = [0u8; 128];
-        (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
+        (at != 0 && crate::host::TitleCopy::read_into(at as *const u8, &mut bytes)).then(|| {
             bytes
                 .as_chunks::<8>()
                 .0
@@ -475,7 +475,7 @@ mod tests {
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_FENCE_FLAG_NONE, ID3D12Device5, ID3D12Fence,
         };
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             return;
         };
         unsafe {

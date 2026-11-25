@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 
 use super::{Shader, Translated};
-use crate::host::host;
+use crate::host::Host;
 
 pub(crate) struct GraphicsState {
     blend: D3D12_BLEND_DESC,
@@ -379,7 +379,7 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
+        if mesh.is_some() && !Host::instance()?.mesh_shaders() {
             return refuse(
                 "the host GPU has no mesh shaders (or no shader model 6.6)",
                 shaders,
@@ -388,7 +388,7 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
-        let host = host()?;
+        let host = Host::instance()?;
 
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
@@ -546,7 +546,7 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
+            crate::host::HostSetup::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
@@ -603,7 +603,7 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
+            crate::host::HostSetup::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -702,7 +702,7 @@ impl HostPipeline {
             }
         };
         tracing::info!(?shaders, "host pipeline");
-        crate::host::name(&pso, || format!("{shaders:?}"));
+        crate::host::HostSetup::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
             depth = ?g.depth,
@@ -1103,7 +1103,7 @@ mod tests {
 
     #[test]
     fn a_mesh_pipeline_loads_from_the_library() {
-        let Some(host) = host() else {
+        let Some(host) = Host::instance() else {
             return;
         };
         if !host.mesh_shaders() {
@@ -1140,14 +1140,14 @@ mod tests {
 
     #[test]
     fn depth_bounds_pipeline_loads_and_filters_draws() {
-        let Some(host) = host() else {
+        let Some(host) = Host::instance() else {
             return;
         };
         if !host.depth_bounds() {
             eprintln!("no host depth bounds support; skipped");
             return;
         }
-        if crate::host::on_warp() {
+        if crate::host::HostSetup::warp() {
             eprintln!("the software adapter does not apply depth bounds; skipped");
             return;
         }
@@ -1349,11 +1349,12 @@ mod tests {
                     windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
                 );
                 list.list.DrawInstanced(3, 1, 0, 0);
-                list.list.ResourceBarrier(&[crate::host::transition(
-                    &color,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
+                list.list
+                    .ResourceBarrier(&[crate::host::StateBits::transition(
+                        &color,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
                 let dst = D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(&readback),
                     Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -1378,11 +1379,12 @@ mod tests {
                     },
                 };
                 list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-                list.list.ResourceBarrier(&[crate::host::transition(
-                    &color,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                )]);
+                list.list
+                    .ResourceBarrier(&[crate::host::StateBits::transition(
+                        &color,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    )]);
             }
             list.close();
             host.execute(&[&list]);

@@ -444,7 +444,7 @@ impl Descriptors {
     #[cfg(windows)]
     pub(crate) fn checked_view(handle: u64) -> Option<View> {
         let mut bytes = [0u8; 12];
-        if handle == 0 || !crate::host::read_into(handle as *const u8, &mut bytes) {
+        if handle == 0 || !crate::host::TitleCopy::read_into(handle as *const u8, &mut bytes) {
             return None;
         }
         let word = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
@@ -884,7 +884,9 @@ mod tests {
     fn scalar_heap_addresses_follow_title_descriptor_creation_copies_and_reuse() {
         use windows::Win32::Graphics::Direct3D12::D3D12_RANGE;
 
-        let Some(_) = crate::host::host() else { return };
+        let Some(_) = crate::host::Host::instance() else {
+            return;
+        };
         let null = std::ptr::null();
         let mut object = null;
         let desc = HeapDesc {
@@ -955,7 +957,9 @@ mod tests {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
         };
-        let Some(_) = crate::host::host() else { return };
+        let Some(_) = crate::host::Host::instance() else {
+            return;
+        };
         let null = std::ptr::null();
         let mut object = null;
         assert_eq!(
@@ -1115,7 +1119,7 @@ mod tests {
     #[test]
     fn material_demand_follows_gpu_record_and_rejects_reused_texture_memory() {
         use windows::Win32::Graphics::Direct3D12::*;
-        let Some(device) = crate::host::host() else {
+        let Some(device) = crate::host::Host::instance() else {
             return;
         };
         let null = std::ptr::null();
@@ -1208,11 +1212,12 @@ mod tests {
             std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), mapped, bytes as usize);
             list.list
                 .CopyBufferRegion(&shadow.buffer, shadow.offset(address), &upload, 0, bytes);
-            list.list.ResourceBarrier(&[crate::host::transition(
-                &shadow.buffer,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
+            list.list
+                .ResourceBarrier(&[crate::host::StateBits::transition(
+                    &shadow.buffer,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
         }
         crate::material_demand::record(&list, heap, heap.start, 0, &[0, 16, 20]);
         list.close();

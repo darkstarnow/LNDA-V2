@@ -397,7 +397,7 @@ impl CommandList {
             newer: [0; 256],
             uploads: Default::default(),
             #[cfg(windows)]
-            host: crate::host::host().and_then(|h| match h.new_list() {
+            host: crate::host::Host::instance().and_then(|h| match h.new_list() {
                 Ok(list) => Some(list),
                 Err(e) => {
                     tracing::warn!(error = %e, "no host command list");
@@ -470,14 +470,14 @@ impl CommandList {
                 if b.flags & BEGIN_ONLY != 0 {
                     return None;
                 }
-                let wanted = crate::host::texture_state(b.last as u32);
+                let wanted = crate::host::StateBits::texture_state(b.last as u32);
                 let (texture, before) = list.transition(b.first, wanted)?;
                 Some(Barrier {
                     kind: 0,
                     flags: 0,
                     first: texture.as_raw().cast_const().cast(),
                     second: 0xffff_ffff | (u64::from(before) << 32),
-                    last: u64::from(crate::host::legal_state(texture, wanted)),
+                    last: u64::from(crate::host::StateBits::legal_state(texture, wanted)),
                 })
             }
             1 => Some(Barrier {
@@ -546,9 +546,12 @@ impl CommandList {
     pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
         if let Some((texture, before)) = list.transition(resource, state) {
-            let state = crate::host::legal_state(texture, state);
-            let barrier =
-                crate::host::transition(texture, State(before as i32), State(state as i32));
+            let state = crate::host::StateBits::legal_state(texture, state);
+            let barrier = crate::host::StateBits::transition(
+                texture,
+                State(before as i32),
+                State(state as i32),
+            );
             unsafe { list.list.ResourceBarrier(&[barrier]) };
         }
     }
@@ -701,7 +704,9 @@ impl CommandList {
             #[cfg(feature = "diagnostics")]
             let mut read = None;
             if src.kind == FOOTPRINT {
-                let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+                let (Some(host), Some(bytes)) =
+                    (crate::host::Host::instance(), src.footprint.bytes())
+                else {
                     return;
                 };
                 let Some(data) = Self::buffer_range(src.resource, src.footprint.offset, bytes)
@@ -799,7 +804,7 @@ impl CommandList {
         if (x, y, z) != (0, 0, 0) {
             return Err("a destination corner other than the footprint's");
         }
-        let host = crate::host::host().ok_or("no host")?;
+        let host = crate::host::Host::instance().ok_or("no host")?;
         let (footprint, [size, row, rows, pitch]) =
             dst.footprint.host_rows().ok_or("an unknown format")?;
         let bytes = pitch * (rows - 1) + row;
@@ -944,7 +949,7 @@ impl CommandList {
             };
             let (Some(texture), Some(host)) = (
                 crate::resource::HostTextures::host_resource(record.resource),
-                crate::host::host(),
+                crate::host::Host::instance(),
             ) else {
                 return;
             };
@@ -958,11 +963,12 @@ impl CommandList {
             unsafe {
                 if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                    list.list.ResourceBarrier(&[crate::host::transition(
-                        texture,
-                        State(before as i32),
-                        State(RENDER_TARGET as i32),
-                    )]);
+                    list.list
+                        .ResourceBarrier(&[crate::host::StateBits::transition(
+                            texture,
+                            State(before as i32),
+                            State(RENDER_TARGET as i32),
+                        )]);
                 }
                 list.list.ClearRenderTargetView(rtv, color, rects);
             }
@@ -991,7 +997,7 @@ impl CommandList {
             };
             let (Some(texture), Some(host)) = (
                 crate::resource::HostTextures::host_resource(record.resource),
-                crate::host::host(),
+                crate::host::Host::instance(),
             ) else {
                 return;
             };
@@ -1401,7 +1407,7 @@ impl ListPool {
         };
         match idle {
             Some(Idle(list, _)) => Some(list),
-            None => crate::host::host().and_then(|h| h.new_list().ok()),
+            None => crate::host::Host::instance().and_then(|h| h.new_list().ok()),
         }
     }
 
@@ -1795,7 +1801,7 @@ impl ValueWait {
             return true;
         }
         let mut raw = [0u8; 8];
-        if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
+        if !crate::host::TitleCopy::read_into(self.address as *const u8, &mut raw[..bytes]) {
             return true;
         }
         self.holds_for(u64::from_le_bytes(raw))

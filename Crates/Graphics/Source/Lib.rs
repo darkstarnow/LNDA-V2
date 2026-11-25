@@ -79,7 +79,7 @@ mod watch;
 mod writeback;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::HostSetup;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]

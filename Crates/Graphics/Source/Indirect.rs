@@ -3,7 +3,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{Host, HostList, StateBits};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
@@ -133,7 +133,9 @@ fn clamp() -> Option<&'static Clamp> {
 }
 
 fn make() -> windows::core::Result<Clamp> {
-    let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+    let device = &Host::instance()
+        .ok_or_else(windows::core::Error::empty)?
+        .device;
     make_for(device)
 }
 
@@ -325,7 +327,7 @@ fn record_clamp_as(
     let waits = true;
     let first = [
         uav_barrier(),
-        transition(
+        StateBits::transition(
             dst,
             D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -333,7 +335,7 @@ fn record_clamp_as(
     ];
     let second = [
         uav_barrier(),
-        transition(
+        StateBits::transition(
             dst,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
@@ -363,7 +365,7 @@ pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
 
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     unsafe {
-        list.ResourceBarrier(&[transition(
+        list.ResourceBarrier(&[StateBits::transition(
             scratch,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             D3D12_RESOURCE_STATE_COMMON,
@@ -759,14 +761,14 @@ void main() {
             let source = if resource == &a { &first } else { &second };
             expected[at as usize..at as usize + hi - lo].copy_from_slice(&source[lo..hi]);
         }
-        crate::host::copy_fetch_runs(&warp.list, &out, slices.into_iter());
+        crate::host::LateRun::copy_fetch_runs(&warp.list, &out, slices.into_iter());
         warp.submit_and_wait();
         assert_eq!(unsafe { std::slice::from_raw_parts(bytes, 256) }, expected);
     }
 
     #[test]
     fn argument_clamp_builds() {
-        if super::host().is_none() {
+        if super::Host::instance().is_none() {
             return;
         }
         assert!(super::clamp().is_some());
@@ -877,14 +879,14 @@ void main() {
         done_on(&warp.list, &dst_buf);
 
         unsafe {
-            warp.list.ResourceBarrier(&[transition(
+            warp.list.ResourceBarrier(&[StateBits::transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             warp.list
                 .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, u64::from(STRIDE * 5));
-            warp.list.ResourceBarrier(&[transition(
+            warp.list.ResourceBarrier(&[StateBits::transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_COMMON,
@@ -1048,14 +1050,14 @@ void main() {
             ));
             done_on(&warp.list, &dst_buf);
             unsafe {
-                warp.list.ResourceBarrier(&[transition(
+                warp.list.ResourceBarrier(&[StateBits::transition(
                     &dst_buf,
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
                 warp.list
                     .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
-                warp.list.ResourceBarrier(&[transition(
+                warp.list.ResourceBarrier(&[StateBits::transition(
                     &dst_buf,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_COMMON,
@@ -1155,14 +1157,14 @@ void main() {
         done_on(&warp.list, &dst_buf);
 
         unsafe {
-            warp.list.ResourceBarrier(&[transition(
+            warp.list.ResourceBarrier(&[StateBits::transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             warp.list
                 .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total_bytes as u64);
-            warp.list.ResourceBarrier(&[transition(
+            warp.list.ResourceBarrier(&[StateBits::transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_COMMON,
@@ -1207,7 +1209,7 @@ void main() {
 
     #[test]
     fn host_list_reuses_and_grows_scratch_across_submissions() {
-        let Some(host) = super::host() else {
+        let Some(host) = super::Host::instance() else {
             return;
         };
         let Ok(list) = host.new_list() else {
@@ -1269,7 +1271,7 @@ mod bare_cost {
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::{Interface, s};
 
-    use crate::host::{compile, transition};
+    use crate::host::{PlanePass, StateBits};
 
     const DRAWS: u32 = 10_000;
     const WIDTH: u32 = 2560;
@@ -1481,12 +1483,12 @@ void work() {
 
     impl Rig {
         fn new() -> Option<Self> {
-            let vs = compile(DRAW, s!("corner"), s!("vs_5_1")).ok()?;
+            let vs = PlanePass::compile(DRAW, s!("corner"), s!("vs_5_1")).ok()?;
             let ps = [
-                compile(DRAW, s!("first"), s!("ps_5_1")).ok()?,
-                compile(DRAW, s!("second"), s!("ps_5_1")).ok()?,
+                PlanePass::compile(DRAW, s!("first"), s!("ps_5_1")).ok()?,
+                PlanePass::compile(DRAW, s!("second"), s!("ps_5_1")).ok()?,
             ];
-            let cs = compile(WORK, s!("work"), s!("cs_5_1")).ok()?;
+            let cs = PlanePass::compile(WORK, s!("work"), s!("cs_5_1")).ok()?;
             unsafe {
                 let mut device: Option<ID3D12Device> = None;
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
@@ -1742,8 +1744,16 @@ void work() {
                             Between::Nothing => {}
                             Between::Pipeline => l.SetPipelineState(&self.pipelines[odd]),
                             Between::BarrierPair => {
-                                l.ResourceBarrier(&[transition(&self.other, target, read)]);
-                                l.ResourceBarrier(&[transition(&self.other, read, target)]);
+                                l.ResourceBarrier(&[StateBits::transition(
+                                    &self.other,
+                                    target,
+                                    read,
+                                )]);
+                                l.ResourceBarrier(&[StateBits::transition(
+                                    &self.other,
+                                    read,
+                                    target,
+                                )]);
                             }
                             Between::DepthMove => {
                                 let (from, to) = if odd == 0 {
@@ -1751,7 +1761,7 @@ void work() {
                                 } else {
                                     (tested, written)
                                 };
-                                l.ResourceBarrier(&[transition(&self.depth, from, to)]);
+                                l.ResourceBarrier(&[StateBits::transition(&self.depth, from, to)]);
                             }
                             Between::Heaps => {
                                 l.SetDescriptorHeaps(&self.heap_pairs[odd]);

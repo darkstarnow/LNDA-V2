@@ -17,7 +17,7 @@ extern "system" fn create_device(
     );
     leonida_graphics::resource::MemoryHooks::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
-    leonida_graphics::on_failure(host_gpu_failed);
+    leonida_graphics::HostSetup::on_failure(host_gpu_failed);
     device::Device::create(adapter, parameters, iid, out)
 }
 

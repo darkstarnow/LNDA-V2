@@ -83,7 +83,7 @@ pub(crate) fn record(
     retained: crate::resource::ResourceRef,
     texture: &ID3D12Resource,
 ) -> Option<Back> {
-    let host = crate::host::host()?;
+    let host = crate::host::Host::instance()?;
     let resource = retained.as_ptr();
     let (layout, at, size) = crate::resource::PlacedTextures::title_texture(resource)?;
     at.checked_add(size)?;
@@ -153,7 +153,7 @@ pub(crate) fn land(back: &Back) {
         return;
     };
     let mut tiled = vec![0u8; back.size];
-    crate::host::copy_mapped(tiled.as_mut_ptr(), back.at as *const u8, back.size, false);
+    crate::host::TitleCopy::copy_mapped(tiled.as_mut_ptr(), back.at as *const u8, back.size, false);
     let mut data = std::ptr::null_mut();
     unsafe {
         if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
@@ -193,7 +193,7 @@ pub(crate) fn land(back: &Back) {
         }
     }
     unsafe { back.buffer.Unmap(0, None) };
-    crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
+    crate::host::TitleCopy::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
     #[cfg(feature = "diagnostics")]
     verify_first_landing(back, &tiled);
 }
@@ -210,7 +210,8 @@ fn verify_first_landing(back: &Back, tiled: &[u8]) {
         seen.push(kind);
     }
     let mut guest = vec![0; tiled.len()];
-    let complete = crate::host::read(back.at as *const u8, guest.as_mut_ptr(), guest.len());
+    let complete =
+        crate::host::TitleCopy::read(back.at as *const u8, guest.as_mut_ptr(), guest.len());
     let verified = complete && guest == tiled;
     let desc = back.layout.desc;
     let (mut finite, mut nonzero, mut lo, mut hi) =

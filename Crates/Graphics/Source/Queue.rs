@@ -130,7 +130,7 @@ impl Held {
     }
 
     fn value_met(wait: &crate::list::ValueWait) -> bool {
-        wait.met() || (crate::host::late() && crate::host::late_met(wait))
+        wait.met() || (crate::host::LateRun::on() && crate::host::LateRun::late_met(wait))
     }
 
     fn run(self, queue: usize, all: bool, rest: &[Held]) {
@@ -148,7 +148,7 @@ impl Held {
             }
             Held::Run(lists, order) => Self::run_lists(queue, all, lists, order, rest),
             Held::Signal(fence, value) => {
-                if !crate::host::late_signal(fence, value) {
+                if !crate::host::LateRun::late_signal(fence, value) {
                     crate::fence::Fence::advance(fence as This, value);
                 }
             }
@@ -185,11 +185,11 @@ impl Held {
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = (queue, rest);
-        if crate::host::late()
-            && let Some(host) = crate::host::host()
+        if crate::host::LateRun::on()
+            && let Some(host) = crate::host::Host::instance()
         {
             host.execute_late(lists, order);
-        } else if let Some(host) = crate::host::host() {
+        } else if let Some(host) = crate::host::Host::instance() {
             let runs: Vec<&crate::host::HostList> =
                 order.iter().map(|&i| lists[i].host()).collect();
             host.execute(&runs);
@@ -352,7 +352,7 @@ impl CommandQueue {
 
     #[cfg(windows)]
     fn submit(this: This, lists: &[This]) -> bool {
-        let Some(host) = crate::host::host() else {
+        let Some(host) = crate::host::Host::instance() else {
             return false;
         };
         if !this.is_null() && Switches::cuts() {
@@ -383,7 +383,7 @@ impl CommandQueue {
                 first < lists.len()
             ),
         );
-        if first > 0 && crate::host::late() {
+        if first > 0 && crate::host::LateRun::on() {
             let (taken, order) = crate::list::CommandList::detach(&lists[..first]);
             host.execute_late(taken, order);
         } else if first > 0 {
@@ -622,7 +622,7 @@ impl CommandQueue {
         }
         #[cfg(windows)]
         if Self::hold(this, || Held::Signal(fence as usize, value))
-            || crate::host::late_signal(fence as usize, value)
+            || crate::host::LateRun::late_signal(fence as usize, value)
         {
             return S_OK;
         }
@@ -811,11 +811,11 @@ impl Presenter {
 
     #[cfg(windows)]
     fn settle() {
-        if crate::host::late() && !crate::host::late_free_present() {
-            crate::host::settle_for_present();
+        if crate::host::LateRun::on() && !crate::host::LateRun::late_free_present() {
+            crate::host::LateRun::settle_for_present();
             Scheduler::release_held(false);
-            crate::host::settle_for_present();
-        } else if crate::host::late() {
+            crate::host::LateRun::settle_for_present();
+        } else if crate::host::LateRun::on() {
             Scheduler::release_held(false);
         }
         Scheduler::release_held(Switches::forces());
@@ -854,7 +854,7 @@ impl Presenter {
     fn show(resource: This, frame: u64) {
         let (Some(texture), Some(host)) = (
             crate::resource::HostTextures::host_resource(resource),
-            crate::host::host(),
+            crate::host::Host::instance(),
         ) else {
             return;
         };

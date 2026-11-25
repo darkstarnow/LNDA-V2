@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
-use crate::host::{HostList, host};
+use crate::host::{Host, HostList};
 use crate::watch::PAGE;
 
 pub(crate) struct Shadow {
@@ -99,7 +99,7 @@ impl ShadowCards {
         if size < least || size >= 1 << 30 {
             return None;
         }
-        let host = host()?;
+        let host = Host::instance()?;
         if !host.card_ready() {
             return None;
         }
@@ -135,7 +135,7 @@ impl ShadowCards {
         if most == 0 || !ShadowCards::enabled() {
             return None;
         }
-        let host = host()?;
+        let host = Host::instance()?;
         if !host.card_ready() {
             return None;
         }
@@ -683,7 +683,7 @@ impl ShadowMemory {
             let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
             let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
             out[0] += (pages * PAGE as u64).min(s.len);
-            if crate::host::references(&s.buffer) > 1 {
+            if crate::host::Retirement::references(&s.buffer) > 1 {
                 out[1] += 1;
                 out[2] += s.len;
             }
@@ -707,17 +707,19 @@ impl ShadowMemory {
             if map.is_empty() {
                 return;
             }
-            let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+            let idle_ms = crate::host::HostClock::ram_idle_ms(
+                crate::host::HostClock::available_physical_ram(),
+            );
             let idle: Vec<(u64, u64)> = map
                 .iter()
                 .filter(|(_, s)| {
                     Arc::strong_count(s) == 1
-                        && crate::host::long_ago(
+                        && crate::host::HostClock::long_ago(
                             s.used.load(Ordering::Relaxed),
                             idle_ms,
                             IDLE_FRAMES,
                         )
-                        && crate::host::references(&s.buffer) == 1
+                        && crate::host::Retirement::references(&s.buffer) == 1
                 })
                 .map(|(key, _)| *key)
                 .collect();
@@ -727,7 +729,7 @@ impl ShadowMemory {
         };
         if !gone.is_empty() {
             let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
-            crate::host::trail(|| {
+            crate::host::HostTrail::trail(|| {
                 format!(
                     "sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot",
                     bytes >> 10
@@ -737,7 +739,7 @@ impl ShadowMemory {
         for shadow in gone {
             LET_GO[0].fetch_add(1, Ordering::Relaxed);
             LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
-            crate::host::retire(shadow);
+            crate::host::Retirement::retire(shadow);
         }
     }
 
@@ -832,7 +834,7 @@ impl ShadowRegistry {
             BUFFER_GENERATION.fetch_add(1, Ordering::Release);
         }
         for shadow in gone {
-            crate::host::retire(shadow);
+            crate::host::Retirement::retire(shadow);
         }
         n
     }
@@ -880,11 +882,11 @@ impl ShadowRegistry {
                 entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
                 return entry.shadow.clone();
             }
-            let (buffer, data) = host()?.shared_buffer(size)?;
-            crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+            let (buffer, data) = Host::instance()?.shared_buffer(size)?;
+            crate::host::HostSetup::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
             let (buffer, card) = match ShadowCards::for_size(size) {
                 Some(on_card) => {
-                    crate::host::name(&on_card, || {
+                    crate::host::HostSetup::name(&on_card, || {
                         format!("title buffer {:#x}+{len:#x} on the card", key.0)
                     });
                     tracing::info!(
@@ -1036,7 +1038,9 @@ impl ShadowRegistry {
             named
         };
         let note = |shadow: &Shadow| {
-            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            shadow
+                .used
+                .store(crate::host::HostClock::moment(), Ordering::Relaxed);
             shadow.asked[0].fetch_min(address, Ordering::Relaxed);
             shadow.asked[1].fetch_max(end, Ordering::Relaxed);
             if unsized_ask {
@@ -1053,11 +1057,11 @@ impl ShadowRegistry {
             map.insert((start, len), shadow.clone());
             return Some(shadow);
         }
-        let (buffer, data) = host()?.shared_buffer(len)?;
-        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+        let (buffer, data) = Host::instance()?.shared_buffer(len)?;
+        crate::host::HostSetup::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
         let (buffer, card) = match ShadowCards::window_for(len) {
             Some(on_card) => {
-                crate::host::name(&on_card, || {
+                crate::host::HostSetup::name(&on_card, || {
                     format!("title memory {start:#x}+{len:#x} on the card")
                 });
                 let card = Card {
@@ -1903,7 +1907,7 @@ impl Shadow {
     }
 
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
-        crate::host::name(&placed.buffer, || {
+        crate::host::HostSetup::name(&placed.buffer, || {
             format!("title memory {start:#x}+{len:#x} in place")
         });
         let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len);
@@ -1936,7 +1940,7 @@ impl Shadow {
             flights: Mutex::default(),
             before: Mutex::default(),
             kept: Mutex::default(),
-            used: AtomicU64::new(crate::host::moment()),
+            used: AtomicU64::new(crate::host::HostClock::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             id: {
@@ -2108,7 +2112,7 @@ impl Shadow {
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
                 let title = &mut title[..n];
-                if !crate::host::read_into((start + at) as *const u8, title) {
+                if !crate::host::TitleCopy::read_into((start + at) as *const u8, title) {
                     continue;
                 }
                 let mut differs = 0u8;
@@ -2179,7 +2183,7 @@ impl Shadow {
         let (now, held) = (&now[first..=last], &mut held[first..=last]);
         title.clear();
         title.resize(n, 0);
-        if !crate::host::read_into((start + at) as *const u8, title) {
+        if !crate::host::TitleCopy::read_into((start + at) as *const u8, title) {
             return 0;
         }
         if !ShadowRelay::merge_piece(now, held, title) {
@@ -2387,7 +2391,7 @@ impl Shadow {
                 let n = hi - lo;
                 let title = &mut title[..n];
                 let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-                if !crate::host::read_into(lo as *const u8, title) {
+                if !crate::host::TitleCopy::read_into(lo as *const u8, title) {
                     continue;
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
@@ -2500,7 +2504,7 @@ impl Shadow {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| {
             std::env::var_os("LEONIDA_REFRESH_CHECK").is_some_and(|v| v == "1")
-                || crate::host::walls_trace()
+                || crate::host::HostTrail::walls_trace()
         }) {
             return;
         }
@@ -2512,7 +2516,7 @@ impl Shadow {
         let mut at = from;
         while at < to {
             let n = SAMPLE.min(to - at);
-            if crate::host::read_into(at as *const u8, &mut title[..n]) {
+            if crate::host::TitleCopy::read_into(at as *const u8, &mut title[..n]) {
                 let copy = unsafe {
                     std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n)
                 };
@@ -2580,7 +2584,7 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        crate::host::TitleCopy::copy_mapped(at, from as *const u8, to - from, false);
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
@@ -2645,7 +2649,7 @@ impl Shadow {
     }
 
     pub(crate) fn walls_merged(&self, fetched: usize, written: usize) {
-        if !crate::host::walls_trace() {
+        if !crate::host::HostTrail::walls_trace() {
             return;
         }
         static SEEN: Mutex<(u64, BTreeMap<u64, (u64, u32, u64, u64)>)> =
@@ -2680,7 +2684,7 @@ impl Shadow {
         entry.2 += fetched as u64;
         entry.3 += written as u64;
         drop(seen);
-        crate::host::walls_landed(
+        crate::host::LateRun::walls_landed(
             crate::host::CARD_COPY,
             self.start as usize,
             self.len as usize,
@@ -2712,7 +2716,7 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
-        if crate::host::read_into((start + at) as *const u8, title) {
+        if crate::host::TitleCopy::read_into((start + at) as *const u8, title) {
             let mut differs = 0u8;
             for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
                 let wrote = if *g != *o { 0xffu8 } else { 0 };
@@ -2770,7 +2774,7 @@ impl Shadow {
         };
         title.clear();
         title.resize(n, 0);
-        let mapped = crate::host::read_into((start + at) as *const u8, title);
+        let mapped = crate::host::TitleCopy::read_into((start + at) as *const u8, title);
         let mut changed = false;
         for (a, b) in ShadowRelay::outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);

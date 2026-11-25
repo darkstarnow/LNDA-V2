@@ -214,7 +214,7 @@ pub(crate) fn record(
     {
         return;
     }
-    let Some(gpu) = crate::host::host() else {
+    let Some(gpu) = crate::host::Host::instance() else {
         return;
     };
     let Some(back) = gpu.read_back_buffer(bytes as u64) else {

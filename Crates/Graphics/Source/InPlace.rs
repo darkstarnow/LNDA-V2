@@ -88,7 +88,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let host = crate::host::host()?;
+    let host = crate::host::Host::instance()?;
     match place_part(&host.device, start, len) {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
@@ -125,7 +125,7 @@ pub fn title_memory_freeing(at: usize, len: usize) {
 
 fn say() {
     static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = crate::host::now_ms();
+    let now = crate::host::HostClock::now_ms();
     let last = LAST.load(Ordering::Relaxed);
     if now < last + 10_000
         || LAST
@@ -1227,7 +1227,7 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
 }
 
 fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
-    let Some(host) = crate::host::host() else {
+    let Some(host) = crate::host::Host::instance() else {
         return Vec::new();
     };
     let mut known = Vec::new();
@@ -1261,10 +1261,10 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
         lines.push(format!("  a buffer placed over it: {}", hr(&placed)));
         if let (Ok(buffer), Ok(mut rig)) = (&placed, Rig::new(&host.device)) {
             let mut before = vec![0u8; K64];
-            crate::host::copy_mapped(before.as_mut_ptr(), at as *const u8, K64, false);
+            crate::host::TitleCopy::copy_mapped(before.as_mut_ptr(), at as *const u8, K64, false);
             let got = rig.fetch(buffer, 0, K64);
             let mut after = vec![0u8; K64];
-            crate::host::copy_mapped(after.as_mut_ptr(), at as *const u8, K64, false);
+            crate::host::TitleCopy::copy_mapped(after.as_mut_ptr(), at as *const u8, K64, false);
             match got {
                 Ok(got) => {
                     let equal = (0..K64)
@@ -1291,10 +1291,10 @@ pub(crate) fn tick() {
     }
     static STARTED: AtomicU64 = AtomicU64::new(0);
     static DONE: AtomicU64 = AtomicU64::new(0);
-    let now = crate::host::now_ms().max(1);
+    let now = crate::host::HostClock::now_ms().max(1);
     let started = match STARTED.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed) {
         Ok(_) => {
-            let Some(host) = crate::host::host() else {
+            let Some(host) = crate::host::Host::instance() else {
                 return;
             };
             let mb = std::env::var("LEONIDA_INPLACE_PROBE_MB")

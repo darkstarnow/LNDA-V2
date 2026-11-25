@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-use crate::host::{HostList, host};
+use crate::host::{Host, HostList};
 use crate::object::This;
 
 macro_rules! once {
@@ -77,7 +77,9 @@ impl TextureUploads {
         ) else {
             return false;
         };
-        let Some(host) = host() else { return false };
+        let Some(host) = Host::instance() else {
+            return false;
+        };
         let through = {
             let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
             let map = map.get_or_insert_with(HashMap::new);
@@ -135,7 +137,7 @@ impl TextureUploads {
                     let Some(buffer) = host.uav_buffer(bytes[0]) else {
                         return false;
                     };
-                    crate::host::name(&buffer, || {
+                    crate::host::HostSetup::name(&buffer, || {
                         format!(
                             "alias copy {}x{} f{} to f{}",
                             of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
@@ -165,8 +167,8 @@ impl TextureUploads {
         let before = list
             .transition(source, COPY_SOURCE)
             .map(|(texture, before)| {
-                let state = crate::host::legal_state(texture, COPY_SOURCE);
-                let barrier = crate::host::transition(
+                let state = crate::host::StateBits::legal_state(texture, COPY_SOURCE);
+                let barrier = crate::host::StateBits::transition(
                     texture,
                     D3D12_RESOURCE_STATES(before as i32),
                     D3D12_RESOURCE_STATES(state as i32),
@@ -201,19 +203,31 @@ impl TextureUploads {
         list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
         unsafe {
             list.list
-                .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+                .ResourceBarrier(&[crate::host::StateBits::transition(
+                    &through.buffer,
+                    common,
+                    written,
+                )]);
             for (index, (of_written, _)) in through.parts.iter().enumerate() {
                 list.list
                     .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
             }
             list.list
-                .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+                .ResourceBarrier(&[crate::host::StateBits::transition(
+                    &through.buffer,
+                    written,
+                    read,
+                )]);
             for (index, (_, of_read)) in through.parts.iter().enumerate() {
                 list.list
                     .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
             }
             list.list
-                .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
+                .ResourceBarrier(&[crate::host::StateBits::transition(
+                    &through.buffer,
+                    read,
+                    common,
+                )]);
         }
         list.keep(&through.buffer);
         if let Some(before) = before
@@ -256,7 +270,7 @@ impl TextureUploads {
 
     fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
         TextureUploads::with_read(size, |read| {
-            crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
+            crate::host::TitleCopy::copy_mapped(read.as_mut_ptr(), memory, size, false);
             f(read)
         })
     }
@@ -288,11 +302,12 @@ impl TextureUploads {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        let idle_ms =
+            crate::host::HostClock::ram_idle_ms(crate::host::HostClock::available_physical_ram());
         let (mut went, mut bytes) = (0u64, 0u64);
         map.retain(|_, s| {
             let keep = Arc::strong_count(s) > 1
-                || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+                || !crate::host::HostClock::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
             if !keep {
                 LET_GO[0].fetch_add(1, Relaxed);
                 LET_GO[1].fetch_add(s.bytes, Relaxed);
@@ -302,7 +317,7 @@ impl TextureUploads {
             keep
         });
         if went > 0 {
-            crate::host::trail(|| {
+            crate::host::HostTrail::trail(|| {
                 format!(
                     "sweep: {went} staging buffers of textures let go ({} KiB), held by no list",
                     bytes >> 10
@@ -340,7 +355,9 @@ impl TextureUploads {
             return;
         };
         use std::sync::atomic::Ordering::Relaxed;
-        staging.used.store(crate::host::moment(), Relaxed);
+        staging
+            .used
+            .store(crate::host::HostClock::moment(), Relaxed);
         if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexSkipped, 1);
@@ -503,7 +520,7 @@ impl TextureUploads {
             );
             return None;
         }
-        let host = host()?;
+        let host = Host::instance()?;
         let d = unsafe { texture.GetDesc() };
         let (first, size) = TextureUploads::staged_part(&layout, u32::from(d.MipLevels), first);
         let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -527,7 +544,7 @@ impl TextureUploads {
             );
         }
         let (buffer, data) = host.upload_buffer(total)?;
-        crate::host::name(&buffer, || {
+        crate::host::HostSetup::name(&buffer, || {
             format!(
                 "staging of {resource:?} {}x{}x{} f{}",
                 d.Width, d.Height, d.DepthOrArraySize, d.Format.0
@@ -552,7 +569,7 @@ impl TextureUploads {
             last: Mutex::default(),
             dirty: std::sync::atomic::AtomicBool::new(true),
             uploaded: std::sync::atomic::AtomicBool::new(false),
-            used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+            used: std::sync::atomic::AtomicU64::new(crate::host::HostClock::moment()),
         });
         map.insert(resource as usize, s.clone());
         Some(s)
@@ -670,7 +687,7 @@ impl TitleMemoryMap {
             let mut hasher = blake3::Hasher::new();
             let mut take = |from: usize, bytes: usize| {
                 read[..bytes].fill(0);
-                crate::host::copy_mapped(
+                crate::host::TitleCopy::copy_mapped(
                     read.as_mut_ptr(),
                     (at as usize + from) as *const u8,
                     bytes,
@@ -736,7 +753,10 @@ impl TitleMemoryMap {
                 let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
                 let mut byte = [0u8];
                 if valid
-                    || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte)
+                    || crate::host::TitleCopy::read_into(
+                        ((page + i) * KERNEL_PAGE) as *const u8,
+                        &mut byte,
+                    )
                 {
                     there += 1;
                 } else if all {
@@ -918,7 +938,7 @@ impl Staging {
             }
             last.asked = now;
             TextureUploads::with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                crate::host::TitleCopy::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 self.detile(read);
             });
             #[cfg(feature = "diagnostics")]
@@ -962,7 +982,7 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = TextureUploads::with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                crate::host::TitleCopy::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1044,7 +1064,7 @@ impl Staging {
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = TextureUploads::with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
+            if !crate::host::TitleCopy::read_into(self.memory, read) {
                 return false;
             }
             let hash = blake3::hash(read);
@@ -1168,7 +1188,7 @@ mod title_memory_tests {
         use windows::core::{IUnknown, Interface};
         use windows_sys::Win32::System::Memory::*;
 
-        if crate::host::host().is_none() {
+        if crate::host::Host::instance().is_none() {
             return;
         }
         let words: [u32; 14] = [3, 0, 0, 0, 16, 0, 4, 65537, 10, 1, 0, 256, 3_145_728, 0];
