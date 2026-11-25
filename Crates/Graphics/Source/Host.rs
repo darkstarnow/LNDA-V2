@@ -290,7 +290,7 @@ impl Retirement {
     }
 
     fn sweep() {
-        crate::inplace::tick();
+        crate::inplace::InPlaceLevel::tick();
         static ON: OnceLock<bool> = OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("LEONIDA_SWEEP").is_none_or(|v| v != "0")) {
             return;

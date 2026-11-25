@@ -1111,7 +1111,7 @@ impl State {
             }
         }
         let constants = Root::raw_constants(roots, &shader.user_data);
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        crate::memory::Ready::prepare(list, heap, &addresses, &constants, writes)
     }
 
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::DescriptorHeap> {
@@ -3359,15 +3359,15 @@ impl State {
                 }
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let bounded = if parts.is_some() {
-                    crate::indirect::bound_split(list, (&args.buffer, offset))
+                    crate::indirect::IndirectClamp::bound_split(list, (&args.buffer, offset))
                 } else if windowed && records > 1 {
-                    crate::indirect::bound_ahead(
+                    crate::indirect::IndirectClamp::bound_ahead(
                         list,
                         (&args.buffer, offset),
                         (kind, step, records),
                     )
                 } else {
-                    crate::indirect::bound(
+                    crate::indirect::IndirectClamp::bound(
                         list,
                         (&args.buffer, offset),
                         count_arg,
@@ -3400,7 +3400,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            crate::indirect::IndirectClamp::done(list, &bounded);
             why("prepare failed");
             return false;
         }
@@ -3460,7 +3460,7 @@ impl State {
                 name,
             );
         }
-        crate::indirect::done(list, &bounded);
+        crate::indirect::IndirectClamp::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

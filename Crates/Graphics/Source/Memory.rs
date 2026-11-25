@@ -20,27 +20,6 @@ const SPECULATIVE_COPIES: usize = crate::descriptor::host::FIRST_RAW_PAGE_SLOTS 
 static CHANGES: OnceLock<Mutex<VecDeque<(u64, u64)>>> = OnceLock::new();
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn ownership_changed(start: u64, len: u64) {
-    if let Some(changes) = CHANGES.get() {
-        let mut changes = changes.lock().unwrap_or_else(|e| e.into_inner());
-        if changes.len() == 256 {
-            changes.pop_front();
-        }
-        changes.push_back((start / PAGE, start.saturating_add(len).div_ceil(PAGE)));
-        GENERATION.fetch_add(1, Ordering::Release);
-    }
-}
-
-fn page_byte(page: u64, start: u64, len: u64, prefix: u64) -> Option<u32> {
-    let at = page.checked_sub(start)?;
-    if at.checked_add(PAGE)? > len {
-        return None;
-    }
-    let byte = prefix.checked_add(at)?;
-    u32::try_from(byte.checked_add(PAGE - 1)?).ok()?;
-    Some(byte as u32)
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Writes {
     None,
@@ -106,6 +85,124 @@ pub(crate) struct Ready {
     pub(crate) count: u32,
 }
 
+impl Ready {
+    pub(crate) fn ownership_changed(start: u64, len: u64) {
+        if let Some(changes) = CHANGES.get() {
+            let mut changes = changes.lock().unwrap_or_else(|e| e.into_inner());
+            if changes.len() == 256 {
+                changes.pop_front();
+            }
+            changes.push_back((start / PAGE, start.saturating_add(len).div_ceil(PAGE)));
+            GENERATION.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn prepare(
+        list: &HostList,
+        heap: &HostHeap,
+        addresses: &[u64],
+        constants: &[u32],
+        writes: Writes,
+    ) -> Option<Ready> {
+        let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Memory::new();
+        }
+        let m = guard.as_mut()?;
+        let before = m.copies.len();
+        let skipped_before = m.speculative_skips;
+        m.reconcile()?;
+        let frame = crate::frame::FramePacer::frame();
+        if m.frame != frame {
+            m.frame = frame;
+            m.refused.clear();
+            m.acceleration = None;
+            m.take_faults();
+        }
+        m.prepare_addresses(heap, addresses, constants);
+        let before_writes = m.copies.len();
+        writes.pages(|at, _| {
+            m.map(at);
+        });
+        m.from_roots += m.copies.len() - before_writes;
+        let copies = m.copies.len();
+        if copies / 256 != before / 256 || (skipped_before == 0 && m.speculative_skips != 0) {
+            tracing::info!(
+                frame,
+                copies,
+                roots_and_as = m.from_roots,
+                constants = m.from_constants,
+                root_neighbors = m.from_neighbors,
+                shader_faults = m.from_faults,
+                deferred_speculation = m.speculative_skips,
+                ownership_changes =
+                    copies - m.from_roots - m.from_constants - m.from_faults - m.from_neighbors,
+                "raw memory copies by first mapping source"
+            );
+        }
+        m.update_ranges();
+        let (base, count) = heap.raw_page_views(&m.copies)?;
+        const READ: usize = usize::MAX - 0x6d;
+        let (reads, written) = list.raw_memory_ranges(
+            &m.directory.0,
+            m.coverage_revision,
+            count as usize,
+            writes == Writes::All,
+        );
+        for i in reads {
+            for &(start, len) in &m.ranges[i] {
+                m.copies[i].refresh(list, start, len);
+            }
+        }
+        for i in written {
+            for &(start, len) in &m.ranges[i] {
+                m.copies[i].gpu_writes(list, start, len);
+            }
+        }
+        writes.owned(&m.pages, |owner, at, len| {
+            if owner < count as usize {
+                m.copies[owner].gpu_writes(list, at, len);
+            }
+        });
+        #[cfg(feature = "diagnostics")]
+        if let Writes::Ranges(ranges) = writes {
+            static BOUNDED: AtomicU64 = AtomicU64::new(0);
+            let dispatches = BOUNDED.fetch_add(1, Ordering::Relaxed) + 1;
+            if dispatches.is_power_of_two() {
+                let bytes = ranges.iter().map(|range| range.1).sum::<u64>();
+                tracing::info!(
+                    frame,
+                    dispatches,
+                    bytes,
+                    visible_copies = count,
+                    "bounded direct builder raw write declarations"
+                );
+            }
+        }
+        if list.first_use(READ) {
+            list.keep(&m.faults.0);
+        }
+        Some(Ready {
+            directory: m.directory.2,
+            faults: m.faults.2,
+            base,
+            count,
+        })
+    }
+}
+
+impl Writes {
+    fn page_byte(page: u64, start: u64, len: u64, prefix: u64) -> Option<u32> {
+        let at = page.checked_sub(start)?;
+        if at.checked_add(PAGE)? > len {
+            return None;
+        }
+        let byte = prefix.checked_add(at)?;
+        u32::try_from(byte.checked_add(PAGE - 1)?).ok()?;
+        Some(byte as u32)
+    }
+}
+
 impl Memory {
     fn new() -> Option<Memory> {
         CHANGES.get_or_init(Default::default);
@@ -157,7 +254,7 @@ impl Memory {
             return None;
         }
         let (first, len) = shadow.span();
-        let offset = page_byte(start, first, len, shadow.offset(first))?;
+        let offset = Writes::page_byte(start, first, len, shadow.offset(first))?;
         Some((shadow, offset))
     }
 
@@ -408,106 +505,13 @@ impl Memory {
     }
 }
 
-pub(crate) fn ready(
-    list: &HostList,
-    heap: &HostHeap,
-    addresses: &[u64],
-    constants: &[u32],
-    writes: Writes,
-) -> Option<Ready> {
-    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        *guard = Memory::new();
-    }
-    let m = guard.as_mut()?;
-    let before = m.copies.len();
-    let skipped_before = m.speculative_skips;
-    m.reconcile()?;
-    let frame = crate::frame::FramePacer::frame();
-    if m.frame != frame {
-        m.frame = frame;
-        m.refused.clear();
-        m.acceleration = None;
-        m.take_faults();
-    }
-    m.prepare_addresses(heap, addresses, constants);
-    let before_writes = m.copies.len();
-    writes.pages(|at, _| {
-        m.map(at);
-    });
-    m.from_roots += m.copies.len() - before_writes;
-    let copies = m.copies.len();
-    if copies / 256 != before / 256 || (skipped_before == 0 && m.speculative_skips != 0) {
-        tracing::info!(
-            frame,
-            copies,
-            roots_and_as = m.from_roots,
-            constants = m.from_constants,
-            root_neighbors = m.from_neighbors,
-            shader_faults = m.from_faults,
-            deferred_speculation = m.speculative_skips,
-            ownership_changes =
-                copies - m.from_roots - m.from_constants - m.from_faults - m.from_neighbors,
-            "raw memory copies by first mapping source"
-        );
-    }
-    m.update_ranges();
-    let (base, count) = heap.raw_page_views(&m.copies)?;
-    const READ: usize = usize::MAX - 0x6d;
-    let (reads, written) = list.raw_memory_ranges(
-        &m.directory.0,
-        m.coverage_revision,
-        count as usize,
-        writes == Writes::All,
-    );
-    for i in reads {
-        for &(start, len) in &m.ranges[i] {
-            m.copies[i].refresh(list, start, len);
-        }
-    }
-    for i in written {
-        for &(start, len) in &m.ranges[i] {
-            m.copies[i].gpu_writes(list, start, len);
-        }
-    }
-    writes.owned(&m.pages, |owner, at, len| {
-        if owner < count as usize {
-            m.copies[owner].gpu_writes(list, at, len);
-        }
-    });
-    #[cfg(feature = "diagnostics")]
-    if let Writes::Ranges(ranges) = writes {
-        static BOUNDED: AtomicU64 = AtomicU64::new(0);
-        let dispatches = BOUNDED.fetch_add(1, Ordering::Relaxed) + 1;
-        if dispatches.is_power_of_two() {
-            let bytes = ranges.iter().map(|range| range.1).sum::<u64>();
-            tracing::info!(
-                frame,
-                dispatches,
-                bytes,
-                visible_copies = count,
-                "bounded direct builder raw write declarations"
-            );
-        }
-    }
-    if list.first_use(READ) {
-        list.keep(&m.faults.0);
-    }
-    Some(Ready {
-        directory: m.directory.2,
-        faults: m.faults.2,
-        base,
-        count,
-    })
-}
-
 #[cfg(test)]
 #[path = "Memory/ProducerTests.rs"]
 mod producer_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{CELL, Memory, PAGE, SPECULATIVE_COPIES, page_byte};
+    use super::{CELL, Memory, PAGE, SPECULATIVE_COPIES, Writes};
 
     #[test]
     fn speculation_stops_before_heap_growth_and_confirmed_accesses_can_still_grow() {
@@ -765,14 +769,20 @@ mod tests {
         let heap = 0x1_0000_0000;
         let start = heap + 0x1230;
         let len = 3 * PAGE - 0x1230;
-        assert_eq!(page_byte(heap + PAGE, start, len, 0x1230), Some(0x10000));
         assert_eq!(
-            page_byte(heap + 2 * PAGE, start, len, 0x1230),
+            Writes::page_byte(heap + PAGE, start, len, 0x1230),
+            Some(0x10000)
+        );
+        assert_eq!(
+            Writes::page_byte(heap + 2 * PAGE, start, len, 0x1230),
             Some(0x20000)
         );
-        assert_eq!(page_byte(heap + PAGE, start, len, 0), Some(0xedd0));
-        assert_eq!(page_byte(heap, start, len, 0x1230), None);
-        assert_eq!(page_byte(heap + 3 * PAGE, start, len, 0x1230), None);
-        assert_eq!(page_byte(heap + PAGE, start, len, u32::MAX.into()), None);
+        assert_eq!(Writes::page_byte(heap + PAGE, start, len, 0), Some(0xedd0));
+        assert_eq!(Writes::page_byte(heap, start, len, 0x1230), None);
+        assert_eq!(Writes::page_byte(heap + 3 * PAGE, start, len, 0x1230), None);
+        assert_eq!(
+            Writes::page_byte(heap + PAGE, start, len, u32::MAX.into()),
+            None
+        );
     }
 }

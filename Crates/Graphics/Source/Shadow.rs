@@ -787,13 +787,13 @@ impl ShadowRegistry {
                 shadow: None,
             },
         );
-        crate::memory::ownership_changed(start, old.map_or(len, |e| len.max(e.end - start)));
+        crate::memory::Ready::ownership_changed(start, old.map_or(len, |e| len.max(e.end - start)));
         BUFFER_GENERATION.fetch_add(1, Ordering::Release);
     }
 
     pub(crate) fn unregister(resource: usize, start: u64) {
         if let Some(old) = ShadowRegistry::lock().remove(&(start, resource)) {
-            crate::memory::ownership_changed(start, old.end - start);
+            crate::memory::Ready::ownership_changed(start, old.end - start);
             BUFFER_GENERATION.fetch_add(1, Ordering::Release);
         }
     }
@@ -830,7 +830,7 @@ impl ShadowRegistry {
         }
         let n = gone.len() as u64;
         if n != 0 {
-            crate::memory::ownership_changed(at, len);
+            crate::memory::Ready::ownership_changed(at, len);
             BUFFER_GENERATION.fetch_add(1, Ordering::Release);
         }
         for shadow in gone {
@@ -878,7 +878,7 @@ impl ShadowRegistry {
             let len = entry.end - key.0;
             let size = len.next_multiple_of(1 << 16);
             let big = ShadowCards::enabled() && size >= ShadowCards::limits().0;
-            if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+            if !big && let Some(placed) = crate::inplace::Placed::for_range(key.0, len, false) {
                 entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
                 return entry.shadow.clone();
             }
@@ -1051,7 +1051,7 @@ impl ShadowRegistry {
             note(shadow);
             return Some(shadow.clone());
         }
-        if let Some(placed) = crate::inplace::place_for(start, len, true) {
+        if let Some(placed) = crate::inplace::Placed::for_range(start, len, true) {
             let shadow = Arc::new(Shadow::placed(placed, start, len, true));
             note(&shadow);
             map.insert((start, len), shadow.clone());
@@ -1809,7 +1809,7 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] =
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
-            crate::inplace::gone(self.window, self.len);
+            crate::inplace::InPlaceLevel::gone(self.window, self.len);
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);

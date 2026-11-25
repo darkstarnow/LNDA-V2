@@ -373,7 +373,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    leonida_graphics::title_memory_section(handle as usize, size as u64, on_wine());
+    leonida_graphics::TitleSections::section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
@@ -682,7 +682,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         return false;
     }
     leonida_graphics::TitleMemory::remapped(base, len);
-    leonida_graphics::title_memory_view(
+    leonida_graphics::TitleSections::view(
         base,
         len,
         slice.section.0 as usize,

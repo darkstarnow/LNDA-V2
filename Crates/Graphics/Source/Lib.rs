@@ -81,6 +81,6 @@ mod writeback;
 #[cfg(windows)]
 pub use host::HostSetup;
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+pub use inplace::TitleSections;
 #[cfg(windows)]
 pub use watch::TitleMemory;

@@ -465,13 +465,14 @@ impl PageGuards {
         if !PageGuards::view_guard() {
             return;
         }
-        for (base, bytes) in
-            crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK))
-        {
+        for (base, bytes) in crate::inplace::SectionViews::between(
+            from.saturating_mul(BLOCK),
+            to.saturating_mul(BLOCK),
+        ) {
             let first = (base / BLOCK).max(from);
             let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
             for block in first..last {
-                let shown = crate::inplace::pages_of(block * BLOCK);
+                let shown = crate::inplace::SectionViews::pages_of(block * BLOCK);
                 if shown.len() < 2 || shown.len() > MANY_VIEWS {
                     continue;
                 }
@@ -561,7 +562,7 @@ impl PageGuards {
             .collect();
         for block in aliased {
             g.aliased.remove(&block);
-            for alias in crate::inplace::pages_of(block * BLOCK) {
+            for alias in crate::inplace::SectionViews::pages_of(block * BLOCK) {
                 if alias / BLOCK != block
                     && PageGuards::open_here(g, alias, alias.saturating_add(BLOCK))
                 {
@@ -607,7 +608,7 @@ impl TitleMemory {
         if !PageGuards::view_guard() {
             return;
         }
-        let ranges = crate::inplace::views_of_section(section, offset, len);
+        let ranges = crate::inplace::SectionViews::of_section(section, offset, len);
         if ranges.is_empty() {
             return;
         }
@@ -635,7 +636,7 @@ impl TitleMemory {
                 })
                 .unwrap_or_else(|e| e.into_inner()),
         );
-        let previous = crate::inplace::physical_spans(&range);
+        let previous = crate::inplace::SectionViews::physical_spans(&range);
         Remapping {
             _writer: writer,
             range,
@@ -666,8 +667,8 @@ impl TitleMemory {
 
     pub fn remapped(at: usize, len: usize) {
         crate::descriptor::host::remapped(at, len);
-        crate::inplace::views_gone(at, len);
-        crate::inplace::title_memory_freeing(at, len);
+        crate::inplace::SectionViews::gone(at, len);
+        crate::inplace::TitleSections::freeing(at, len);
         let mut g = PageGuards::lock();
         let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
         let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
@@ -763,8 +764,12 @@ pub struct Remapping {
 
 impl Drop for Remapping {
     fn drop(&mut self) {
-        let current = crate::inplace::physical_spans(&self.range);
-        crate::inplace::physical_changes(&self.previous, &current, crate::writeback::remapped);
+        let current = crate::inplace::SectionViews::physical_spans(&self.range);
+        crate::inplace::SectionViews::physical_changes(
+            &self.previous,
+            &current,
+            crate::writeback::remapped,
+        );
         MAPPING.lock().unwrap_or_else(|e| e.into_inner()).changing = None;
         MAPPING_CHANGED.notify_all();
     }
@@ -1151,8 +1156,8 @@ mod tests {
             let two = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, bytes).Value as usize;
             assert_ne!(one, 0);
             assert_ne!(two, 0);
-            crate::inplace::title_memory_view(one, bytes, section as usize, 0);
-            crate::inplace::title_memory_view(two, bytes, section as usize, 0);
+            crate::inplace::TitleSections::view(one, bytes, section as usize, 0);
+            crate::inplace::TitleSections::view(two, bytes, section as usize, 0);
             (section as usize, one, two)
         }
     }
@@ -1246,7 +1251,7 @@ mod tests {
             "nothing written yet"
         );
         TitleMemory::remapped(other, SIZE);
-        crate::inplace::title_memory_view(other, SIZE, section, 0);
+        crate::inplace::TitleSections::view(other, SIZE, section, 0);
         assert_eq!(
             PageGuards::guard(guarded, guarded + SIZE),
             Some(vec![pages(0), pages(1)])
@@ -1337,7 +1342,7 @@ mod tests {
         let (section, one, two) = two_views(BLOCK);
         let filler = one + (1 << 45);
         for n in 0..MANY_VIEWS {
-            crate::inplace::title_memory_view(filler + n * BLOCK, BLOCK, section, 0);
+            crate::inplace::TitleSections::view(filler + n * BLOCK, BLOCK, section, 0);
         }
         assert_eq!(PageGuards::guard(one, one + BLOCK), Some(vec![one / PAGE]));
         assert!(

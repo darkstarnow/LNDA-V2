@@ -116,274 +116,286 @@ struct Clamp {
     pso: ID3D12PipelineState,
 }
 
+pub(crate) struct IndirectClamp;
+
+impl Clamp {
+    fn get() -> Option<&'static Clamp> {
+        static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+        CLAMP
+            .get_or_init(|| match Clamp::make() {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    fn make() -> windows::core::Result<Clamp> {
+        let device = &Host::instance()
+            .ok_or_else(windows::core::Error::empty)?
+            .device;
+        Clamp::make_for(device)
+    }
+
+    fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        let compiled = unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("clamp"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(e) = compiled {
+            if let Some(errors) = errors {
+                let text = unsafe {
+                    std::slice::from_raw_parts(
+                        errors.GetBufferPointer().cast::<u8>(),
+                        errors.GetBufferSize(),
+                    )
+                };
+                tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
+            }
+            return Err(e);
+        }
+        let code = code.ok_or_else(windows::core::Error::empty)?;
+        unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })?;
+            Ok(Clamp { root, pso })
+        }
+    }
+
+    fn min_stride(kind: u32) -> Option<u32> {
+        match kind {
+            0 => Some(16),
+            1 => Some(20),
+            2 | 10 => Some(12),
+            _ => None,
+        }
+    }
+
+    fn validate_layout(
+        (kind, stride, records): (u32, u32, u32),
+        src_offset: u64,
+        count_offset: Option<u64>,
+    ) -> Option<u64> {
+        let min = Clamp::min_stride(kind)?;
+        if stride < min || !stride.is_multiple_of(4) || !src_offset.is_multiple_of(4) {
+            return None;
+        }
+        if count_offset.is_some_and(|off| !off.is_multiple_of(4)) {
+            return None;
+        }
+        let bytes = u64::from(stride).checked_mul(u64::from(records))?;
+        (bytes <= u64::from(u32::MAX)).then_some(bytes)
+    }
+
+    fn record(
+        c: &Clamp,
+        l: &ID3D12GraphicsCommandList,
+        dst: &ID3D12Resource,
+        budget: u64,
+        src: (&ID3D12Resource, u64),
+        count: Option<(&ID3D12Resource, u64)>,
+        spec: (u32, u32, u32),
+    ) -> bool {
+        Clamp::record_as(c, l, dst, budget, src, count, spec, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_as(
+        c: &Clamp,
+        l: &ID3D12GraphicsCommandList,
+        dst: &ID3D12Resource,
+        budget: u64,
+        (src, src_offset): (&ID3D12Resource, u64),
+        count: Option<(&ID3D12Resource, u64)>,
+        (kind, stride, records): (u32, u32, u32),
+        how: u32,
+    ) -> bool {
+        let Some(bytes) = Clamp::validate_layout(
+            (kind, stride, records),
+            src_offset,
+            count.map(|(_, off)| off),
+        ) else {
+            return false;
+        };
+        let (src_base, dst_gpu) =
+            unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+        if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+            return false;
+        }
+        let (src_gpu, args_offset) = match src_offset
+            .checked_add(bytes)
+            .filter(|&end| end <= u64::from(u32::MAX))
+        {
+            Some(_) => (src_base, src_offset as u32),
+            None => {
+                let Some(rebased) = src_base.checked_add(src_offset) else {
+                    return false;
+                };
+                (rebased, 0)
+            }
+        };
+        let (count_gpu, has_count, count_offset) = match count {
+            Some((buf, off)) => {
+                let base = unsafe { buf.GetGPUVirtualAddress() };
+                if !base.is_multiple_of(4) {
+                    return false;
+                }
+                match off.checked_add(4).filter(|&end| end <= u64::from(u32::MAX)) {
+                    Some(_) => (base, 1u32, off as u32),
+                    None => {
+                        let Some(rebased) = base.checked_add(off) else {
+                            return false;
+                        };
+                        (rebased, 1u32, 0u32)
+                    }
+                }
+            }
+            None => (src_gpu, 0u32, 0u32),
+        };
+        let constants = [
+            kind,
+            stride,
+            records,
+            args_offset,
+            has_count | how,
+            count_offset,
+        ];
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+        #[cfg(feature = "diagnostics")]
+        let waits = crate::copystat::barrier_test() & 2 == 0;
+        #[cfg(not(feature = "diagnostics"))]
+        let waits = true;
+        let first = [
+            Clamp::uav_barrier(),
+            StateBits::transition(
+                dst,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
+        ];
+        let second = [
+            Clamp::uav_barrier(),
+            StateBits::transition(
+                dst,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            ),
+        ];
+        let skip = usize::from(!waits);
+        unsafe {
+            l.ResourceBarrier(&first[skip..]);
+            if records > 0 {
+                l.SetComputeRootSignature(&c.root);
+                l.SetPipelineState(&c.pso);
+                l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                l.SetComputeRootShaderResourceView(1, src_gpu);
+                l.SetComputeRootShaderResourceView(2, count_gpu);
+                l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+                l.SetComputeRootUnorderedAccessView(4, budget);
+                l.Dispatch(records.div_ceil(64), 1, 1);
+            }
+            l.ResourceBarrier(&second[skip..]);
+        }
+        true
+    }
+
+    fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
+        unsafe {
+            list.ResourceBarrier(&[StateBits::transition(
+                scratch,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COMMON,
+            )])
+        };
+    }
+
+    fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        }
+    }
+}
+
+impl IndirectClamp {
+    pub(crate) fn bound(
+        list: &HostList,
+        src: (&ID3D12Resource, u64),
+        count: Option<(&ID3D12Resource, u64)>,
+        spec: (u32, u32, u32),
+    ) -> Option<ID3D12Resource> {
+        let bytes = Clamp::validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+        let (c, budget, dst) = (Clamp::get()?, list.budget()?, list.indirect_scratch(bytes)?);
+        Clamp::record(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    }
+
+    pub(crate) fn bound_ahead(
+        list: &HostList,
+        src: (&ID3D12Resource, u64),
+        spec: (u32, u32, u32),
+    ) -> Option<ID3D12Resource> {
+        let bytes = Clamp::validate_layout(spec, src.1, None)?;
+        let (c, budget, dst) = (Clamp::get()?, list.budget()?, list.indirect_scratch(bytes)?);
+        Clamp::record_as(c, &list.list, &dst, budget, src, None, spec, AHEAD).then_some(dst)
+    }
+
+    pub(crate) fn bound_split(
+        list: &HostList,
+        src: (&ID3D12Resource, u64),
+    ) -> Option<ID3D12Resource> {
+        let spec = (2, 12, 1);
+        Clamp::validate_layout(spec, src.1, None)?;
+        let (c, budget) = (Clamp::get()?, list.budget()?);
+        let dst = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
+        Clamp::record_as(c, &list.list, &dst, budget, src, None, spec, IN_PARTS).then_some(dst)
+    }
+
+    pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
+        Clamp::done_on(&list.list, scratch);
+    }
+}
+
 unsafe impl Send for Clamp {}
 unsafe impl Sync for Clamp {}
-
-fn clamp() -> Option<&'static Clamp> {
-    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
-    CLAMP
-        .get_or_init(|| match make() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
-                None
-            }
-        })
-        .as_ref()
-}
-
-fn make() -> windows::core::Result<Clamp> {
-    let device = &Host::instance()
-        .ok_or_else(windows::core::Error::empty)?
-        .device;
-    make_for(device)
-}
-
-fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    let compiled = unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            },
-            ..Default::default()
-        })?;
-        Ok(Clamp { root, pso })
-    }
-}
-
-fn min_stride(kind: u32) -> Option<u32> {
-    match kind {
-        0 => Some(16),
-        1 => Some(20),
-        2 | 10 => Some(12),
-        _ => None,
-    }
-}
-
-fn validate_layout(
-    (kind, stride, records): (u32, u32, u32),
-    src_offset: u64,
-    count_offset: Option<u64>,
-) -> Option<u64> {
-    let min = min_stride(kind)?;
-    if stride < min || !stride.is_multiple_of(4) || !src_offset.is_multiple_of(4) {
-        return None;
-    }
-    if count_offset.is_some_and(|off| !off.is_multiple_of(4)) {
-        return None;
-    }
-    let bytes = u64::from(stride).checked_mul(u64::from(records))?;
-    (bytes <= u64::from(u32::MAX)).then_some(bytes)
-}
-
-pub(crate) fn bound(
-    list: &HostList,
-    src: (&ID3D12Resource, u64),
-    count: Option<(&ID3D12Resource, u64)>,
-    spec: (u32, u32, u32),
-) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
-}
-
-pub(crate) fn bound_ahead(
-    list: &HostList,
-    src: (&ID3D12Resource, u64),
-    spec: (u32, u32, u32),
-) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, AHEAD).then_some(dst)
-}
 
 pub(crate) const SPLIT: u32 = 2;
 pub(crate) const PART: u32 = 65_535;
 pub(crate) const PART_BYTES: u64 = 12;
 
-pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Option<ID3D12Resource> {
-    let spec = (2, 12, 1);
-    validate_layout(spec, src.1, None)?;
-    let (c, budget) = (clamp()?, list.budget()?);
-    let dst = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, IN_PARTS).then_some(dst)
-}
-
 const AHEAD: u32 = 2;
 const IN_PARTS: u32 = 4;
-
-fn record_clamp(
-    c: &Clamp,
-    l: &ID3D12GraphicsCommandList,
-    dst: &ID3D12Resource,
-    budget: u64,
-    src: (&ID3D12Resource, u64),
-    count: Option<(&ID3D12Resource, u64)>,
-    spec: (u32, u32, u32),
-) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, 0)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_clamp_as(
-    c: &Clamp,
-    l: &ID3D12GraphicsCommandList,
-    dst: &ID3D12Resource,
-    budget: u64,
-    (src, src_offset): (&ID3D12Resource, u64),
-    count: Option<(&ID3D12Resource, u64)>,
-    (kind, stride, records): (u32, u32, u32),
-    how: u32,
-) -> bool {
-    let Some(bytes) = validate_layout(
-        (kind, stride, records),
-        src_offset,
-        count.map(|(_, off)| off),
-    ) else {
-        return false;
-    };
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
-    if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
-        return false;
-    }
-    let (src_gpu, args_offset) = match src_offset
-        .checked_add(bytes)
-        .filter(|&end| end <= u64::from(u32::MAX))
-    {
-        Some(_) => (src_base, src_offset as u32),
-        None => {
-            let Some(rebased) = src_base.checked_add(src_offset) else {
-                return false;
-            };
-            (rebased, 0)
-        }
-    };
-    let (count_gpu, has_count, count_offset) = match count {
-        Some((buf, off)) => {
-            let base = unsafe { buf.GetGPUVirtualAddress() };
-            if !base.is_multiple_of(4) {
-                return false;
-            }
-            match off.checked_add(4).filter(|&end| end <= u64::from(u32::MAX)) {
-                Some(_) => (base, 1u32, off as u32),
-                None => {
-                    let Some(rebased) = base.checked_add(off) else {
-                        return false;
-                    };
-                    (rebased, 1u32, 0u32)
-                }
-            }
-        }
-        None => (src_gpu, 0u32, 0u32),
-    };
-    let constants = [
-        kind,
-        stride,
-        records,
-        args_offset,
-        has_count | how,
-        count_offset,
-    ];
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
-    #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
-    let first = [
-        uav_barrier(),
-        StateBits::transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
-    ];
-    let second = [
-        uav_barrier(),
-        StateBits::transition(
-            dst,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        ),
-    ];
-    let skip = usize::from(!waits);
-    unsafe {
-        l.ResourceBarrier(&first[skip..]);
-        if records > 0 {
-            l.SetComputeRootSignature(&c.root);
-            l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-            l.SetComputeRootShaderResourceView(1, src_gpu);
-            l.SetComputeRootShaderResourceView(2, count_gpu);
-            l.SetComputeRootUnorderedAccessView(3, dst_gpu);
-            l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
-        }
-        l.ResourceBarrier(&second[skip..]);
-    }
-    true
-}
-
-pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
-    done_on(&list.list, scratch);
-}
-
-fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
-    unsafe {
-        list.ResourceBarrier(&[StateBits::transition(
-            scratch,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_COMMON,
-        )])
-    };
-}
-
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
-    D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
-            }),
-        },
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -445,7 +457,7 @@ void main() {
                     .ok()?;
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
-                let clamp = make_for(&device).expect("clamp shader must compile on WARP");
+                let clamp = Clamp::make_for(&device).expect("clamp shader must compile on WARP");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
                     device,
@@ -771,24 +783,24 @@ void main() {
         if super::Host::instance().is_none() {
             return;
         }
-        assert!(super::clamp().is_some());
+        assert!(super::Clamp::get().is_some());
     }
 
     #[test]
     fn rejects_unaligned_or_undersized_layouts() {
-        assert_eq!(validate_layout((0, 16, 4), 0, None), Some(64));
-        assert_eq!(validate_layout((1, 20, 4), 64, Some(128)), Some(80));
-        assert_eq!(validate_layout((2, 12, 0), 0, Some(0)), Some(0));
-        assert_eq!(validate_layout((10, 16, 2), 8, None), Some(32));
-        assert_eq!(validate_layout((0, 12, 1), 0, None), None);
-        assert_eq!(validate_layout((1, 16, 1), 0, None), None);
-        assert_eq!(validate_layout((2, 8, 1), 0, None), None);
-        assert_eq!(validate_layout((10, 8, 1), 0, None), None);
-        assert_eq!(validate_layout((3, 16, 1), 0, None), None);
-        assert_eq!(validate_layout((0, 18, 1), 0, None), None);
-        assert_eq!(validate_layout((0, 16, 1), 2, None), None);
-        assert_eq!(validate_layout((0, 16, 1), 0, Some(6)), None);
-        assert_eq!(validate_layout((1, 20, u32::MAX), 0, None), None);
+        assert_eq!(Clamp::validate_layout((0, 16, 4), 0, None), Some(64));
+        assert_eq!(Clamp::validate_layout((1, 20, 4), 64, Some(128)), Some(80));
+        assert_eq!(Clamp::validate_layout((2, 12, 0), 0, Some(0)), Some(0));
+        assert_eq!(Clamp::validate_layout((10, 16, 2), 8, None), Some(32));
+        assert_eq!(Clamp::validate_layout((0, 12, 1), 0, None), None);
+        assert_eq!(Clamp::validate_layout((1, 16, 1), 0, None), None);
+        assert_eq!(Clamp::validate_layout((2, 8, 1), 0, None), None);
+        assert_eq!(Clamp::validate_layout((10, 8, 1), 0, None), None);
+        assert_eq!(Clamp::validate_layout((3, 16, 1), 0, None), None);
+        assert_eq!(Clamp::validate_layout((0, 18, 1), 0, None), None);
+        assert_eq!(Clamp::validate_layout((0, 16, 1), 2, None), None);
+        assert_eq!(Clamp::validate_layout((0, 16, 1), 0, Some(6)), None);
+        assert_eq!(Clamp::validate_layout((1, 20, u32::MAX), 0, None), None);
     }
 
     #[test]
@@ -854,7 +866,7 @@ void main() {
             std::ptr::write_bytes(readback_ptr, 0, (STRIDE * 8) as usize);
         }
 
-        assert!(record_clamp(
+        assert!(Clamp::record(
             &warp.clamp,
             &warp.list,
             &dst_buf,
@@ -876,7 +888,7 @@ void main() {
                 COUNT_OFFSET_1 as u64,
             );
         }
-        done_on(&warp.list, &dst_buf);
+        Clamp::done_on(&warp.list, &dst_buf);
 
         unsafe {
             warp.list.ResourceBarrier(&[StateBits::transition(
@@ -893,7 +905,7 @@ void main() {
             )]);
         }
 
-        assert!(record_clamp(
+        assert!(Clamp::record(
             &warp.clamp,
             &warp.list,
             &dst_buf,
@@ -915,7 +927,7 @@ void main() {
                 COUNT_OFFSET_2 as u64,
             );
         }
-        done_on(&warp.list, &dst_buf);
+        Clamp::done_on(&warp.list, &dst_buf);
 
         warp.submit_and_wait();
 
@@ -989,7 +1001,7 @@ void main() {
                 std::ptr::write_bytes(budget_ptr, 0, 256);
                 std::ptr::write_bytes(readback_ptr, 0, 64);
             }
-            assert!(record_clamp_as(
+            assert!(Clamp::record_as(
                 &warp.clamp,
                 &warp.list,
                 &dst_buf,
@@ -999,7 +1011,7 @@ void main() {
                 (2, 12, 1),
                 IN_PARTS,
             ));
-            done_on(&warp.list, &dst_buf);
+            Clamp::done_on(&warp.list, &dst_buf);
             unsafe {
                 warp.list
                     .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, 24)
@@ -1038,7 +1050,7 @@ void main() {
                 std::ptr::write_bytes(budget_ptr, 0, 256);
                 std::ptr::write_bytes(readback_ptr, 0, total);
             }
-            assert!(record_clamp_as(
+            assert!(Clamp::record_as(
                 &warp.clamp,
                 &warp.list,
                 &dst_buf,
@@ -1048,7 +1060,7 @@ void main() {
                 (KIND_MESH, STRIDE, RECORDS),
                 if ahead { AHEAD } else { 0 },
             ));
-            done_on(&warp.list, &dst_buf);
+            Clamp::done_on(&warp.list, &dst_buf);
             unsafe {
                 warp.list.ResourceBarrier(&[StateBits::transition(
                     &dst_buf,
@@ -1145,7 +1157,7 @@ void main() {
             std::ptr::write_bytes(readback_ptr, 0, total_bytes);
         }
 
-        assert!(record_clamp(
+        assert!(Clamp::record(
             &warp.clamp,
             &warp.list,
             &dst_buf,
@@ -1154,7 +1166,7 @@ void main() {
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
         ));
-        done_on(&warp.list, &dst_buf);
+        Clamp::done_on(&warp.list, &dst_buf);
 
         unsafe {
             warp.list.ResourceBarrier(&[StateBits::transition(
@@ -1226,18 +1238,21 @@ void main() {
             (count_ptr as *mut u32).write_volatile(2);
         }
 
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
-        done(&list, &b1);
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
-        done(&list, &b2);
+        let b1 =
+            IndirectClamp::bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        IndirectClamp::done(&list, &b1);
+        let b2 = IndirectClamp::bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128))
+            .unwrap();
+        IndirectClamp::done(&list, &b2);
         assert_eq!(
             b1.as_raw(),
             b2.as_raw(),
             "scratch buffer within capacity must be reused"
         );
 
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
-        done(&list, &b3);
+        let b3 = IndirectClamp::bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000))
+            .unwrap();
+        IndirectClamp::done(&list, &b3);
         assert_ne!(
             b3.as_raw(),
             b1.as_raw(),
@@ -1248,8 +1263,9 @@ void main() {
         host.execute(&[&list]);
         list.reset();
 
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
-        done(&list, &b4);
+        let b4 = IndirectClamp::bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096))
+            .unwrap();
+        IndirectClamp::done(&list, &b4);
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),
@@ -1778,7 +1794,7 @@ void work() {
                             Between::Compute | Between::ComputeWithWaits => {
                                 let waits = between == Between::ComputeWithWaits;
                                 if waits {
-                                    l.ResourceBarrier(&[super::uav_barrier()]);
+                                    l.ResourceBarrier(&[super::Clamp::uav_barrier()]);
                                 }
                                 l.SetComputeRootSignature(&self.work_root);
                                 l.SetPipelineState(&self.work);
@@ -1788,7 +1804,7 @@ void work() {
                                 );
                                 l.Dispatch(1, 1, 1);
                                 if waits {
-                                    l.ResourceBarrier(&[super::uav_barrier()]);
+                                    l.ResourceBarrier(&[super::Clamp::uav_barrier()]);
                                 }
                                 l.SetPipelineState(&self.pipelines[0]);
                             }

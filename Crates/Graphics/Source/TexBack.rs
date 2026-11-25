@@ -68,7 +68,7 @@ pub(crate) fn add_destination_aliases(ranges: &mut Vec<(usize, usize)>) {
         while page < end {
             let lo = at.saturating_sub(page);
             let hi = (end - page).min(PAGE);
-            for alias in crate::inplace::pages_of(page) {
+            for alias in crate::inplace::SectionViews::pages_of(page) {
                 if alias != page {
                     ranges.push((alias + lo, alias + hi));
                 }
