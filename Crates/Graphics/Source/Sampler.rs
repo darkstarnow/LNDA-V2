@@ -1,7 +1,7 @@
 use windows::Win32::Graphics::Direct3D12::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Fields {
+pub(crate) struct ConsoleSampler {
     mag: u32,
     min: u32,
     mip: u32,
@@ -15,8 +15,25 @@ struct Fields {
     border: [f32; 4],
 }
 
-impl Fields {
-    fn host(&self) -> D3D12_SAMPLER_DESC {
+impl ConsoleSampler {
+    pub(crate) fn from_words(words: &[u32; 27]) -> Self {
+        let f = |i: usize| f32::from_bits(words[i]);
+        Self {
+            mag: words[1],
+            min: words[2],
+            mip: words[3],
+            mode: words[5],
+            address: [words[6], words[7], words[8]],
+            min_lod: f(9),
+            max_lod: f(10),
+            bias: f(11),
+            anisotropy: words[13],
+            compare: words[16],
+            border: [f(17), f(18), f(19), f(20)],
+        }
+    }
+
+    pub(crate) fn host_desc(&self) -> D3D12_SAMPLER_DESC {
         let linear = |f: u32| u32::from(f == 1 || f == 3);
         let aniso = self.mag >= 2 || self.min >= 2;
         const LESS: u32 = 2;
@@ -55,27 +72,13 @@ impl Fields {
     }
 }
 
-pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
-    let f = |i: usize| f32::from_bits(words[i]);
-    Fields {
-        mag: words[1],
-        min: words[2],
-        mip: words[3],
-        mode: words[5],
-        address: [words[6], words[7], words[8]],
-        min_lod: f(9),
-        max_lod: f(10),
-        bias: f(11),
-        anisotropy: words[13],
-        compare: words[16],
-        border: [f(17), f(18), f(19), f(20)],
-    }
-    .host()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
+        ConsoleSampler::from_words(words).host_desc()
+    }
 
     #[test]
     fn console_descriptions_decode() {

@@ -2867,7 +2867,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             Some(None)
         }
         View::ConsoleSampler(words) => {
-            let desc = crate::sampler::console(words);
+            let desc = crate::sampler::ConsoleSampler::from_words(words).host_desc();
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
         }

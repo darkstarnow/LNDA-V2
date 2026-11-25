@@ -2353,7 +2353,7 @@ mod tests {
 
     #[test]
     fn device_setup_heap_properties_and_resources_at_addresses() {
-        let device = crate::device::device();
+        let device = crate::device::Device::instance();
         type Custom =
             extern "system" fn(*mut HeapProperties, This, u32, u32) -> *mut HeapProperties;
         let mut p = PROPERTIES;

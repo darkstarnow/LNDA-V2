@@ -1,6 +1,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::object::{
     self, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HRESULT, Iid, Object, S_FALSE, S_OK, Table, This,
@@ -76,10 +77,6 @@ const LEVEL_IIDS: [Iid; 9] = [
     ),
 ];
 
-pub(crate) fn is_device(iid: *const Iid) -> bool {
-    object::is(iid, &[IID]) || object::is(iid, &LEVEL_IIDS)
-}
-
 pub const CHECKED_VERSION: u32 = 0x0002_0004;
 
 const HIGHEST_FEATURE_LEVEL: u32 = 0xc200;
@@ -98,55 +95,126 @@ pub(crate) static DEVICE: Device = Device {
     out_of_line: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 };
 
-pub(crate) fn device() -> This {
-    (&raw const DEVICE).cast()
-}
+static NEWER: AtomicBool = AtomicBool::new(false);
 
-pub extern "system" fn create(
-    _adapter: *const c_void,
-    parameters: *const u32,
-    iid: *const Iid,
-    out: *mut This,
-) -> HRESULT {
-    if parameters.is_null() || iid.is_null() {
-        return E_INVALIDARG;
+impl Device {
+    pub(crate) fn instance() -> This {
+        (&raw const DEVICE).cast()
     }
-    let (version, iid) = unsafe { (parameters.read(), &*iid) };
-    tracing::info!(version = format_args!("{version:#x}"), "D3D12.X device");
-    if version != CHECKED_VERSION {
-        tracing::warn!(
-            version = format_args!("{version:#x}"),
-            "device layouts were checked against {CHECKED_VERSION:#x} only"
-        );
-    }
-    if !is_device(iid) {
-        tracing::warn!(iid = %guid_text(iid), "device created as an unknown interface");
-        return E_NOINTERFACE;
-    }
-    if out.is_null() {
-        return S_FALSE;
-    }
-    if *iid == LEVEL_IIDS[8] {
-        NEWER.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    object::answer(object::DEVICE, iid, Some(device()), out)
-}
 
-static NEWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    pub(crate) fn implements(iid: *const Iid) -> bool {
+        object::is(iid, &[IID]) || object::is(iid, &LEVEL_IIDS)
+    }
 
-pub(crate) fn newer() -> bool {
-    NEWER.load(std::sync::atomic::Ordering::Relaxed)
-}
+    pub(crate) fn newer() -> bool {
+        NEWER.load(Ordering::Relaxed)
+    }
 
-extern "system" fn query_interface(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    let found = if is_device(iid) {
-        Some(this)
-    } else if object::is(iid, &dxgi::DEVICE_IIDS) {
-        Some(dxgi::device())
-    } else {
+    pub extern "system" fn create(
+        _adapter: *const c_void,
+        parameters: *const u32,
+        iid: *const Iid,
+        out: *mut This,
+    ) -> HRESULT {
+        if parameters.is_null() || iid.is_null() {
+            return E_INVALIDARG;
+        }
+        let (version, iid) = unsafe { (parameters.read(), &*iid) };
+        tracing::info!(version = format_args!("{version:#x}"), "D3D12.X device");
+        if version != CHECKED_VERSION {
+            tracing::warn!(
+                version = format_args!("{version:#x}"),
+                "device layouts were checked against {CHECKED_VERSION:#x} only"
+            );
+        }
+        if !Self::implements(iid) {
+            tracing::warn!(iid = %guid_text(iid), "device created as an unknown interface");
+            return E_NOINTERFACE;
+        }
+        if out.is_null() {
+            return S_FALSE;
+        }
+        if *iid == LEVEL_IIDS[8] {
+            NEWER.store(true, Ordering::Relaxed);
+        }
+        object::answer(object::DEVICE, iid, Some(Self::instance()), out)
+    }
+
+    extern "system" fn query_interface(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        let found = if Self::implements(iid) {
+            Some(this)
+        } else if dxgi::DxgiDevice::implements(iid) {
+            Some(dxgi::DxgiDevice::object())
+        } else {
+            None
+        };
+        object::answer(object::DEVICE, iid, found, out)
+    }
+
+    extern "system" fn get_node_count(_: This) -> u32 {
+        1
+    }
+
+    extern "system" fn check_feature_support(
+        _: This,
+        feature: u32,
+        data: *mut c_void,
+        size: u32,
+    ) -> HRESULT {
+        let Some(feature) = Feature::from_id(feature) else {
+            tracing::warn!(feature, size, "device feature query not implemented");
+            return E_NOTIMPL;
+        };
+        if data.is_null() || size as usize != feature.size() {
+            return E_INVALIDARG;
+        }
+        feature.answer(data)
+    }
+
+    extern "system" fn unknown_pipeline<const SLOT: usize>(
+        _: This,
+        desc: *const u8,
+        _iid: *const Iid,
+        out: *mut This,
+    ) -> HRESULT {
+        static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+        let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+        if !out.is_null() {
+            unsafe { *out = std::ptr::null() };
+        }
+        if calls <= 4 || calls.is_power_of_two() {
+            let description = Self::title_words(desc as usize);
+            let first = description
+                .as_ref()
+                .and_then(|w| Self::title_words(w[0] as usize));
+            tracing::warn!(
+                slot = format_args!("{:#x}", SLOT),
+                calls,
+                description = format_args!("{description:x?}"),
+                first_points_at = format_args!("{first:x?}"),
+                "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            );
+        }
+        E_NOTIMPL
+    }
+
+    #[cfg(windows)]
+    fn title_words(at: usize) -> Option<Vec<u64>> {
+        let mut bytes = [0u8; 128];
+        (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
+            bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
+                .collect()
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn title_words(_: usize) -> Option<Vec<u64>> {
         None
-    };
-    object::answer(object::DEVICE, iid, found, out)
+    }
 }
 
 #[repr(C)]
@@ -159,23 +227,23 @@ pub struct VirtualMemory {
 }
 const _: () = assert!(size_of::<VirtualMemory>() == 0x20);
 
-pub extern "system" fn configure_virtual_memory(config: *mut VirtualMemory) -> HRESULT {
-    let Some(config) = (unsafe { config.as_mut() }) else {
-        return E_INVALIDARG;
-    };
-    tracing::info!(
-        flags = config.flags,
-        page_table_pages = config.page_table_pages,
-        preserved_bytes = config.preserved_bytes,
-        "graphics virtual memory"
-    );
-    (config.lowest, config.highest) = user_space();
-    S_OK
-}
+impl VirtualMemory {
+    pub extern "system" fn configure(config: *mut VirtualMemory) -> HRESULT {
+        let Some(config) = (unsafe { config.as_mut() }) else {
+            return E_INVALIDARG;
+        };
+        tracing::info!(
+            flags = config.flags,
+            page_table_pages = config.page_table_pages,
+            preserved_bytes = config.preserved_bytes,
+            "graphics virtual memory"
+        );
+        (config.lowest, config.highest) = Self::user_space();
+        S_OK
+    }
 
-fn user_space() -> (u64, u64) {
     #[cfg(windows)]
-    {
+    fn user_space() -> (u64, u64) {
         use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
         let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
         unsafe { GetSystemInfo(&mut info) };
@@ -184,12 +252,11 @@ fn user_space() -> (u64, u64) {
             info.lpMaximumApplicationAddress as u64,
         )
     }
-    #[cfg(not(windows))]
-    (0x1_0000, 0x7fff_fffe_ffff)
-}
 
-extern "system" fn node_count(_: This) -> u32 {
-    1
+    #[cfg(not(windows))]
+    fn user_space() -> (u64, u64) {
+        (0x1_0000, 0x7fff_fffe_ffff)
+    }
 }
 
 #[repr(C)]
@@ -201,129 +268,97 @@ struct FeatureLevels {
 
 const OPTIONS: [u32; 16] = [1, 1, 2, 3, 3, 1, 1, 1, 3, 40, 0, 0, 0, 0, 1, 2];
 
-extern "system" fn check_feature_support(
-    _: This,
-    feature: u32,
-    data: *mut c_void,
-    size: u32,
-) -> HRESULT {
-    const OPTIONS_QUERY: u32 = 0;
-    const ARCHITECTURE: u32 = 1;
-    const FEATURE_LEVELS: u32 = 2;
-    const FORMAT_SUPPORT: u32 = 3;
-    const MULTISAMPLE: u32 = 4;
-    let expected = match feature {
-        OPTIONS_QUERY => size_of_val(&OPTIONS),
-        ARCHITECTURE => 16,
-        FEATURE_LEVELS => size_of::<FeatureLevels>(),
-        FORMAT_SUPPORT => 12,
-        MULTISAMPLE => 16,
-        _ => {
-            tracing::warn!(feature, size, "device feature query not implemented");
-            return E_NOTIMPL;
-        }
-    };
-    if data.is_null() || size as usize != expected {
-        return E_INVALIDARG;
+#[derive(Clone, Copy)]
+enum Feature {
+    Options,
+    Architecture,
+    Levels,
+    FormatSupport,
+    Multisample,
+}
+
+impl Feature {
+    fn from_id(id: u32) -> Option<Self> {
+        Some(match id {
+            0 => Self::Options,
+            1 => Self::Architecture,
+            2 => Self::Levels,
+            3 => Self::FormatSupport,
+            4 => Self::Multisample,
+            _ => return None,
+        })
     }
-    match feature {
-        OPTIONS_QUERY => {
-            unsafe { data.cast::<[u32; 16]>().write_unaligned(OPTIONS) };
-            S_OK
+
+    fn size(self) -> usize {
+        match self {
+            Self::Options => size_of_val(&OPTIONS),
+            Self::Architecture | Self::Multisample => 16,
+            Self::Levels => size_of::<FeatureLevels>(),
+            Self::FormatSupport => 12,
         }
-        ARCHITECTURE => {
-            let a = unsafe { &mut *data.cast::<[u32; 4]>() };
-            if a[0] != 0 {
-                return E_INVALIDARG;
+    }
+
+    fn answer(self, data: *mut c_void) -> HRESULT {
+        match self {
+            Self::Options => {
+                unsafe { data.cast::<[u32; 16]>().write_unaligned(OPTIONS) };
+                S_OK
             }
-            a[1..].copy_from_slice(&[0, 1, 1]);
-            S_OK
+            Self::Architecture => {
+                let a = unsafe { &mut *data.cast::<[u32; 4]>() };
+                if a[0] != 0 {
+                    return E_INVALIDARG;
+                }
+                a[1..].copy_from_slice(&[0, 1, 1]);
+                S_OK
+            }
+            Self::FormatSupport => {
+                let q = unsafe { &mut *data.cast::<[u32; 3]>() };
+                q[1] = 0x7fff_ffff;
+                q[2] = 0xffff;
+                S_OK
+            }
+            Self::Multisample => {
+                let q = unsafe { &mut *data.cast::<[u32; 4]>() };
+                q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
+                S_OK
+            }
+            Self::Levels => unsafe { &mut *data.cast::<FeatureLevels>() }.resolve(),
         }
-        FORMAT_SUPPORT => {
-            let q = unsafe { &mut *data.cast::<[u32; 3]>() };
-            q[1] = 0x7fff_ffff;
-            q[2] = 0xffff;
-            S_OK
-        }
-        MULTISAMPLE => {
-            let q = unsafe { &mut *data.cast::<[u32; 4]>() };
-            q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
-            S_OK
-        }
-        _ => feature_levels(data),
     }
 }
 
-fn feature_levels(data: *mut c_void) -> HRESULT {
-    let query = unsafe { &mut *data.cast::<FeatureLevels>() };
-    if query.requested.is_null() {
-        return E_INVALIDARG;
-    }
-    let requested = unsafe { std::slice::from_raw_parts(query.requested, query.count as usize) };
-    match requested
-        .iter()
-        .copied()
-        .filter(|&l| l <= HIGHEST_FEATURE_LEVEL)
-        .max()
-    {
-        Some(level) => {
-            query.highest = level;
-            S_OK
+impl FeatureLevels {
+    fn resolve(&mut self) -> HRESULT {
+        if self.requested.is_null() {
+            return E_INVALIDARG;
         }
-        None => UNSUPPORTED,
+        let requested = unsafe { std::slice::from_raw_parts(self.requested, self.count as usize) };
+        match requested
+            .iter()
+            .copied()
+            .filter(|&l| l <= HIGHEST_FEATURE_LEVEL)
+            .max()
+        {
+            Some(level) => {
+                self.highest = level;
+                S_OK
+            }
+            None => UNSUPPORTED,
+        }
     }
-}
-
-extern "system" fn unknown_pipeline<const SLOT: usize>(
-    _: This,
-    desc: *const u8,
-    _iid: *const Iid,
-    out: *mut This,
-) -> HRESULT {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
-    let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
-    if !out.is_null() {
-        unsafe { *out = std::ptr::null() };
-    }
-    if calls <= 4 || calls.is_power_of_two() {
-        #[cfg(windows)]
-        let words = |at: usize| -> Option<Vec<u64>> {
-            let mut bytes = [0u8; 128];
-            (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
-                bytes
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
-                    .collect()
-            })
-        };
-        #[cfg(not(windows))]
-        let words = |_: usize| None::<Vec<u64>>;
-        let description = words(desc as usize);
-        let first = description.as_ref().and_then(|w| words(w[0] as usize));
-        tracing::warn!(
-            slot = format_args!("{:#x}", SLOT),
-            calls,
-            description = format_args!("{description:x?}"),
-            first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
-        );
-    }
-    E_NOTIMPL
 }
 
 static FUNCTIONS: Table<160> = {
     let mut f = object::d3d12_object(object::missing_table::<{ object::DEVICE }, 160>());
-    f[0] = query_interface as *const ();
-    f[7] = node_count as *const ();
+    f[0] = Device::query_interface as *const ();
+    f[7] = Device::get_node_count as *const ();
     f[8] = queue::create as *const ();
     f[9] = list::create_allocator as *const ();
     f[12] = list::create_list as *const ();
     f[10] = pipeline::create_graphics as *const ();
     f[11] = pipeline::create_compute as *const ();
-    f[13] = check_feature_support as *const ();
+    f[13] = Device::check_feature_support as *const ();
     f[14] = descriptor::create_heap as *const ();
     f[15] = descriptor::increment_size as *const ();
     f[16] = root::RootSignature::create as *const ();
@@ -345,10 +380,10 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::QueryHeap::create as *const ();
     f[41] = signature::CommandSignature::create as *const ();
     f[48] = queue::create_x as *const ();
-    f[57] = unknown_pipeline::<0x1c8> as *const ();
+    f[57] = Device::unknown_pipeline::<0x1c8> as *const ();
     f[61] = descriptor::create_sampler_x as *const ();
     f[62] = pipeline::create_compute_x as *const ();
-    f[67] = unknown_pipeline::<0x218> as *const ();
+    f[67] = Device::unknown_pipeline::<0x218> as *const ();
     f[69] = object::ignore as *const ();
     f[70] = descriptor::create_placed_srv as *const ();
     f[71] = descriptor::create_placed_uav as *const ();
@@ -375,7 +410,7 @@ mod tests {
     fn create_as(iid: &Iid) -> (HRESULT, This) {
         let version = CHECKED_VERSION;
         let mut device = std::ptr::null();
-        let hr = create(std::ptr::null(), &version, iid, &mut device);
+        let hr = Device::create(std::ptr::null(), &version, iid, &mut device);
         (hr, device)
     }
 
@@ -383,7 +418,7 @@ mod tests {
     fn creation_hands_out_the_device() {
         let (hr, device) = create_as(&IID);
         assert_eq!(hr, S_OK);
-        assert_eq!(device, super::device());
+        assert_eq!(device, Device::instance());
         assert_ne!(unsafe { device.cast::<u8>().add(0x18).read() }, 0);
         assert_eq!(create_as(&[0; 16]).0, E_NOINTERFACE);
         assert_eq!(
@@ -397,9 +432,12 @@ mod tests {
     #[test]
     fn newer_device_levels_are_the_same_device() {
         let (hr, device) = create_as(&LEVEL_IIDS[8]);
-        assert_eq!((hr, device), (S_OK, super::device()));
+        assert_eq!((hr, device), (S_OK, Device::instance()));
         let mut same = std::ptr::null();
-        assert_eq!(query_interface(device, &LEVEL_IIDS[4], &mut same), S_OK);
+        assert_eq!(
+            Device::query_interface(device, &LEVEL_IIDS[4], &mut same),
+            S_OK
+        );
         assert_eq!(same, device);
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0x3a0);
         assert_eq!(missing(), E_NOTIMPL);
@@ -415,17 +453,17 @@ mod tests {
             S_OK
         );
         let get_device = slot::<Get>(fence, 0x38);
-        let dxgi = dxgi::device();
+        let dxgi = dxgi::DxgiDevice::object();
         let query = slot::<Get>(dxgi, 0);
         for iid in std::iter::once(&IID).chain(&LEVEL_IIDS) {
             let mut found = std::ptr::null();
             assert_eq!(get_device(fence, iid, &mut found), S_OK, "{iid:02x?}");
-            assert_eq!(found, device());
+            assert_eq!(found, Device::instance());
             let mut found = std::ptr::null();
             assert_eq!(query(dxgi, iid, &mut found), S_OK, "{iid:02x?}");
-            assert_eq!(found, device());
+            assert_eq!(found, Device::instance());
         }
-        let mut found = device();
+        let mut found = Device::instance();
         assert_eq!(get_device(fence, fence_iid, &mut found), E_NOINTERFACE);
         assert!(found.is_null());
         slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
@@ -457,17 +495,17 @@ mod tests {
             lowest: 0,
             highest: 0,
         };
-        assert_eq!(configure_virtual_memory(&mut config), S_OK);
+        assert_eq!(VirtualMemory::configure(&mut config), S_OK);
         assert!(0 < config.lowest && config.lowest < config.highest);
         let heap = Box::new(0u8);
         assert!((config.lowest..=config.highest).contains(&(&raw const *heap as u64)));
-        assert_eq!(configure_virtual_memory(std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(VirtualMemory::configure(std::ptr::null_mut()), E_INVALIDARG);
     }
 
     #[test]
     fn feature_levels_pick_the_highest_supported() {
         type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
-        let device = device();
+        let device = Device::instance();
         let check = slot::<Check>(device, 0x68);
         let query = |levels: &[u32], size| {
             let mut query = FeatureLevels {

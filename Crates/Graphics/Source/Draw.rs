@@ -2697,7 +2697,7 @@ impl State {
                         std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
                     )
                 };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
+                crate::primitive::RectExpander::new(stride, &elements).expand(src, dst);
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,

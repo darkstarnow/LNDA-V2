@@ -361,7 +361,7 @@ pub(crate) extern "system" fn create(
     };
     tracing::debug!(?desc, "command queue");
     let queue = Box::new(Queue {
-        object: if crate::device::newer() {
+        object: if crate::device::Device::newer() {
             Object::new(&NEWER_FUNCTIONS)
         } else {
             Object::new(&FUNCTIONS)

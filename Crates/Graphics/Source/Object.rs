@@ -234,11 +234,11 @@ pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT 
 }
 
 pub(crate) extern "system" fn parent_device(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    let device = crate::device::device();
+    let device = crate::device::Device::instance();
     answer(
         DEVICE,
         iid,
-        crate::device::is_device(iid).then_some(device),
+        crate::device::Device::implements(iid).then_some(device),
         out,
     )
 }

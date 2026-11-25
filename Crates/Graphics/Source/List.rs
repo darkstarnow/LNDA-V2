@@ -459,7 +459,7 @@ fn new_list(
     }
     tracing::debug!(kind, "command list");
     let list = Box::new(List {
-        object: if crate::device::newer() {
+        object: if crate::device::Device::newer() {
             Object::new(&NEWER_LIST_FUNCTIONS)
         } else {
             Object::new(&LIST_FUNCTIONS)

@@ -15,7 +15,7 @@ extern "system" fn create_device(
     leonida_graphics::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
     leonida_graphics::on_failure(host_gpu_failed);
-    device::create(adapter, parameters, iid, out)
+    device::Device::create(adapter, parameters, iid, out)
 }
 
 #[cfg(windows)]
@@ -47,7 +47,7 @@ pub(crate) fn module() -> ServiceModule {
         exports: vec![
             ServiceExport {
                 name: "D3D12ConfigureVirtualMemoryX",
-                address: device::configure_virtual_memory as *const () as usize,
+                address: device::VirtualMemory::configure as *const () as usize,
             },
             ServiceExport {
                 name: "D3D12XboxCreateDevice",

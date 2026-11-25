@@ -72,43 +72,104 @@ const OUTPUT_IIDS: [Iid; 1] = [guid(
     [0x8d, 0x52, 0x5a, 0x8d, 0xc2, 0x02, 0x13, 0xaa],
 )];
 
-static DEVICE: Object = Object::new(&DEVICE_FUNCTIONS);
+trait Singleton: 'static {
+    const KIND: usize;
+    const INTERFACES: &'static [Iid];
+
+    fn instance() -> This;
+
+    fn answer(iid: *const Iid, out: *mut This) -> HRESULT {
+        Self::answer_as(Self::KIND, iid, out)
+    }
+
+    fn answer_as(by: usize, iid: *const Iid, out: *mut This) -> HRESULT {
+        let found = object::is(iid, Self::INTERFACES).then_some(Self::instance());
+        object::answer(by, iid, found, out)
+    }
+
+    fn offer(by: usize, out: *mut This) -> HRESULT {
+        object::answer(by, &Self::INTERFACES[0], Some(Self::instance()), out)
+    }
+
+    extern "system" fn query_interface(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        Self::answer(iid, out)
+    }
+}
+
+pub(crate) struct DxgiDevice;
+struct DxgiAdapter;
+struct DxgiFactory;
+struct DxgiOutput;
+
+static DEVICE_OBJECT: Object = Object::new(&DEVICE_FUNCTIONS);
 static ADAPTER_OBJECT: Object = Object::new(&ADAPTER_FUNCTIONS);
 static FACTORY_OBJECT: Object = Object::new(&FACTORY_FUNCTIONS);
 static OUTPUT_OBJECT: Object = Object::new(&OUTPUT_FUNCTIONS);
 
-pub(crate) fn device() -> This {
-    &DEVICE
-}
+impl Singleton for DxgiDevice {
+    const KIND: usize = DXGI_DEVICE;
+    const INTERFACES: &'static [Iid] = &DEVICE_IIDS;
 
-fn query(kind: usize, iid: *const Iid, known: &[Iid], found: This, out: *mut This) -> HRESULT {
-    object::answer(kind, iid, object::is(iid, known).then_some(found), out)
-}
-
-extern "system" fn device_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    if crate::device::is_device(iid) {
-        return object::answer(DXGI_DEVICE, iid, Some(crate::device::device()), out);
+    fn instance() -> This {
+        &DEVICE_OBJECT
     }
-    query(DXGI_DEVICE, iid, &DEVICE_IIDS, this, out)
-}
-extern "system" fn device_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    query(DXGI_DEVICE, iid, &ADAPTER_IIDS, &ADAPTER_OBJECT, out)
-}
-extern "system" fn device_adapter(_: This, out: *mut This) -> HRESULT {
-    object::answer(DXGI_DEVICE, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
+
+    extern "system" fn query_interface(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        if crate::device::Device::implements(iid) {
+            return object::answer(
+                DXGI_DEVICE,
+                iid,
+                Some(crate::device::Device::instance()),
+                out,
+            );
+        }
+        Self::answer(iid, out)
+    }
 }
 
-extern "system" fn adapter_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    query(ADAPTER, iid, &ADAPTER_IIDS, this, out)
-}
-extern "system" fn adapter_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    query(ADAPTER, iid, &FACTORY_IIDS, &FACTORY_OBJECT, out)
-}
-extern "system" fn adapter_outputs(_: This, index: u32, out: *mut This) -> HRESULT {
-    if index != 0 {
-        return NOT_FOUND;
+impl Singleton for DxgiAdapter {
+    const KIND: usize = ADAPTER;
+    const INTERFACES: &'static [Iid] = &ADAPTER_IIDS;
+
+    fn instance() -> This {
+        &ADAPTER_OBJECT
     }
-    object::answer(ADAPTER, &OUTPUT_IIDS[0], Some(&OUTPUT_OBJECT), out)
+}
+
+impl Singleton for DxgiFactory {
+    const KIND: usize = FACTORY;
+    const INTERFACES: &'static [Iid] = &FACTORY_IIDS;
+
+    fn instance() -> This {
+        &FACTORY_OBJECT
+    }
+}
+
+impl Singleton for DxgiOutput {
+    const KIND: usize = OUTPUT;
+    const INTERFACES: &'static [Iid] = &OUTPUT_IIDS;
+
+    fn instance() -> This {
+        &OUTPUT_OBJECT
+    }
+}
+
+impl DxgiDevice {
+    pub(crate) fn object() -> This {
+        <Self as Singleton>::instance()
+    }
+
+    pub(crate) fn implements(iid: *const Iid) -> bool {
+        object::is(iid, &DEVICE_IIDS)
+    }
+
+    extern "system" fn get_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        DxgiAdapter::answer_as(DXGI_DEVICE, iid, out)
+    }
+
+    extern "system" fn get_adapter(_: This, out: *mut This) -> HRESULT {
+        DxgiAdapter::offer(DXGI_DEVICE, out)
+    }
 }
 
 #[repr(C)]
@@ -127,71 +188,56 @@ const _: () = assert!(size_of::<AdapterDescription>() == 0x130);
 
 const AMD: u32 = 0x1002;
 
-extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) -> HRESULT {
-    if out.is_null() {
-        return E_INVALIDARG;
+impl AdapterDescription {
+    fn current() -> Self {
+        let mut name = [0; 128];
+        for (slot, unit) in name.iter_mut().zip("Leonida console GPU".encode_utf16()) {
+            *slot = unit;
+        }
+        let (gpu_optimal, standard) = crate::console::Console::current().title_memory();
+        Self {
+            name,
+            vendor: AMD,
+            device: 0,
+            subsystem: 0,
+            revision: 0,
+            dedicated_video_memory: gpu_optimal,
+            dedicated_system_memory: 0,
+            shared_system_memory: standard,
+            luid: [1, 0],
+        }
     }
-    let mut name = [0; 128];
-    for (slot, unit) in name.iter_mut().zip("Leonida console GPU".encode_utf16()) {
-        *slot = unit;
+}
+
+impl DxgiAdapter {
+    extern "system" fn get_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        DxgiFactory::answer_as(ADAPTER, iid, out)
     }
-    let (gpu_optimal, standard) = crate::console::Console::current().title_memory();
-    let description = AdapterDescription {
-        name,
-        vendor: AMD,
-        device: 0,
-        subsystem: 0,
-        revision: 0,
-        dedicated_video_memory: gpu_optimal,
-        dedicated_system_memory: 0,
-        shared_system_memory: standard,
-        luid: [1, 0],
-    };
-    unsafe { out.write(description) };
-    S_OK
-}
 
-extern "system" fn factory_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    query(FACTORY, iid, &FACTORY_IIDS, this, out)
-}
-extern "system" fn factory_adapters(_: This, index: u32, out: *mut This) -> HRESULT {
-    if index != 0 {
-        return NOT_FOUND;
+    extern "system" fn enum_outputs(_: This, index: u32, out: *mut This) -> HRESULT {
+        if index != 0 {
+            return NOT_FOUND;
+        }
+        DxgiOutput::offer(ADAPTER, out)
     }
-    object::answer(FACTORY, &ADAPTER_IIDS[0], Some(&ADAPTER_OBJECT), out)
+
+    extern "system" fn get_desc(_: This, out: *mut AdapterDescription) -> HRESULT {
+        if out.is_null() {
+            return E_INVALIDARG;
+        }
+        unsafe { out.write(AdapterDescription::current()) };
+        S_OK
+    }
 }
 
-extern "system" fn output_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    query(OUTPUT, iid, &OUTPUT_IIDS, this, out)
+impl DxgiFactory {
+    extern "system" fn enum_adapters(_: This, index: u32, out: *mut This) -> HRESULT {
+        if index != 0 {
+            return NOT_FOUND;
+        }
+        DxgiAdapter::offer(FACTORY, out)
+    }
 }
-extern "system" fn output_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    query(OUTPUT, iid, &ADAPTER_IIDS, &ADAPTER_OBJECT, out)
-}
-
-static DEVICE_FUNCTIONS: Table<32> = {
-    let mut f = object::missing_table::<DXGI_DEVICE, 32>();
-    f[0] = device_query as *const ();
-    f[6] = device_parent as *const ();
-    f[7] = device_adapter as *const ();
-    Table(f)
-};
-
-static ADAPTER_FUNCTIONS: Table<24> = {
-    let mut f = object::missing_table::<ADAPTER, 24>();
-    f[0] = adapter_query as *const ();
-    f[6] = adapter_parent as *const ();
-    f[7] = adapter_outputs as *const ();
-    f[8] = adapter_description as *const ();
-    Table(f)
-};
-
-static FACTORY_FUNCTIONS: Table<32> = {
-    let mut f = object::missing_table::<FACTORY, 32>();
-    f[0] = factory_query as *const ();
-    f[7] = factory_adapters as *const ();
-    f[12] = factory_adapters as *const ();
-    Table(f)
-};
 
 #[repr(C)]
 struct Mode {
@@ -205,63 +251,101 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-fn display_size() -> (u32, u32) {
-    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
-    *SIZE.get_or_init(|| {
-        let asked = std::env::var("LEONIDA_DISPLAY_MODE").ok().and_then(|v| {
-            let (w, h) = v.trim().split_once(['x', 'X'])?;
-            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-        });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
-        };
-        tracing::info!(
-            width = size.0,
-            height = size.1,
-            "display mode reported to the title"
-        );
-        size
-    })
+impl Mode {
+    fn reported() -> Self {
+        let (width, height) = Self::display_size();
+        Self {
+            width,
+            height,
+            refresh: [60, 1],
+            format: 0,
+            scanlines: 1,
+            scaling: 0,
+            flags: 0,
+        }
+    }
+
+    fn display_size() -> (u32, u32) {
+        static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+        *SIZE.get_or_init(|| {
+            let size = match Self::requested_size() {
+                Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
+                _ => (3840, 2160),
+            };
+            tracing::info!(
+                width = size.0,
+                height = size.1,
+                "display mode reported to the title"
+            );
+            size
+        })
+    }
+
+    fn requested_size() -> Option<(u32, u32)> {
+        let value = std::env::var("LEONIDA_DISPLAY_MODE").ok()?;
+        let (w, h) = value.trim().split_once(['x', 'X'])?;
+        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+    }
 }
 
-extern "system" fn modes(
-    _: This,
-    _format: u32,
-    _flags: u32,
-    count: *mut u32,
-    out: *mut Mode,
-) -> HRESULT {
-    let Some(count) = (unsafe { count.as_mut() }) else {
-        return E_INVALIDARG;
-    };
-    if out.is_null() {
+impl DxgiOutput {
+    extern "system" fn get_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        DxgiAdapter::answer_as(OUTPUT, iid, out)
+    }
+
+    extern "system" fn get_display_mode_list(
+        _: This,
+        _format: u32,
+        _flags: u32,
+        count: *mut u32,
+        out: *mut Mode,
+    ) -> HRESULT {
+        let Some(count) = (unsafe { count.as_mut() }) else {
+            return E_INVALIDARG;
+        };
+        if out.is_null() {
+            *count = 1;
+            return S_OK;
+        }
+        if *count < 1 {
+            return MORE_DATA;
+        }
         *count = 1;
-        return S_OK;
+        unsafe { out.write(Mode::reported()) };
+        S_OK
     }
-    if *count < 1 {
-        return MORE_DATA;
-    }
-    *count = 1;
-    let (width, height) = display_size();
-    let mode = Mode {
-        width,
-        height,
-        refresh: [60, 1],
-        format: 0,
-        scanlines: 1,
-        scaling: 0,
-        flags: 0,
-    };
-    unsafe { out.write(mode) };
-    S_OK
 }
+
+static DEVICE_FUNCTIONS: Table<32> = {
+    let mut f = object::missing_table::<DXGI_DEVICE, 32>();
+    f[0] = <DxgiDevice as Singleton>::query_interface as *const ();
+    f[6] = DxgiDevice::get_parent as *const ();
+    f[7] = DxgiDevice::get_adapter as *const ();
+    Table(f)
+};
+
+static ADAPTER_FUNCTIONS: Table<24> = {
+    let mut f = object::missing_table::<ADAPTER, 24>();
+    f[0] = <DxgiAdapter as Singleton>::query_interface as *const ();
+    f[6] = DxgiAdapter::get_parent as *const ();
+    f[7] = DxgiAdapter::enum_outputs as *const ();
+    f[8] = DxgiAdapter::get_desc as *const ();
+    Table(f)
+};
+
+static FACTORY_FUNCTIONS: Table<32> = {
+    let mut f = object::missing_table::<FACTORY, 32>();
+    f[0] = <DxgiFactory as Singleton>::query_interface as *const ();
+    f[7] = DxgiFactory::enum_adapters as *const ();
+    f[12] = DxgiFactory::enum_adapters as *const ();
+    Table(f)
+};
 
 static OUTPUT_FUNCTIONS: Table<32> = {
     let mut f = object::missing_table::<OUTPUT, 32>();
-    f[0] = output_query as *const ();
-    f[6] = output_parent as *const ();
-    f[21] = modes as *const ();
+    f[0] = <DxgiOutput as Singleton>::query_interface as *const ();
+    f[6] = DxgiOutput::get_parent as *const ();
+    f[21] = DxgiOutput::get_display_mode_list as *const ();
     Table(f)
 };
 
@@ -277,7 +361,7 @@ mod tests {
 
     #[test]
     fn startup_walks_from_device_to_output() {
-        let d3d = crate::device::device();
+        let d3d = crate::device::Device::instance();
         let newest_pc = guid(
             0x6007896c,
             0x3244,
@@ -289,7 +373,7 @@ mod tests {
         assert_eq!(qi(d3d, &newest_pc, &mut dxgi), E_NOINTERFACE);
         assert!(dxgi.is_null());
         assert_eq!(qi(d3d, &DEVICE_IIDS[2], &mut dxgi), S_OK);
-        assert_eq!(dxgi, device());
+        assert_eq!(dxgi, DxgiDevice::object());
 
         let mut adapter = std::ptr::null();
         assert_eq!(slot::<Get>(dxgi, 0x38)(dxgi, &mut adapter), S_OK);
