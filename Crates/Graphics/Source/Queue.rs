@@ -796,7 +796,7 @@ impl Presenter {
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         {
-            crate::capture::frame_drew(frame, crate::draw::drawn());
+            crate::capture::frame_drew(frame, crate::draw::DrawCounters::drawn());
             if crate::capture::listed(frame) {
                 crate::capture::dump_targets(frame);
             }
@@ -829,8 +829,8 @@ impl Presenter {
             static DISPATCHED: AtomicU64 = AtomicU64::new(0);
             let since = |last: &AtomicU64, now: u64| now - last.swap(now, Ordering::Relaxed);
             (
-                since(&DRAWN, crate::draw::drawn()),
-                since(&DISPATCHED, crate::draw::dispatched()),
+                since(&DRAWN, crate::draw::DrawCounters::drawn()),
+                since(&DISPATCHED, crate::draw::DrawCounters::dispatched()),
             )
         };
         #[cfg(not(windows))]
@@ -887,9 +887,9 @@ impl BlackFrames {
         });
         static AFTER: AtomicU64 = AtomicU64::new(0);
         let mut last = lock(&LAST);
-        let drawn = crate::draw::drawn();
+        let drawn = crate::draw::DrawCounters::drawn();
         let black = shown.unwrap_or(false);
-        let draws = crate::draw::take_frame();
+        let draws = crate::draw::DrawCounters::take_frame();
         if black && !last.black {
             last.count += 1;
             tracing::warn!(

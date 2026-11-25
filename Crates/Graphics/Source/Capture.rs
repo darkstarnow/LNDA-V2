@@ -153,7 +153,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static LAST_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let attempted = crate::draw::attempted();
+    let attempted = crate::draw::DrawCounters::attempted();
     let attempts = attempted.saturating_sub(LAST_ATTEMPTS.swap(attempted, Relaxed));
     let offsets = heavy_offsets();
     if !offsets.is_empty() {
@@ -1310,18 +1310,18 @@ mod tests {
         };
         let list = host.new_list().unwrap();
         let mut state = crate::draw::State::default();
-        let before = crate::draw::attempted();
+        let before = crate::draw::DrawCounters::attempted();
         state.draw(&list, 3, 1, 0, 0);
         state.draw_indexed(&list, 3, 1, 0, 0, 0);
         state.dispatch_mesh(&list, 1);
         assert_eq!(
-            crate::draw::attempted() - before,
+            crate::draw::DrawCounters::attempted() - before,
             3,
             "a draw, an indexed draw and a mesh dispatch, all dropped"
         );
         state.dispatch(&list, 1, 1, 1, None);
         assert_eq!(
-            crate::draw::attempted() - before,
+            crate::draw::DrawCounters::attempted() - before,
             3,
             "a compute dispatch, dropped, is not one"
         );

@@ -24,55 +24,6 @@ enum Root {
     View(u64),
 }
 
-fn raw_constants(roots: &[Root], words: &[leonida_shader::emit::UserData]) -> Vec<u32> {
-    let mut constants = Vec::new();
-    for word in words.iter().filter(|word| word.root == RootType::Constants) {
-        let Some(Root::Constants(values)) = roots.get(usize::from(word.slot)) else {
-            continue;
-        };
-        let Some(&value) = values.get(word.dword as usize) else {
-            continue;
-        };
-        let index = word.index as usize;
-        if index >= constants.len() {
-            constants.resize(index + 1, 0);
-        }
-        constants[index] = value;
-    }
-    constants
-}
-
-fn builder_raw_writes(hash: &str, roots: &[Root]) -> Writes {
-    let (slot, header_offset, header_bytes, centroid) = match hash {
-        "f6e47efa50226beb" => (8, 12, 28, true),
-        "190fbf0ebe040169" => (3, 12, 28, true),
-        "5062bc7a48e842f8" => (8, 16, 24, true),
-        "35e51bb27a463294" => (4, 12, 4, false),
-        _ => return Writes::All,
-    };
-    let Some(Root::Constants(words)) = roots.get(slot) else {
-        return Writes::All;
-    };
-    let address = |word: usize| -> Option<u64> {
-        Some(u64::from(*words.get(word)?) | u64::from(*words.get(word + 1)?) << 32)
-    };
-    let Some(header) = address(0) else {
-        return Writes::All;
-    };
-    let extra = if centroid {
-        let Some(address) = address(4) else {
-            return Writes::All;
-        };
-        (address, 24)
-    } else {
-        (0, 0)
-    };
-    if (header | extra.0) & 3 != 0 {
-        return Writes::All;
-    }
-    Writes::Ranges([(header.wrapping_add(header_offset), header_bytes), extra])
-}
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VertexView {
@@ -100,22 +51,6 @@ thread_local! {
     static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
 }
 
-fn early_budgets() -> (u64, u64) {
-    static MS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| {
-        let ms = |name: &str, default: u64| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(default)
-        };
-        (
-            ms("LEONIDA_EARLY_TEXTURES_MS", 12),
-            ms("LEONIDA_BAKE_TEXTURES_MS", 1500),
-        )
-    })
-}
-
 const BAKE_PIXEL_SHADERS: [&str; 4] = [
     "c0a7fe77b1862e10",
     "0d1575a396dfe513",
@@ -124,11 +59,6 @@ const BAKE_PIXEL_SHADERS: [&str; 4] = [
 ];
 
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-
-fn write_skip() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_WRITE_SKIP").is_none_or(|v| v != "0"))
-}
 
 #[derive(Clone)]
 struct Window {
@@ -142,11 +72,6 @@ struct Window {
 }
 
 const WINDOW_MOST: u64 = 64;
-
-fn windows() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
-}
 
 #[derive(Default)]
 pub(crate) struct State {
@@ -220,63 +145,11 @@ impl State {
     }
 }
 
-fn scissor_test() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LEONIDA_SCISSOR_TEST").as_deref() == Ok("full"))
-}
-
-fn mesh_test() -> u8 {
-    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("LEONIDA_MESH_TEST").as_deref() {
-        Ok("skip") => 1,
-        Ok("scissor") => 2,
-        _ => 0,
-    })
-}
-
-fn mesh_kept(pipeline: usize) -> bool {
-    static KEEP: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
-    let Some((last, before)) = KEEP.get_or_init(|| {
-        let value = std::env::var("LEONIDA_MESH_TEST").ok()?;
-        let mut parts = value.strip_prefix("keep:")?.split(':');
-        Some((
-            parts.next()?.to_owned(),
-            parts.next().unwrap_or("").to_owned(),
-        ))
-    }) else {
-        return true;
-    };
-    let Some(p) = crate::pipeline::PipelineState::host_pipeline(pipeline as This) else {
-        return true;
-    };
-    let Some(at) = p.name.find("mesh ") else {
-        return true;
-    };
-    let hash = &p.name.as_bytes()[at + 5..];
-    if hash.len() < 16 {
-        return true;
-    }
-    last.as_bytes().contains(&hash[15])
-        && (before.is_empty() || before.as_bytes().contains(&hash[14]))
-}
-
 static DRAWN: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn drawn() -> u64 {
-    DRAWN.load(Ordering::Relaxed)
-}
 
 #[cfg(feature = "diagnostics")]
 static FRAME: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-#[cfg(feature = "diagnostics")]
-pub(crate) fn take_frame() -> Vec<String> {
-    std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
-}
-
-pub(crate) fn take_dropped() -> u64 {
-    DROPPED.swap(0, Ordering::Relaxed)
-}
 #[derive(Default)]
 struct RootSlot {
     generation: u64,
@@ -298,20 +171,6 @@ impl RootSlot {
     }
 }
 
-fn catching_up(more: std::time::Duration) -> bool {
-    static SPENT: AtomicU64 = AtomicU64::new(0);
-    static TOTAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let total = *TOTAL.get_or_init(|| {
-        let seconds = std::env::var("LEONIDA_TEXTURE_GATE_S")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(60);
-        seconds * 1000
-    });
-    let more = more.as_millis() as u64;
-    SPENT.fetch_add(more, Ordering::Relaxed) + more < total
-}
-
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
@@ -323,63 +182,17 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-fn heap_recheck() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_HEAP_RECHECK").is_none_or(|v| v != "0"))
-}
-
 pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
 
-fn reupload_when_full() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_REUPLOAD_WHEN_FULL").is_none_or(|v| v != "0"))
-}
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
-fn dropped(pipeline: usize) {
-    crate::pipeline::PipelineDrops::note(pipeline as This);
-    if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
-        last.push_str(" DROPPED");
-    }
-}
-
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
 static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn attempted() -> u64 {
-    ATTEMPTS.load(Ordering::Relaxed)
-}
-
-pub(crate) fn dispatched() -> u64 {
-    DISPATCHED.load(Ordering::Relaxed)
-}
-
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
-    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        std::env::var("LEONIDA_ROOT_VIEW_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map_or(u64::MAX, |mb| mb << 20)
-    });
-    let shadow = crate::shadow::ShadowRegistry::find(address, 1)?;
-    let len = shadow.left(address).min(if srv { limit } else { 1 << 16 });
-    let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
-        shadow.refresh(list, address, len);
-        return Some(gpu);
-    }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
-}
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -388,12 +201,556 @@ macro_rules! once {
     }};
 }
 
-fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
-    let slot = slot as usize;
-    if roots.len() <= slot {
-        roots.resize(slot + 1, Root::None);
+pub(crate) struct DrawSwitches;
+
+pub(crate) struct DrawCounters;
+
+pub(crate) struct DispatchShape;
+
+pub(crate) struct ViewInspector;
+
+pub(crate) struct FixedState;
+
+impl Root {
+    fn raw_constants(roots: &[Root], words: &[leonida_shader::emit::UserData]) -> Vec<u32> {
+        let mut constants = Vec::new();
+        for word in words.iter().filter(|word| word.root == RootType::Constants) {
+            let Some(Root::Constants(values)) = roots.get(usize::from(word.slot)) else {
+                continue;
+            };
+            let Some(&value) = values.get(word.dword as usize) else {
+                continue;
+            };
+            let index = word.index as usize;
+            if index >= constants.len() {
+                constants.resize(index + 1, 0);
+            }
+            constants[index] = value;
+        }
+        constants
     }
-    roots[slot] = root;
+
+    fn builder_raw_writes(hash: &str, roots: &[Root]) -> Writes {
+        let (slot, header_offset, header_bytes, centroid) = match hash {
+            "f6e47efa50226beb" => (8, 12, 28, true),
+            "190fbf0ebe040169" => (3, 12, 28, true),
+            "5062bc7a48e842f8" => (8, 16, 24, true),
+            "35e51bb27a463294" => (4, 12, 4, false),
+            _ => return Writes::All,
+        };
+        let Some(Root::Constants(words)) = roots.get(slot) else {
+            return Writes::All;
+        };
+        let address = |word: usize| -> Option<u64> {
+            Some(u64::from(*words.get(word)?) | u64::from(*words.get(word + 1)?) << 32)
+        };
+        let Some(header) = address(0) else {
+            return Writes::All;
+        };
+        let extra = if centroid {
+            let Some(address) = address(4) else {
+                return Writes::All;
+            };
+            (address, 24)
+        } else {
+            (0, 0)
+        };
+        if (header | extra.0) & 3 != 0 {
+            return Writes::All;
+        }
+        Writes::Ranges([(header.wrapping_add(header_offset), header_bytes), extra])
+    }
+
+    fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+        static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let limit = *LIMIT.get_or_init(|| {
+            std::env::var("LEONIDA_ROOT_VIEW_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or(u64::MAX, |mb| mb << 20)
+        });
+        let shadow = crate::shadow::ShadowRegistry::find(address, 1)?;
+        let len = shadow.left(address).min(if srv { limit } else { 1 << 16 });
+        let gpu = shadow.gpu(address);
+        if srv || gpu % 256 == 0 {
+            shadow.refresh(list, address, len);
+            return Some(gpu);
+        }
+        let (gpu, to) = list.scratch(len)?;
+        list.defer_fill(to, address as *const u8, len as usize);
+        Some(gpu)
+    }
+
+    fn place(roots: &mut Vec<Root>, slot: u32, root: Root) {
+        let slot = slot as usize;
+        if roots.len() <= slot {
+            roots.resize(slot + 1, Root::None);
+        }
+        roots[slot] = root;
+    }
+}
+
+impl DrawSwitches {
+    fn early_budgets() -> (u64, u64) {
+        static MS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        *MS.get_or_init(|| {
+            let ms = |name: &str, default: u64| {
+                std::env::var(name)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(default)
+            };
+            (
+                ms("LEONIDA_EARLY_TEXTURES_MS", 12),
+                ms("LEONIDA_BAKE_TEXTURES_MS", 1500),
+            )
+        })
+    }
+
+    fn write_skip() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_WRITE_SKIP").is_none_or(|v| v != "0"))
+    }
+
+    fn windows_on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    }
+
+    fn scissor_test() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("LEONIDA_SCISSOR_TEST").as_deref() == Ok("full"))
+    }
+
+    fn mesh_test() -> u8 {
+        static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| match std::env::var("LEONIDA_MESH_TEST").as_deref() {
+            Ok("skip") => 1,
+            Ok("scissor") => 2,
+            _ => 0,
+        })
+    }
+
+    fn mesh_kept(pipeline: usize) -> bool {
+        static KEEP: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
+        let Some((last, before)) = KEEP.get_or_init(|| {
+            let value = std::env::var("LEONIDA_MESH_TEST").ok()?;
+            let mut parts = value.strip_prefix("keep:")?.split(':');
+            Some((
+                parts.next()?.to_owned(),
+                parts.next().unwrap_or("").to_owned(),
+            ))
+        }) else {
+            return true;
+        };
+        let Some(p) = crate::pipeline::PipelineState::host_pipeline(pipeline as This) else {
+            return true;
+        };
+        let Some(at) = p.name.find("mesh ") else {
+            return true;
+        };
+        let hash = &p.name.as_bytes()[at + 5..];
+        if hash.len() < 16 {
+            return true;
+        }
+        last.as_bytes().contains(&hash[15])
+            && (before.is_empty() || before.as_bytes().contains(&hash[14]))
+    }
+
+    fn catching_up(more: std::time::Duration) -> bool {
+        static SPENT: AtomicU64 = AtomicU64::new(0);
+        static TOTAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let total = *TOTAL.get_or_init(|| {
+            let seconds = std::env::var("LEONIDA_TEXTURE_GATE_S")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(60);
+            seconds * 1000
+        });
+        let more = more.as_millis() as u64;
+        SPENT.fetch_add(more, Ordering::Relaxed) + more < total
+    }
+
+    fn heap_recheck() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_HEAP_RECHECK").is_none_or(|v| v != "0"))
+    }
+
+    fn reupload_when_full() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_REUPLOAD_WHEN_FULL").is_none_or(|v| v != "0"))
+    }
+}
+
+impl DrawCounters {
+    pub(crate) fn drawn() -> u64 {
+        DRAWN.load(Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn take_frame() -> Vec<String> {
+        std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    pub(crate) fn take_dropped() -> u64 {
+        DROPPED.swap(0, Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn note_dropped(pipeline: usize) {
+        crate::pipeline::PipelineDrops::note(pipeline as This);
+        if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
+            last.push_str(" DROPPED");
+        }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) fn attempted() -> u64 {
+        ATTEMPTS.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn dispatched() -> u64 {
+        DISPATCHED.load(Ordering::Relaxed)
+    }
+}
+
+impl DispatchShape {
+    fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+        DispatchShape::compute_word(p, leonida_shader::emit::USER_GROUP_BASE)
+    }
+
+    fn compute_word(p: &crate::pipeline::host::HostPipeline, kind: u32) -> Option<(u32, u32)> {
+        let stage = p.stages.first().filter(|_| p.compute)?;
+        let (param, _) = stage.user_data?;
+        let word = stage
+            .translated()
+            .host
+            .user_data
+            .iter()
+            .find(|u| u.root == RootType::Other(kind))?;
+        Some((param, word.index))
+    }
+
+    fn groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
+        std::array::from_fn(|i| threads[i].div_ceil(size[i]))
+    }
+
+    fn signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+        static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+            return Some(s.clone());
+        }
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: stride,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        let result = unsafe {
+            crate::host::host()?.device.CreateCommandSignature(
+                &desc,
+                None::<&ID3D12RootSignature>,
+                &mut signature,
+            )
+        };
+        if let Err(e) = result {
+            once!(error = %e, kind, stride, "host command signature refused");
+            return None;
+        }
+        let signature = signature?;
+        made.push(((kind, stride), signature.clone()));
+        Some(signature)
+    }
+}
+
+impl ViewInspector {
+    fn view_kind(view: &View) -> Option<ResourceType> {
+        match view {
+            View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
+            View::Unordered(..) | View::Placed(true, ..) => Some(ResourceType::Uav),
+            _ => None,
+        }
+    }
+
+    fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>) -> u32 {
+        const ONE_PLANE: [i32; 2] = [55, 40];
+        let Some(desc) = desc else {
+            return DEPTH_WRITE;
+        };
+        let format = if desc.Format.0 == 0 {
+            unsafe { texture.GetDesc() }.Format.0
+        } else {
+            desc.Format.0
+        };
+        let mut needed = D3D12_DSV_FLAG_READ_ONLY_DEPTH.0;
+        if !ONE_PLANE.contains(&format) {
+            needed |= D3D12_DSV_FLAG_READ_ONLY_STENCIL.0;
+        }
+        if desc.Flags.0 & needed == needed {
+            DEPTH_READ
+        } else {
+            DEPTH_WRITE
+        }
+    }
+
+    fn readable(list: &HostList, kind: ResourceType, view: &View) {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        let placed = crate::descriptor::host::placed_texture(view);
+        let view = placed.as_ref().map_or(view, |p| &p.view);
+        if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+            shadow.refresh(list, address, len);
+            if kind == ResourceType::Uav {
+                if STORES.get() || !DrawSwitches::write_skip() {
+                    shadow.gpu_writes(list, address, len);
+                } else {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
+                        crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
+                    }
+                }
+            }
+        }
+        match (view, kind) {
+            (View::Shader(resource, _), ResourceType::Srv) => {
+                let aliased = crate::resource::GpuResource::alias_of(*resource as This)
+                    .is_some_and(|source| {
+                        crate::texture::TextureUploads::alias(list, *resource as This, source)
+                    });
+                if !aliased
+                    && let Some(t) = crate::resource::HostTextures::host_resource(*resource as This)
+                    && crate::texture::TextureUploads::title_written(t)
+                {
+                    let first = match (&placed, view) {
+                        (Some(_), View::Shader(_, Some(desc))) => {
+                            crate::resource::PlacedTextures::first_mip(desc)
+                        }
+                        _ => 0,
+                    };
+                    crate::texture::TextureUploads::upload_from(list, *resource as This, t, first);
+                }
+                list.twin_use(*resource as This, false, false);
+                let (tested, _) = TESTED_DEPTH.get();
+                let state = if tested != 0 && tested == *resource {
+                    TESTED_DEPTH.set((tested, true));
+                    DEPTH_READ | SHADER_RESOURCE
+                } else {
+                    SHADER_RESOURCE
+                };
+                crate::list::CommandList::ensure_state(list, *resource as This, state);
+                #[cfg(feature = "diagnostics")]
+                if let Some(t) = crate::resource::HostTextures::host_resource(*resource as This) {
+                    let d = unsafe { t.GetDesc() };
+                    if d.Flags.0 & 7 == 0 {
+                        tracing::debug!(
+                            resource = format_args!("{resource:#x}"),
+                            ?d,
+                            "a shader reads a texture the title fills"
+                        );
+                    }
+                }
+            }
+            (View::Unordered(resource, _, _), ResourceType::Uav) => {
+                #[cfg(feature = "diagnostics")]
+                crate::capture::note_target(*resource as This);
+                #[cfg(feature = "diagnostics")]
+                crate::capture::note_written(std::ptr::from_ref(list) as usize, *resource as This);
+                list.texture_written(*resource as This);
+                if !list.twin_use(*resource as This, true, true) {
+                    crate::list::CommandList::ensure_state(
+                        list,
+                        *resource as This,
+                        UNORDERED_ACCESS,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn list_slots() -> &'static [String] {
+        static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        LIST.get_or_init(|| {
+            std::env::var("LEONIDA_LIST_SLOTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn print_4k(at: u64) -> String {
+        let mut bytes = [0u8; 4096];
+        if at == 0 || !crate::host::read_into(at as *const u8, &mut bytes) {
+            return "unreadable".into();
+        }
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for b in bytes {
+            hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("{hash:016x}")
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn memory_state(at: u64, bytes: u64) -> String {
+        let mapped = crate::texture::TitleMemoryMap::mapped_bytes(at as *const u8, bytes as usize);
+        let last = at + bytes.saturating_sub(4096);
+        format!(
+            "memory={at:#x} mapped={mapped}/{bytes} first4k={} last4k={}",
+            ViewInspector::print_4k(at),
+            ViewInspector::print_4k(last)
+        )
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn texture_state(this: This) -> String {
+        let Some((at, desc)) = crate::resource::GpuResource::texture_memory(this) else {
+            return "not a texture".into();
+        };
+        let words = unsafe {
+            std::ptr::from_ref(&desc)
+                .cast::<[u32; 14]>()
+                .read_unaligned()
+        };
+        let bytes = crate::resource::PlacedTextures::placed_bytes(&words).unwrap_or(0);
+        let staged = match crate::texture::TextureUploads::staged_state(this) {
+            Some((uploaded, dirty)) => format!("staged=yes uploaded={uploaded} dirty={dirty}"),
+            None => "staged=no".into(),
+        };
+        format!(
+            "{}x{} f{} levels={} host_copy={} {staged} host_written={} title_fills={} {}",
+            u64::from(words[4]) | u64::from(words[5]) << 32,
+            words[6],
+            words[8],
+            words[7] >> 16,
+            crate::resource::GpuResource::host_made(this).is_some(),
+            crate::texture::HostWrites::wrote(this as usize),
+            crate::resource::GpuResource::title_fills(this),
+            ViewInspector::memory_state(at as u64, bytes)
+        )
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn view_state(view: Option<&View>) -> String {
+        match view {
+            None => "no view".into(),
+            Some(View::Placed(false, r, d)) if r[0] != 1 => {
+                let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+                let state = match crate::resource::PlacedTextures::placed_known(address, r) {
+                    Some(this) => ViewInspector::texture_state(this),
+                    None => format!(
+                        "{}x{} f{} levels={} resource=none {}",
+                        u64::from(r[4]) | u64::from(r[5]) << 32,
+                        r[6],
+                        r[8],
+                        r[7] >> 16,
+                        ViewInspector::memory_state(
+                            address,
+                            crate::resource::PlacedTextures::placed_bytes(r).unwrap_or(0)
+                        )
+                    ),
+                };
+                format!("placed texture view_format={} {state}", d[0])
+            }
+            Some(View::Shader(r, d))
+                if crate::resource::GpuResource::texture_memory(*r as This).is_some() =>
+            {
+                format!(
+                    "texture object {r:#x} view_format={} {}",
+                    d.as_ref().map_or(0, |d| d[0]),
+                    ViewInspector::texture_state(*r as This)
+                )
+            }
+            Some(v) => format!("{v:?}").chars().take(80).collect(),
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn describe(view: Option<&View>) -> String {
+        let texture = |r: This| {
+            crate::resource::GpuResource::host_made(r).map(|t| {
+                let d = unsafe { t.GetDesc() };
+                format!(
+                    "{}x{} f{} flags {:#x} of {r:?}",
+                    d.Width, d.Height, d.Format.0, d.Flags.0
+                )
+            })
+        };
+        match view {
+            None => "no view".into(),
+            Some(v @ View::Shader(r, _)) => texture(*r as This).unwrap_or_else(|| {
+                format!("buffer {:?}", crate::descriptor::host::buffer_range(v))
+            }),
+            Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
+                Some(t) => format!("uav texture {t}"),
+                None => format!(
+                    "uav resource {r:#x} buffer {:?}",
+                    crate::descriptor::host::buffer_range(v)
+                ),
+            },
+            Some(View::Placed(u, r, d)) => format!(
+                "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
+                r[0],
+                u64::from(r[4]) | u64::from(r[5]) << 32,
+                r[6],
+                r[8],
+                r[11],
+                u64::from(d[10]) | u64::from(d[11]) << 32
+            ),
+            Some(View::Constant(address, size))
+                if *size >= 16
+                    && crate::texture::TitleMemoryMap::committed(*address as *const u8, 16) =>
+            {
+                let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
+                format!("Constant({address:#x}, {size}) {v:?}")
+            }
+            Some(v) => format!("{v:?}").chars().take(60).collect(),
+        }
+    }
+}
+
+impl FixedState {
+    pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        unsafe { list.list.RSSetViewports(viewports) };
+    }
+
+    pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
+        unsafe { list.list.RSSetScissorRects(rects) };
+    }
+
+    pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
+        unsafe { list.list.OMSetBlendFactor(factor) };
+    }
+
+    pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
+        #[cfg(feature = "diagnostics")]
+        crate::capture::op(std::ptr::from_ref(list) as usize, || {
+            format!("STENCIL REF {reference:#x}")
+        });
+        unsafe { list.list.OMSetStencilRef(reference) };
+    }
+
+    pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+        #[cfg(feature = "diagnostics")]
+        crate::capture::op(std::ptr::from_ref(list) as usize, || {
+            format!("DEPTH BOUNDS {min}..{max}")
+        });
+        if crate::host::host().is_some_and(|h| h.depth_bounds())
+            && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
+        {
+            unsafe { l1.OMSetDepthBounds(min, max) };
+        }
+    }
 }
 
 impl State {
@@ -442,18 +799,18 @@ impl State {
     }
 
     pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) {
-        set(self.roots(compute), slot, Root::Table(handle));
+        Root::place(self.roots(compute), slot, Root::Table(handle));
     }
 
     pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
-        set(self.roots(compute), slot, Root::View(address));
+        Root::place(self.roots(compute), slot, Root::View(address));
     }
 
     pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
         let roots = self.roots(compute);
         let s = slot as usize;
         if !matches!(roots.get(s), Some(Root::Constants(_))) {
-            set(roots, slot, Root::Constants(Vec::new()));
+            Root::place(roots, slot, Root::Constants(Vec::new()));
         }
         if let Root::Constants(c) = &mut roots[s] {
             let end = offset as usize + values.len();
@@ -525,7 +882,7 @@ impl State {
         let dsv = crate::descriptor::RtvRecord::dsv(depth).and_then(|record| {
             let texture = crate::resource::HostTextures::host_resource(record.resource)?;
             self.depth = record.resource as usize;
-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+            self.depth_state = ViewInspector::depth_state(texture, record.depth_desc().as_ref());
             if crate::resource::GpuResource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
@@ -546,38 +903,38 @@ impl State {
     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
         self.viewports.clear();
         self.viewports.extend_from_slice(viewports);
-        crate::draw::viewports(list, viewports);
+        crate::draw::FixedState::viewports(list, viewports);
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
         self.scissors.clear();
         self.scissors.extend_from_slice(rects);
-        if scissor_test() {
+        if DrawSwitches::scissor_test() {
             let full = RECT {
                 left: 0,
                 top: 0,
                 right: 16384,
                 bottom: 16384,
             };
-            crate::draw::scissors(list, &vec![full; rects.len()]);
+            crate::draw::FixedState::scissors(list, &vec![full; rects.len()]);
             return;
         }
-        crate::draw::scissors(list, rects);
+        crate::draw::FixedState::scissors(list, rects);
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
         self.blend = factor.copied();
-        crate::draw::blend_factor(list, factor);
+        crate::draw::FixedState::blend_factor(list, factor);
     }
 
     pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
         self.stencil = Some(reference);
-        crate::draw::stencil_ref(list, reference);
+        crate::draw::FixedState::stencil_ref(list, reference);
     }
 
     pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
         self.depth_bounds = Some([min, max]);
-        crate::draw::depth_bounds(list, min, max);
+        crate::draw::FixedState::depth_bounds(list, min, max);
     }
 
     fn after_our_pass(&mut self, list: &HostList) {
@@ -592,7 +949,7 @@ impl State {
             self.set_targets(list, &handles, self.depth_handle);
         }
         if !self.viewports.is_empty() {
-            crate::draw::viewports(list, &self.viewports);
+            crate::draw::FixedState::viewports(list, &self.viewports);
         }
         if !self.scissors.is_empty() {
             let rects = std::mem::take(&mut self.scissors);
@@ -612,20 +969,20 @@ impl State {
             self.set_targets(list, &handles, self.depth_handle);
         }
         if !self.viewports.is_empty() {
-            crate::draw::viewports(list, &self.viewports);
+            crate::draw::FixedState::viewports(list, &self.viewports);
         }
         if !self.scissors.is_empty() {
             let rects = std::mem::take(&mut self.scissors);
             self.set_scissors(list, &rects);
         }
         if let Some(factor) = self.blend {
-            crate::draw::blend_factor(list, Some(&factor));
+            crate::draw::FixedState::blend_factor(list, Some(&factor));
         }
         if let Some(reference) = self.stencil {
-            crate::draw::stencil_ref(list, reference);
+            crate::draw::FixedState::stencil_ref(list, reference);
         }
         if let Some([min, max]) = self.depth_bounds {
-            crate::draw::depth_bounds(list, min, max);
+            crate::draw::FixedState::depth_bounds(list, min, max);
         }
     }
 
@@ -755,7 +1112,7 @@ impl State {
                 addresses.push(*address);
             }
         }
-        let constants = raw_constants(roots, &shader.user_data);
+        let constants = Root::raw_constants(roots, &shader.user_data);
         crate::memory::ready(list, heap, &addresses, &constants, writes)
     }
 
@@ -913,19 +1270,20 @@ impl State {
                 return false;
             }
             let publish = !crate::pipeline::BvhBuilder::quarantined(self.pipeline as This);
-            let writes = publish && (t.stores || !write_skip());
+            let writes = publish && (t.stores || !DrawSwitches::write_skip());
             let memory = if t
                 .host
                 .root_srvs
                 .contains(&leonida_shader::emit::SLOT_MEMORY)
             {
-                let raw_writes = if !publish || (write_skip() && !t.host.writes_guest_memory) {
-                    Writes::None
-                } else if direct_builder && write_skip() {
-                    builder_raw_writes(&stage.shader.hash, self.roots_ref(compute))
-                } else {
-                    Writes::All
-                };
+                let raw_writes =
+                    if !publish || (DrawSwitches::write_skip() && !t.host.writes_guest_memory) {
+                        Writes::None
+                    } else if direct_builder && DrawSwitches::write_skip() {
+                        Root::builder_raw_writes(&stage.shader.hash, self.roots_ref(compute))
+                    } else {
+                        Writes::All
+                    };
                 let Some(ready) = self.memory_ready(list, compute, raw_writes, &t.host) else {
                     once!(
                         "a shader that reads title memory by address without a view heap to hold its views: the draw is dropped"
@@ -1056,7 +1414,7 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(mut gpu) = root_view(list, address, srv) else {
+                    let Some(mut gpu) = Root::root_view(list, address, srv) else {
                         continue;
                     };
                     if biased {
@@ -1101,8 +1459,8 @@ impl State {
                         None
                     }
                 };
-                let writes_slot =
-                    writes && (!write_skip() || t.host.written_root_uavs.contains(&slot));
+                let writes_slot = writes
+                    && (!DrawSwitches::write_skip() || t.host.written_root_uavs.contains(&slot));
                 if !self.root_uav(list, address, param, compute, writes_slot) {
                     return false;
                 }
@@ -1408,7 +1766,7 @@ impl State {
     }
 
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
-        let (early_ms, bake_ms) = early_budgets();
+        let (early_ms, bake_ms) = DrawSwitches::early_budgets();
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
         }
@@ -1569,7 +1927,7 @@ impl State {
         let mut refused = 0;
         host.texture_slots_remapped(frame);
         host.texture_sweep(heap, frame);
-        if heap_recheck() {
+        if DrawSwitches::heap_recheck() {
             let [same, changed, waiting] = host.texture_slots_rechecked(frame);
             HEAP_TEXTURES_RECHECKED[0].fetch_add(same, Ordering::Relaxed);
             HEAP_TEXTURES_RECHECKED[1].fetch_add(changed, Ordering::Relaxed);
@@ -1616,15 +1974,17 @@ impl State {
         let catchup = *CATCHUP
             .get_or_init(|| std::env::var_os("LEONIDA_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
         let plain = span;
-        let (per_frame, span) =
-            if catchup && census[0] > LONG && catching_up(std::time::Duration::ZERO) {
-                (
-                    per_frame.max(PER_FRAME_CATCHING_UP),
-                    span.max(SPAN_CATCHING_UP),
-                )
-            } else {
-                (per_frame, span)
-            };
+        let (per_frame, span) = if catchup
+            && census[0] > LONG
+            && DrawSwitches::catching_up(std::time::Duration::ZERO)
+        {
+            (
+                per_frame.max(PER_FRAME_CATCHING_UP),
+                span.max(SPAN_CATCHING_UP),
+            )
+        } else {
+            (per_frame, span)
+        };
         let (span, bytes_at_most) = match PASS_BUDGET.get() {
             Some((ms, bytes)) => (
                 std::time::Duration::from_millis(ms),
@@ -1687,7 +2047,7 @@ impl State {
                 host.texture_slot_done(index, write, None);
                 continue;
             };
-            let upload = (room || reupload_when_full())
+            let upload = (room || DrawSwitches::reupload_when_full())
                 .then(|| host.mirror_queued(index, handle, write, !room))
                 .and_then(Result::ok);
             let Some((view, _residence)) = upload else {
@@ -1729,7 +2089,7 @@ impl State {
                 crate::texture::TextureUploads::upload_again(resource);
             }
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                ViewInspector::readable(list, sampled.kind, view);
             }
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !GONE.load(Ordering::Relaxed)
@@ -1759,7 +2119,7 @@ impl State {
                 host.texture_slot_done(index, write, again);
                 continue;
             }
-            let memory = if again.is_none() && heap_recheck() {
+            let memory = if again.is_none() && DrawSwitches::heap_recheck() {
                 crate::texture::TextureUploads::staged_memory(resource)
             } else {
                 None
@@ -1778,7 +2138,7 @@ impl State {
                 );
             }
         }
-        catching_up(began.elapsed().saturating_sub(plain));
+        DrawSwitches::catching_up(began.elapsed().saturating_sub(plain));
     }
 
     #[cfg(feature = "diagnostics")]
@@ -1907,9 +2267,9 @@ impl State {
             .then(|| p.stages[0].translated().compute_threads)
             .flatten();
         let threads = [x, y, z];
-        let [x, y, z] = thread_group.map_or(threads, |size| dispatch_groups(threads, size));
+        let [x, y, z] = thread_group.map_or(threads, |size| DispatchShape::groups(threads, size));
         let tail = thread_group.and_then(|size| {
-            compute_word(p, leonida_shader::emit::USER_DISPATCH_THREADS_X)
+            DispatchShape::compute_word(p, leonida_shader::emit::USER_DISPATCH_THREADS_X)
                 .map(|(param, word)| (param, word, size[0]))
         });
         let set_tail = |base: u32| {
@@ -1918,7 +2278,7 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, left, word) };
             }
         };
-        match group_base(p) {
+        match DispatchShape::group_base(p) {
             Some((param, dword)) if x > crate::indirect::PART => unsafe {
                 let mut base = 0;
                 while base < x {
@@ -2060,7 +2420,7 @@ impl State {
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
-        if !compute && !list_slots().is_empty() {
+        if !compute && !ViewInspector::list_slots().is_empty() {
             text.push_str(&self.slots_text());
         }
         text
@@ -2072,7 +2432,7 @@ impl State {
         const MATERIALS: u32 = 160;
         const GLOBAL: u32 = 688;
         const DRAW_CONSTANTS: u32 = 56;
-        let wanted = list_slots();
+        let wanted = ViewInspector::list_slots();
         let Some(p) = crate::pipeline::PipelineState::host_pipeline(self.pipeline as This) else {
             return String::new();
         };
@@ -2142,7 +2502,7 @@ impl State {
                             let _ = write!(
                                 text,
                                 "\n    ~table {label} title=[{}]",
-                                view_state(Some(&view))
+                                ViewInspector::view_state(Some(&view))
                             );
                         }
                     }
@@ -2259,12 +2619,12 @@ impl State {
         };
         format!(
             "\n    ~slot from={from}+{at:#x} slot={index} title=[{}] host=[{host}] queue=[{queue}]",
-            view_state(title.as_ref())
+            ViewInspector::view_state(title.as_ref())
         )
     }
 
     fn mesh_scissor(&self, list: &HostList, on: bool) {
-        if mesh_test() != 2 {
+        if DrawSwitches::mesh_test() != 2 {
             return;
         }
         if on {
@@ -2274,9 +2634,9 @@ impl State {
                 right: 1,
                 bottom: 1,
             };
-            crate::draw::scissors(list, &vec![one; self.scissors.len().max(1)]);
+            crate::draw::FixedState::scissors(list, &vec![one; self.scissors.len().max(1)]);
         } else if !self.scissors.is_empty() {
-            crate::draw::scissors(list, &self.scissors);
+            crate::draw::FixedState::scissors(list, &self.scissors);
         }
     }
 
@@ -2285,8 +2645,8 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = mesh_test() != 1
-            && mesh_kept(self.pipeline)
+        let ran = DrawSwitches::mesh_test() != 1
+            && DrawSwitches::mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -2305,7 +2665,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            DrawCounters::note_dropped(self.pipeline);
         }
     }
 
@@ -2395,7 +2755,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            ViewInspector::readable(list, u.kind, &view);
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
             }
@@ -2511,7 +2871,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::Descriptors::view(handle) {
-                        readable(list, u.kind, &view);
+                        ViewInspector::readable(list, u.kind, &view);
                     }
                 }
                 for k in selected {
@@ -2520,9 +2880,9 @@ impl State {
                     }
                     let handle = table + u64::from(k) * 32;
                     if let Some(view) = crate::descriptor::Descriptors::view(handle)
-                        && let Some(kind) = view_kind(&view)
+                        && let Some(kind) = ViewInspector::view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        ViewInspector::readable(list, kind, &view);
                     }
                 }
                 made.push((slot, first * 32));
@@ -2553,10 +2913,10 @@ impl State {
                             selected
                                 .binary_search(&k)
                                 .ok()
-                                .and_then(|_| view_kind(&view))
+                                .and_then(|_| ViewInspector::view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            ViewInspector::readable(list, kind, &view);
                         }
                         if let Some(title) = title_first
                             && crate::descriptor::host::is_texture_view(&view)
@@ -2628,7 +2988,9 @@ impl State {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        describe(crate::descriptor::Descriptors::view(handle).as_ref())
+                        ViewInspector::describe(
+                            crate::descriptor::Descriptors::view(handle).as_ref(),
+                        )
                     }
                     (root, _) => format!("{root:?}"),
                 };
@@ -2675,7 +3037,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            DrawCounters::note_dropped(self.pipeline);
         }
     }
 
@@ -2767,7 +3129,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            DrawCounters::note_dropped(self.pipeline);
         }
     }
 }
@@ -2920,24 +3282,29 @@ impl State {
             None => None,
         };
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+            .then(|| DispatchShape::signature(kind, stride))
             .flatten()
         else {
             why("no host signature");
             return false;
         };
-        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+        if kind == MESH
+            && (DrawSwitches::mesh_test() == 1 || !DrawSwitches::mesh_kept(self.pipeline))
+        {
             why("mesh draws are switched off (LEONIDA_MESH_TEST=skip)");
             return false;
         }
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let parts = if kind == DISPATCH && max == 1 && count.is_none() {
-            group_base(p).zip(host_signature(DISPATCH, crate::indirect::PART_BYTES as u32))
+            DispatchShape::group_base(p).zip(DispatchShape::signature(
+                DISPATCH,
+                crate::indirect::PART_BYTES as u32,
+            ))
         } else {
             None
         };
-        let windowed = windows()
+        let windowed = DrawSwitches::windows_on()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -3101,339 +3468,11 @@ impl State {
     }
 }
 
-fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
-    compute_word(p, leonida_shader::emit::USER_GROUP_BASE)
-}
-
-fn compute_word(p: &crate::pipeline::host::HostPipeline, kind: u32) -> Option<(u32, u32)> {
-    let stage = p.stages.first().filter(|_| p.compute)?;
-    let (param, _) = stage.user_data?;
-    let word = stage
-        .translated()
-        .host
-        .user_data
-        .iter()
-        .find(|u| u.root == RootType::Other(kind))?;
-    Some((param, word.index))
-}
-
-fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
-    std::array::from_fn(|i| threads[i].div_ceil(size[i]))
-}
-
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
-        std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
-    }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
-    };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
-    }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
-}
-
-fn view_kind(view: &View) -> Option<ResourceType> {
-    match view {
-        View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
-        View::Unordered(..) | View::Placed(true, ..) => Some(ResourceType::Uav),
-        _ => None,
-    }
-}
-
-fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>) -> u32 {
-    const ONE_PLANE: [i32; 2] = [55, 40];
-    let Some(desc) = desc else {
-        return DEPTH_WRITE;
-    };
-    let format = if desc.Format.0 == 0 {
-        unsafe { texture.GetDesc() }.Format.0
-    } else {
-        desc.Format.0
-    };
-    let mut needed = D3D12_DSV_FLAG_READ_ONLY_DEPTH.0;
-    if !ONE_PLANE.contains(&format) {
-        needed |= D3D12_DSV_FLAG_READ_ONLY_STENCIL.0;
-    }
-    if desc.Flags.0 & needed == needed {
-        DEPTH_READ
-    } else {
-        DEPTH_WRITE
-    }
-}
-
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
-    const UNORDERED_ACCESS: u32 = 0x8;
-    let placed = crate::descriptor::host::placed_texture(view);
-    let view = placed.as_ref().map_or(view, |p| &p.view);
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
-        shadow.refresh(list, address, len);
-        if kind == ResourceType::Uav {
-            if STORES.get() || !write_skip() {
-                shadow.gpu_writes(list, address, len);
-            } else {
-                #[cfg(feature = "diagnostics")]
-                {
-                    crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
-                    crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
-                }
-            }
-        }
-    }
-    match (view, kind) {
-        (View::Shader(resource, _), ResourceType::Srv) => {
-            let aliased =
-                crate::resource::GpuResource::alias_of(*resource as This).is_some_and(|source| {
-                    crate::texture::TextureUploads::alias(list, *resource as This, source)
-                });
-            if !aliased
-                && let Some(t) = crate::resource::HostTextures::host_resource(*resource as This)
-                && crate::texture::TextureUploads::title_written(t)
-            {
-                let first = match (&placed, view) {
-                    (Some(_), View::Shader(_, Some(desc))) => {
-                        crate::resource::PlacedTextures::first_mip(desc)
-                    }
-                    _ => 0,
-                };
-                crate::texture::TextureUploads::upload_from(list, *resource as This, t, first);
-            }
-            list.twin_use(*resource as This, false, false);
-            let (tested, _) = TESTED_DEPTH.get();
-            let state = if tested != 0 && tested == *resource {
-                TESTED_DEPTH.set((tested, true));
-                DEPTH_READ | SHADER_RESOURCE
-            } else {
-                SHADER_RESOURCE
-            };
-            crate::list::CommandList::ensure_state(list, *resource as This, state);
-            #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::HostTextures::host_resource(*resource as This) {
-                let d = unsafe { t.GetDesc() };
-                if d.Flags.0 & 7 == 0 {
-                    tracing::debug!(
-                        resource = format_args!("{resource:#x}"),
-                        ?d,
-                        "a shader reads a texture the title fills"
-                    );
-                }
-            }
-        }
-        (View::Unordered(resource, _, _), ResourceType::Uav) => {
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(*resource as This);
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_written(std::ptr::from_ref(list) as usize, *resource as This);
-            list.texture_written(*resource as This);
-            if !list.twin_use(*resource as This, true, true) {
-                crate::list::CommandList::ensure_state(list, *resource as This, UNORDERED_ACCESS);
-            }
-        }
-        _ => {}
-    }
-}
-
-#[cfg(feature = "diagnostics")]
-fn list_slots() -> &'static [String] {
-    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
-        std::env::var("LEONIDA_LIST_SLOTS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect()
-    })
-}
-
-#[cfg(feature = "diagnostics")]
-fn print_4k(at: u64) -> String {
-    let mut bytes = [0u8; 4096];
-    if at == 0 || !crate::host::read_into(at as *const u8, &mut bytes) {
-        return "unreadable".into();
-    }
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for b in bytes {
-        hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
-
-#[cfg(feature = "diagnostics")]
-fn memory_state(at: u64, bytes: u64) -> String {
-    let mapped = crate::texture::TitleMemoryMap::mapped_bytes(at as *const u8, bytes as usize);
-    let last = at + bytes.saturating_sub(4096);
-    format!(
-        "memory={at:#x} mapped={mapped}/{bytes} first4k={} last4k={}",
-        print_4k(at),
-        print_4k(last)
-    )
-}
-
-#[cfg(feature = "diagnostics")]
-fn texture_state(this: This) -> String {
-    let Some((at, desc)) = crate::resource::GpuResource::texture_memory(this) else {
-        return "not a texture".into();
-    };
-    let words = unsafe {
-        std::ptr::from_ref(&desc)
-            .cast::<[u32; 14]>()
-            .read_unaligned()
-    };
-    let bytes = crate::resource::PlacedTextures::placed_bytes(&words).unwrap_or(0);
-    let staged = match crate::texture::TextureUploads::staged_state(this) {
-        Some((uploaded, dirty)) => format!("staged=yes uploaded={uploaded} dirty={dirty}"),
-        None => "staged=no".into(),
-    };
-    format!(
-        "{}x{} f{} levels={} host_copy={} {staged} host_written={} title_fills={} {}",
-        u64::from(words[4]) | u64::from(words[5]) << 32,
-        words[6],
-        words[8],
-        words[7] >> 16,
-        crate::resource::GpuResource::host_made(this).is_some(),
-        crate::texture::HostWrites::wrote(this as usize),
-        crate::resource::GpuResource::title_fills(this),
-        memory_state(at as u64, bytes)
-    )
-}
-
-#[cfg(feature = "diagnostics")]
-fn view_state(view: Option<&View>) -> String {
-    match view {
-        None => "no view".into(),
-        Some(View::Placed(false, r, d)) if r[0] != 1 => {
-            let address = u64::from(d[10]) | u64::from(d[11]) << 32;
-            let state = match crate::resource::PlacedTextures::placed_known(address, r) {
-                Some(this) => texture_state(this),
-                None => format!(
-                    "{}x{} f{} levels={} resource=none {}",
-                    u64::from(r[4]) | u64::from(r[5]) << 32,
-                    r[6],
-                    r[8],
-                    r[7] >> 16,
-                    memory_state(
-                        address,
-                        crate::resource::PlacedTextures::placed_bytes(r).unwrap_or(0)
-                    )
-                ),
-            };
-            format!("placed texture view_format={} {state}", d[0])
-        }
-        Some(View::Shader(r, d))
-            if crate::resource::GpuResource::texture_memory(*r as This).is_some() =>
-        {
-            format!(
-                "texture object {r:#x} view_format={} {}",
-                d.as_ref().map_or(0, |d| d[0]),
-                texture_state(*r as This)
-            )
-        }
-        Some(v) => format!("{v:?}").chars().take(80).collect(),
-    }
-}
-
-#[cfg(feature = "diagnostics")]
-fn describe(view: Option<&View>) -> String {
-    let texture = |r: This| {
-        crate::resource::GpuResource::host_made(r).map(|t| {
-            let d = unsafe { t.GetDesc() };
-            format!(
-                "{}x{} f{} flags {:#x} of {r:?}",
-                d.Width, d.Height, d.Format.0, d.Flags.0
-            )
-        })
-    };
-    match view {
-        None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This)
-            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
-            Some(t) => format!("uav texture {t}"),
-            None => format!(
-                "uav resource {r:#x} buffer {:?}",
-                crate::descriptor::host::buffer_range(v)
-            ),
-        },
-        Some(View::Placed(u, r, d)) => format!(
-            "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
-            r[0],
-            u64::from(r[4]) | u64::from(r[5]) << 32,
-            r[6],
-            r[8],
-            r[11],
-            u64::from(d[10]) | u64::from(d[11]) << 32
-        ),
-        Some(View::Constant(address, size))
-            if *size >= 16
-                && crate::texture::TitleMemoryMap::committed(*address as *const u8, 16) =>
-        {
-            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
-        }
-        Some(v) => format!("{v:?}").chars().take(60).collect(),
-    }
-}
-
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
 const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
-
-pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
-    unsafe { list.list.RSSetViewports(viewports) };
-}
-
-pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
-    unsafe { list.list.RSSetScissorRects(rects) };
-}
-
-pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
-    unsafe { list.list.OMSetBlendFactor(factor) };
-}
-
-pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
-    #[cfg(feature = "diagnostics")]
-    crate::capture::op(std::ptr::from_ref(list) as usize, || {
-        format!("STENCIL REF {reference:#x}")
-    });
-    unsafe { list.list.OMSetStencilRef(reference) };
-}
-
-pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
-    #[cfg(feature = "diagnostics")]
-    crate::capture::op(std::ptr::from_ref(list) as usize, || {
-        format!("DEPTH BOUNDS {min}..{max}")
-    });
-    if crate::host::host().is_some_and(|h| h.depth_bounds())
-        && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
-    {
-        unsafe { l1.OMSetDepthBounds(min, max) };
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -3464,7 +3503,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            raw_constants(&roots, &words),
+            Root::raw_constants(&roots, &words),
             [0, 0, 0xaabb_ffff, 0, 0, 0, 0x7654_3210, 0x34, 0x0800_0000]
         );
     }
@@ -3486,7 +3525,7 @@ mod tests {
             }
             let extra = if has_centroid { (centroid, 24) } else { (0, 0) };
             assert_eq!(
-                builder_raw_writes(hash, state.roots_ref(true)),
+                Root::builder_raw_writes(hash, state.roots_ref(true)),
                 Writes::Ranges([(header + from, bytes), extra]),
             );
         }
@@ -3496,26 +3535,32 @@ mod tests {
     fn bounded_builder_raw_writes_fall_back_for_indirect_or_missing_addresses() {
         let hash = "f6e47efa50226beb";
         let mut roots = vec![Root::None; 9];
-        assert_eq!(builder_raw_writes(hash, &roots[..8]), Writes::All);
+        assert_eq!(Root::builder_raw_writes(hash, &roots[..8]), Writes::All);
         roots[8] = Root::View(0x10000);
-        assert_eq!(builder_raw_writes(hash, &roots), Writes::All);
+        assert_eq!(Root::builder_raw_writes(hash, &roots), Writes::All);
         roots[8] = Root::Constants(vec![0, 5, 0, 0, 4]);
-        assert_eq!(builder_raw_writes(hash, &roots), Writes::All);
+        assert_eq!(Root::builder_raw_writes(hash, &roots), Writes::All);
         roots[8] = Root::Constants(vec![2, 5, 0, 0, 0, 0]);
-        assert_eq!(builder_raw_writes(hash, &roots), Writes::All);
+        assert_eq!(Root::builder_raw_writes(hash, &roots), Writes::All);
         roots[8] = Root::Constants(vec![0; 6]);
-        assert_eq!(builder_raw_writes("3cea4534bbc15632", &roots), Writes::All);
-        assert_eq!(builder_raw_writes("0000000000000000", &roots), Writes::All);
+        assert_eq!(
+            Root::builder_raw_writes("3cea4534bbc15632", &roots),
+            Writes::All
+        );
+        assert_eq!(
+            Root::builder_raw_writes("0000000000000000", &roots),
+            Writes::All
+        );
     }
 
     #[test]
     fn thread_dimensions_use_the_kernels_declared_group_size() {
-        assert_eq!(dispatch_groups([8847, 1, 1], [64, 1, 1]), [139, 1, 1]);
-        assert_eq!(dispatch_groups([74, 1, 1], [64, 1, 1]), [2, 1, 1]);
-        assert_eq!(dispatch_groups([32, 1, 1], [32, 1, 1]), [1, 1, 1]);
-        assert_eq!(dispatch_groups([0, 12, 9], [64, 4, 4]), [0, 3, 3]);
+        assert_eq!(DispatchShape::groups([8847, 1, 1], [64, 1, 1]), [139, 1, 1]);
+        assert_eq!(DispatchShape::groups([74, 1, 1], [64, 1, 1]), [2, 1, 1]);
+        assert_eq!(DispatchShape::groups([32, 1, 1], [32, 1, 1]), [1, 1, 1]);
+        assert_eq!(DispatchShape::groups([0, 12, 9], [64, 4, 4]), [0, 3, 3]);
         assert_eq!(
-            dispatch_groups([u32::MAX, 1, 1], [64, 1, 1]),
+            DispatchShape::groups([u32::MAX, 1, 1], [64, 1, 1]),
             [1 << 26, 1, 1]
         );
     }
@@ -3703,7 +3748,7 @@ mod tests {
             let list = host.new_list().unwrap();
             heap.mirror(0, handle, true).unwrap();
             heap.make_at(1, &reader);
-            readable(&list, ResourceType::Uav, &writer);
+            ViewInspector::readable(&list, ResourceType::Uav, &writer);
             unsafe {
                 list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
                 list.list.SetComputeRootSignature(&write_root);
@@ -3712,7 +3757,7 @@ mod tests {
                     .SetComputeRootDescriptorTable(0, heap.gpu_handle(0));
                 list.list.Dispatch(1, 1, 1);
             }
-            readable(&list, ResourceType::Srv, &reader);
+            ViewInspector::readable(&list, ResourceType::Srv, &reader);
             unsafe {
                 list.list.SetComputeRootSignature(&read_root);
                 list.list.SetPipelineState(&read_pso);

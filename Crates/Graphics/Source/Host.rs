@@ -5812,7 +5812,7 @@ impl Meter {
             frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
-            drawn: crate::draw::drawn(),
+            drawn: crate::draw::DrawCounters::drawn(),
             logged: now,
             cpu_us: process_cpu_us().unwrap_or(0),
             cpu_pct: 0.0,
@@ -5835,7 +5835,7 @@ impl Meter {
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
-        let drawn = crate::draw::drawn();
+        let drawn = crate::draw::DrawCounters::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
@@ -5861,7 +5861,7 @@ impl Meter {
         });
         let [back_ms, back_mb] =
             [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
-        let dropped = crate::draw::take_dropped() as f64 / frames;
+        let dropped = crate::draw::DrawCounters::take_dropped() as f64 / frames;
         let indirect = crate::list::WorkCounters::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
