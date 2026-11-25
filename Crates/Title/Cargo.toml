@@ -1,0 +1,26 @@
+[package]
+name = "leonida-title"
+description = "Everything specific to the title: its containers, build identities, patches."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+autobins = false
+autotests = false
+autoexamples = false
+autobenches = false
+
+[lib]
+path = "Source/Lib.rs"
+
+[[example]]
+name = "shader_pack_states"
+path = "Examples/ShaderPackStates.rs"
+
+[dependencies]
+memchr.workspace = true
+zlib-rs.workspace = true
+
+[lints]
+workspace = true

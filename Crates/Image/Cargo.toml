@@ -1,0 +1,22 @@
+[package]
+name = "leonida-image"
+description = "Read-only analysis of PE32+ images and COFF import libraries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+autobins = false
+autotests = false
+autoexamples = false
+autobenches = false
+
+[lib]
+path = "Source/Lib.rs"
+
+[dependencies]
+object.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

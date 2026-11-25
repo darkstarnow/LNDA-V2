@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = ["Apps/*", "Crates/*", "Tasks"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+leonida-core = { path = "Crates/Core" }
+leonida-image = { path = "Crates/Image" }
+leonida-loader = { path = "Crates/Loader" }
+leonida-services = { path = "Crates/Services" }
+leonida-graphics = { path = "Crates/Graphics" }
+leonida-shader = { path = "Crates/Shader" }
+leonida-formats = { path = "Crates/Formats" }
+leonida-conversion = { path = "Crates/Conversion" }
+leonida-title = { path = "Crates/Title" }
+
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+clap = { version = "4.6.9", features = ["derive"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.2"
+object = { version = "0.41.0", default-features = false, features = ["read_core", "pe", "coff", "archive", "std"] }
+windows-sys = "0.61.2"
+windows = "0.62.2"
+windows-core = "0.62.2"
+blake3 = "1.8.7"
+memchr = "2.8.3"
+zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
+walkdir = "2.5.1"
+tempfile = "3.27.0"
+opus-pure = "0.2.4"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+type_complexity = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+missing_safety_doc = "allow"
+chunks_exact_to_as_chunks = "allow"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+debug = "line-tables-only"
+
+[profile.diag]
+inherits = "release"

@@ -1,0 +1,50 @@
+[package]
+name = "leonida"
+default-run = "Leonida"
+description = "Command-line front end: inspect, census, convert, run."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+autobins = false
+autotests = false
+autoexamples = false
+autobenches = false
+
+[[bin]]
+name = "Leonida"
+path = "Source/Main.rs"
+
+[[bin]]
+name = "LeonidaPlay"
+path = "Source/Bin/LeonidaPlay.rs"
+
+[[bin]]
+name = "LeonidaWarm"
+path = "Source/Bin/LeonidaWarm.rs"
+
+[dependencies]
+leonida-core.workspace = true
+leonida-image.workspace = true
+leonida-loader.workspace = true
+leonida-services.workspace = true
+leonida-shader = { workspace = true, features = ["host"] }
+leonida-title.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+memchr.workspace = true
+clap.workspace = true
+walkdir.workspace = true
+tracing.workspace = true
+
+[features]
+diagnostics = [
+    "leonida-core/diagnostics",
+    "leonida-services/diagnostics",
+    "leonida-loader/diagnostics",
+    "leonida-shader/diagnostics",
+]
+
+[lints]
+workspace = true
