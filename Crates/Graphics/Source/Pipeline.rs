@@ -699,7 +699,7 @@ static FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<PIPELINE, 24>());
     f[0] = PipelineState::query_interface as *const ();
     f[2] = PipelineState::release as *const ();
-    f[7] = object::parent_device as *const ();
+    f[7] = object::Object::parent_device as *const ();
     Table(f)
 };
 

@@ -83,12 +83,12 @@ trait Singleton: 'static {
     }
 
     fn answer_as(by: usize, iid: *const Iid, out: *mut This) -> HRESULT {
-        let found = object::is(iid, Self::INTERFACES).then_some(Self::instance());
-        object::answer(by, iid, found, out)
+        let found = object::Object::implements(iid, Self::INTERFACES).then_some(Self::instance());
+        object::Object::answer(by, iid, found, out)
     }
 
     fn offer(by: usize, out: *mut This) -> HRESULT {
-        object::answer(by, &Self::INTERFACES[0], Some(Self::instance()), out)
+        object::Object::answer(by, &Self::INTERFACES[0], Some(Self::instance()), out)
     }
 
     extern "system" fn query_interface(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -116,7 +116,7 @@ impl Singleton for DxgiDevice {
 
     extern "system" fn query_interface(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
         if crate::device::Device::implements(iid) {
-            return object::answer(
+            return object::Object::answer(
                 DXGI_DEVICE,
                 iid,
                 Some(crate::device::Device::instance()),
@@ -160,7 +160,7 @@ impl DxgiDevice {
     }
 
     pub(crate) fn implements(iid: *const Iid) -> bool {
-        object::is(iid, &DEVICE_IIDS)
+        object::Object::implements(iid, &DEVICE_IIDS)
     }
 
     extern "system" fn get_parent(_: This, iid: *const Iid, out: *mut This) -> HRESULT {

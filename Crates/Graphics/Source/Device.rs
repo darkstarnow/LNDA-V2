@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::object::{
     self, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, HRESULT, Iid, Object, S_FALSE, S_OK, Table, This,
-    guid, guid_text,
+    guid,
 };
 use crate::{
     descriptor, dxgi, fence, frame, list, pipeline, query, queue, resource, root, signature,
@@ -103,7 +103,7 @@ impl Device {
     }
 
     pub(crate) fn implements(iid: *const Iid) -> bool {
-        object::is(iid, &[IID]) || object::is(iid, &LEVEL_IIDS)
+        object::Object::implements(iid, &[IID]) || object::Object::implements(iid, &LEVEL_IIDS)
     }
 
     pub(crate) fn newer() -> bool {
@@ -128,7 +128,7 @@ impl Device {
             );
         }
         if !Self::implements(iid) {
-            tracing::warn!(iid = %guid_text(iid), "device created as an unknown interface");
+            tracing::warn!(iid = %Object::guid_text(iid), "device created as an unknown interface");
             return E_NOINTERFACE;
         }
         if out.is_null() {
@@ -137,7 +137,7 @@ impl Device {
         if *iid == LEVEL_IIDS[8] {
             NEWER.store(true, Ordering::Relaxed);
         }
-        object::answer(object::DEVICE, iid, Some(Self::instance()), out)
+        object::Object::answer(object::DEVICE, iid, Some(Self::instance()), out)
     }
 
     extern "system" fn query_interface(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -148,7 +148,7 @@ impl Device {
         } else {
             None
         };
-        object::answer(object::DEVICE, iid, found, out)
+        object::Object::answer(object::DEVICE, iid, found, out)
     }
 
     extern "system" fn get_node_count(_: This) -> u32 {
@@ -384,7 +384,7 @@ static FUNCTIONS: Table<160> = {
     f[61] = descriptor::Descriptors::create_sampler_x as *const ();
     f[62] = pipeline::PipelineState::create_compute_x as *const ();
     f[67] = Device::unknown_pipeline::<0x218> as *const ();
-    f[69] = object::ignore as *const ();
+    f[69] = object::Object::ignore as *const ();
     f[70] = descriptor::Descriptors::create_placed_srv as *const ();
     f[71] = descriptor::Descriptors::create_placed_uav as *const ();
     f[73] = list::CommandList::create_x as *const ();

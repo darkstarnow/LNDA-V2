@@ -25,14 +25,6 @@ pub const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> Iid {
     ]
 }
 
-pub fn guid_text(g: &Iid) -> String {
-    let a = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
-    let b = u16::from_le_bytes([g[4], g[5]]);
-    let c = u16::from_le_bytes([g[6], g[7]]);
-    let d: String = g[8..].iter().map(|x| format!("{x:02x}")).collect();
-    format!("{a:08x}-{b:04x}-{c:04x}-{}-{}", &d[..4], &d[4..])
-}
-
 #[repr(C)]
 pub struct Object {
     functions: *const *const (),
@@ -55,65 +47,213 @@ pub(crate) type This = *const Object;
 
 #[repr(transparent)]
 pub(crate) struct Table<const N: usize>(pub [*const (); N]);
-unsafe impl<const N: usize> Sync for Table<N> {}
 
-pub(crate) extern "system" fn add_ref(this: This) -> u32 {
-    unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
-}
+pub(crate) struct PrivateData;
 
-#[cfg(windows)]
-pub(crate) fn try_add_ref(this: This) -> bool {
-    unsafe { &*this }
-        .refs
-        .try_update(Ordering::Acquire, Ordering::Relaxed, |n| {
-            if n == 0 { None } else { n.checked_add(1) }
-        })
-        .is_ok()
-}
+pub(crate) struct MissingMethods;
 
-pub(crate) extern "system" fn release(this: This) -> u32 {
-    let refs = &unsafe { &*this }.refs;
-    let _ = refs.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
-    refs.load(Ordering::Relaxed)
-}
-
-pub(crate) fn answer(kind: usize, iid: *const Iid, found: Option<This>, out: *mut This) -> HRESULT {
-    if out.is_null() {
-        return E_POINTER;
+impl Object {
+    pub fn guid_text(g: &Iid) -> String {
+        let a = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+        let b = u16::from_le_bytes([g[4], g[5]]);
+        let c = u16::from_le_bytes([g[6], g[7]]);
+        let d: String = g[8..].iter().map(|x| format!("{x:02x}")).collect();
+        format!("{a:08x}-{b:04x}-{c:04x}-{}-{}", &d[..4], &d[4..])
     }
-    let hr = match found {
-        Some(object) => {
-            add_ref(object);
-            unsafe { out.write(object) };
+
+    pub(crate) extern "system" fn add_ref(this: This) -> u32 {
+        unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn try_add_ref(this: This) -> bool {
+        unsafe { &*this }
+            .refs
+            .try_update(Ordering::Acquire, Ordering::Relaxed, |n| {
+                if n == 0 { None } else { n.checked_add(1) }
+            })
+            .is_ok()
+    }
+
+    pub(crate) extern "system" fn release(this: This) -> u32 {
+        let refs = &unsafe { &*this }.refs;
+        let _ = refs.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        refs.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn answer(
+        kind: usize,
+        iid: *const Iid,
+        found: Option<This>,
+        out: *mut This,
+    ) -> HRESULT {
+        if out.is_null() {
+            return E_POINTER;
+        }
+        let hr = match found {
+            Some(object) => {
+                Object::add_ref(object);
+                unsafe { out.write(object) };
+                return S_OK;
+            }
+            None => E_NOINTERFACE,
+        };
+        let iid = unsafe { iid.as_ref() }
+            .map(Object::guid_text)
+            .unwrap_or_default();
+        tracing::warn!(object = KINDS[kind], %iid, "unknown interface");
+        unsafe { out.write(std::ptr::null()) };
+        hr
+    }
+
+    pub(crate) fn implements(iid: *const Iid, known: &[Iid]) -> bool {
+        unsafe { iid.as_ref() }.is_some_and(|i| known.contains(i))
+    }
+
+    pub(crate) fn hand_out<T>(
+        kind: usize,
+        object: Box<T>,
+        iid: *const Iid,
+        known: &[Iid],
+        out: *mut This,
+    ) -> HRESULT {
+        if !Object::implements(iid, known) {
+            return Object::answer(kind, iid, None, out);
+        }
+        if out.is_null() {
+            return S_FALSE;
+        }
+        Object::answer(kind, iid, Some(Box::into_raw(object).cast()), out)
+    }
+
+    pub(crate) fn release_boxed<T>(this: This) -> u32 {
+        let refs = &unsafe { &*this }.refs;
+        match refs.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
+            Ok(1) => {
+                PrivateData::lock().retain(|&(object, _), _| object != this as usize);
+                drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
+                0
+            }
+            Ok(n) => n - 1,
+            Err(_) => 0,
+        }
+    }
+
+    pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT {
+        let name = if name.is_null() {
+            String::new()
+        } else {
+            let len = (0..).take_while(|&i| unsafe { *name.add(i) } != 0).count();
+            String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, len) })
+        };
+        tracing::debug!(object = ?this, %name, "named");
+        S_OK
+    }
+
+    pub(crate) extern "system" fn parent_device(
+        _: This,
+        iid: *const Iid,
+        out: *mut This,
+    ) -> HRESULT {
+        let device = crate::device::Device::instance();
+        Object::answer(
+            DEVICE,
+            iid,
+            crate::device::Device::implements(iid).then_some(device),
+            out,
+        )
+    }
+
+    pub(crate) extern "system" fn ignore() -> HRESULT {
+        S_OK
+    }
+}
+
+impl PrivateData {
+    fn lock() -> std::sync::MutexGuard<'static, BTreeMap<(usize, Iid), Vec<u8>>> {
+        PRIVATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    extern "system" fn get(this: This, id: *const Iid, size: *mut u32, data: *mut u8) -> HRESULT {
+        let (Some(id), Some(size)) = (unsafe { (id.as_ref(), size.as_mut()) }) else {
+            return E_INVALIDARG;
+        };
+        let map = PrivateData::lock();
+        let Some(value) = map.get(&(this as usize, *id)) else {
+            *size = 0;
+            return NOT_FOUND;
+        };
+        let len = value.len() as u32;
+        let room = std::mem::replace(size, len);
+        if data.is_null() {
             return S_OK;
         }
-        None => E_NOINTERFACE,
-    };
-    let iid = unsafe { iid.as_ref() }.map(guid_text).unwrap_or_default();
-    tracing::warn!(object = KINDS[kind], %iid, "unknown interface");
-    unsafe { out.write(std::ptr::null()) };
-    hr
+        if room < len {
+            return MORE_DATA;
+        }
+        unsafe { data.copy_from_nonoverlapping(value.as_ptr(), value.len()) };
+        S_OK
+    }
+
+    extern "system" fn set(this: This, id: *const Iid, size: u32, data: *const u8) -> HRESULT {
+        let Some(&id) = (unsafe { id.as_ref() }) else {
+            return E_INVALIDARG;
+        };
+        let mut map = PrivateData::lock();
+        if data.is_null() {
+            map.remove(&(this as usize, id));
+        } else {
+            let value = unsafe { std::slice::from_raw_parts(data, size as usize) };
+            map.insert((this as usize, id), value.to_vec());
+        }
+        S_OK
+    }
 }
 
-pub(crate) fn is(iid: *const Iid, known: &[Iid]) -> bool {
-    unsafe { iid.as_ref() }.is_some_and(|i| known.contains(i))
+impl MissingMethods {
+    extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
+        if !REPORTED[KIND][SLOT].swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                object = KINDS[KIND],
+                slot = format_args!("{:#x}", SLOT * 8),
+                caller = MissingMethods::caller(),
+                "method not implemented"
+            );
+        }
+        E_NOTIMPL
+    }
+
+    #[inline(never)]
+    fn caller() -> String {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+            use windows_sys::Win32::System::LibraryLoader::{
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleExW,
+            };
+            let mut frame = std::ptr::null_mut();
+            if unsafe { RtlCaptureStackBackTrace(2, 1, &mut frame, std::ptr::null_mut()) } == 1 {
+                let mut module = std::ptr::null_mut();
+                let found = unsafe {
+                    GetModuleHandleExW(
+                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                            | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        frame as *const u16,
+                        &mut module,
+                    )
+                };
+                if found != 0 {
+                    return format!("+{:#x}", frame as usize - module as usize);
+                }
+                return format!("{frame:?}");
+            }
+        }
+        String::new()
+    }
 }
 
-pub(crate) fn hand_out<T>(
-    kind: usize,
-    object: Box<T>,
-    iid: *const Iid,
-    known: &[Iid],
-    out: *mut This,
-) -> HRESULT {
-    if !is(iid, known) {
-        return answer(kind, iid, None, out);
-    }
-    if out.is_null() {
-        return S_FALSE;
-    }
-    answer(kind, iid, Some(Box::into_raw(object).cast()), out)
-}
+unsafe impl<const N: usize> Sync for Table<N> {}
 
 pub(crate) unsafe trait ComObject: Sized + 'static {
     const KIND: usize;
@@ -124,91 +264,29 @@ pub(crate) unsafe trait ComObject: Sized + 'static {
     }
 
     fn hand_out(self: Box<Self>, iid: *const Iid, out: *mut This) -> HRESULT {
-        hand_out(Self::KIND, self, iid, Self::INTERFACES, out)
+        Object::hand_out(Self::KIND, self, iid, Self::INTERFACES, out)
     }
 
     extern "system" fn query_interface(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-        answer(
+        Object::answer(
             Self::KIND,
             iid,
-            is(iid, Self::INTERFACES).then_some(this),
+            Object::implements(iid, Self::INTERFACES).then_some(this),
             out,
         )
     }
 
     extern "system" fn release(this: This) -> u32 {
-        release_boxed::<Self>(this)
-    }
-}
-
-pub(crate) fn release_boxed<T>(this: This) -> u32 {
-    let refs = &unsafe { &*this }.refs;
-    match refs.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
-        Ok(1) => {
-            private_data().retain(|&(object, _), _| object != this as usize);
-            drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
-            0
-        }
-        Ok(n) => n - 1,
-        Err(_) => 0,
+        Object::release_boxed::<Self>(this)
     }
 }
 
 static PRIVATE: Mutex<BTreeMap<(usize, Iid), Vec<u8>>> = Mutex::new(BTreeMap::new());
 
-fn private_data() -> std::sync::MutexGuard<'static, BTreeMap<(usize, Iid), Vec<u8>>> {
-    PRIVATE.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-extern "system" fn get_private_data(
-    this: This,
-    id: *const Iid,
-    size: *mut u32,
-    data: *mut u8,
-) -> HRESULT {
-    let (Some(id), Some(size)) = (unsafe { (id.as_ref(), size.as_mut()) }) else {
-        return E_INVALIDARG;
-    };
-    let map = private_data();
-    let Some(value) = map.get(&(this as usize, *id)) else {
-        *size = 0;
-        return NOT_FOUND;
-    };
-    let len = value.len() as u32;
-    let room = std::mem::replace(size, len);
-    if data.is_null() {
-        return S_OK;
-    }
-    if room < len {
-        return MORE_DATA;
-    }
-    unsafe { data.copy_from_nonoverlapping(value.as_ptr(), value.len()) };
-    S_OK
-}
-
-extern "system" fn set_private_data(
-    this: This,
-    id: *const Iid,
-    size: u32,
-    data: *const u8,
-) -> HRESULT {
-    let Some(&id) = (unsafe { id.as_ref() }) else {
-        return E_INVALIDARG;
-    };
-    let mut map = private_data();
-    if data.is_null() {
-        map.remove(&(this as usize, id));
-    } else {
-        let value = unsafe { std::slice::from_raw_parts(data, size as usize) };
-        map.insert((this as usize, id), value.to_vec());
-    }
-    S_OK
-}
-
 pub(crate) const fn d3d12_object<const N: usize>(mut f: [*const (); N]) -> [*const (); N] {
-    f[3] = get_private_data as *const ();
-    f[4] = set_private_data as *const ();
-    f[6] = set_name as *const ();
+    f[3] = PrivateData::get as *const ();
+    f[4] = PrivateData::set as *const ();
+    f[6] = Object::set_name as *const ();
     f
 }
 
@@ -218,29 +296,8 @@ pub(crate) const fn pageable_table<T: ComObject, const KIND: usize, const N: usi
     let mut f = d3d12_object(missing_table::<KIND, N>());
     f[0] = T::query_interface as *const ();
     f[2] = T::release as *const ();
-    f[7] = parent_device as *const ();
+    f[7] = Object::parent_device as *const ();
     f
-}
-
-pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT {
-    let name = if name.is_null() {
-        String::new()
-    } else {
-        let len = (0..).take_while(|&i| unsafe { *name.add(i) } != 0).count();
-        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, len) })
-    };
-    tracing::debug!(object = ?this, %name, "named");
-    S_OK
-}
-
-pub(crate) extern "system" fn parent_device(_: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    let device = crate::device::Device::instance();
-    answer(
-        DEVICE,
-        iid,
-        crate::device::Device::implements(iid).then_some(device),
-        out,
-    )
 }
 
 pub(crate) const DEVICE: usize = 0;
@@ -283,53 +340,8 @@ const MAX_SLOTS: usize = 160;
 static REPORTED: [[AtomicBool; MAX_SLOTS]; KINDS.len()] =
     [const { [const { AtomicBool::new(false) }; MAX_SLOTS] }; KINDS.len()];
 
-extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
-    if !REPORTED[KIND][SLOT].swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            object = KINDS[KIND],
-            slot = format_args!("{:#x}", SLOT * 8),
-            caller = caller(),
-            "method not implemented"
-        );
-    }
-    E_NOTIMPL
-}
-
-#[inline(never)]
-fn caller() -> String {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
-        use windows_sys::Win32::System::LibraryLoader::{
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            GetModuleHandleExW,
-        };
-        let mut frame = std::ptr::null_mut();
-        if unsafe { RtlCaptureStackBackTrace(2, 1, &mut frame, std::ptr::null_mut()) } == 1 {
-            let mut module = std::ptr::null_mut();
-            let found = unsafe {
-                GetModuleHandleExW(
-                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-                        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                    frame as *const u16,
-                    &mut module,
-                )
-            };
-            if found != 0 {
-                return format!("+{:#x}", frame as usize - module as usize);
-            }
-            return format!("{frame:?}");
-        }
-    }
-    String::new()
-}
-
-pub(crate) extern "system" fn ignore() -> HRESULT {
-    S_OK
-}
-
 macro_rules! missing {
-    ($kind:ident; $($slot:literal)*) => { [$(missing::<$kind, $slot> as *const ()),*] };
+    ($kind:ident; $($slot:literal)*) => { [$(MissingMethods::missing::<$kind, $slot> as *const ()),*] };
 }
 
 pub(crate) const fn missing_table<const KIND: usize, const N: usize>() -> [*const (); N] {
@@ -349,8 +361,8 @@ pub(crate) const fn missing_table<const KIND: usize, const N: usize>() -> [*cons
         table[i] = all[i];
         i += 1;
     }
-    table[1] = add_ref as *const ();
-    table[2] = release as *const ();
+    table[1] = Object::add_ref as *const ();
+    table[2] = Object::release as *const ();
     table
 }
 
@@ -373,6 +385,9 @@ mod tests {
             [0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7],
         );
         assert_eq!(g[..4], [0xf1, 0x19, 0x98, 0x18]);
-        assert_eq!(guid_text(&g), "189819f1-1db6-4b57-be54-1821339b85f7");
+        assert_eq!(
+            Object::guid_text(&g),
+            "189819f1-1db6-4b57-be54-1821339b85f7"
+        );
     }
 }

@@ -62,11 +62,7 @@ impl MaterialDemand {
             .unwrap_or_else(|e| e.into_inner());
         sampler.select(
             crate::frame::FramePacer::frame(),
-            (
-                heap as *const DescriptorHeap as usize,
-                offset,
-                fields,
-            ),
+            (heap as *const DescriptorHeap as usize, offset, fields),
         )
     }
 

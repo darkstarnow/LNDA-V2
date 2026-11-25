@@ -156,7 +156,7 @@ impl DescriptorHeap {
         }
         #[cfg(not(windows))]
         let _ = visible;
-        object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
+        object::Object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
     }
 
     extern "system" fn get_desc(this: This, out: *mut HeapDesc) {
@@ -834,7 +834,7 @@ static FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<DESCRIPTOR_HEAP, 24>());
     f[0] = DescriptorHeap::query_interface as *const ();
     f[2] = DescriptorHeap::release as *const ();
-    f[7] = object::parent_device as *const ();
+    f[7] = object::Object::parent_device as *const ();
     f[8] = DescriptorHeap::get_desc as *const ();
     f[9] = DescriptorHeap::gpu_start as *const ();
     f[10] = DescriptorHeap::gpu_start as *const ();

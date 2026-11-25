@@ -1552,9 +1552,9 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<ALLOCATOR, 24>());
     f[0] = CommandAllocator::query_interface as *const ();
     f[2] = CommandAllocator::release as *const ();
-    f[7] = object::parent_device as *const ();
+    f[7] = object::Object::parent_device as *const ();
     f[8] = CommandAllocator::reset as *const ();
-    f[9] = object::ignore as *const ();
+    f[9] = object::Object::ignore as *const ();
     Table(f)
 };
 
@@ -1836,7 +1836,7 @@ static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex
 const METHODS: [(usize, *const ()); 52] = [
     (0, CommandList::query_interface as *const ()),
     (2, CommandList::release as *const ()),
-    (7, object::parent_device as *const ()),
+    (7, object::Object::parent_device as *const ()),
     (8, CommandList::get_type as *const ()),
     (9, CommandList::close as *const ()),
     (10, CommandList::reset as *const ()),

@@ -865,7 +865,7 @@ impl GpuResource {
     #[cfg(windows)]
     pub(crate) fn resident_copy(this: This) -> Option<ResidentTexture> {
         let registry = PlacedTextures::tracked();
-        if !registry.contains(&(this as usize)) || !object::try_add_ref(this) {
+        if !registry.contains(&(this as usize)) || !object::Object::try_add_ref(this) {
             return None;
         }
         let title = ResourceRef(this as usize);
@@ -970,7 +970,7 @@ impl GpuResource {
             let at = std::ptr::from_ref::<GpuResource>(&resource) as usize;
             crate::shadow::ShadowRegistry::register(at, resource.data() as u64, desc.width);
         }
-        object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+        object::Object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
     }
 
     pub(crate) extern "system" fn create_committed(
@@ -1339,7 +1339,7 @@ impl ResourceHeap {
             desc,
             memory,
         });
-        object::hand_out(HEAP, heap, iid, &HEAP_IIDS, out)
+        object::Object::hand_out(HEAP, heap, iid, &HEAP_IIDS, out)
     }
 
     extern "system" fn get_desc(this: This, out: *mut HeapDesc) {
@@ -1560,7 +1560,7 @@ impl PlacedTextures {
         let find = || {
             let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
             let target = *targets.get(&address)?.last()? as This;
-            if !object::try_add_ref(target) {
+            if !object::Object::try_add_ref(target) {
                 return Some(None);
             }
             let owner = ResourceRef(target as usize);
@@ -1612,7 +1612,7 @@ impl PlacedTextures {
             );
             return E_INVALIDARG;
         }
-        object::add_ref(heap);
+        object::Object::add_ref(heap);
         let backing = Backing::Placed { heap, offset };
         GpuResource::hand_out_resource(
             desc,
@@ -2292,7 +2292,7 @@ pub(crate) struct ResourceRef(usize);
 #[cfg(windows)]
 impl ResourceRef {
     pub(crate) fn new(this: This) -> Self {
-        object::add_ref(this);
+        object::Object::add_ref(this);
         Self(this as usize)
     }
 
@@ -2312,7 +2312,7 @@ static HEAP_FUNCTIONS: Table<24> = {
     let mut f = object::d3d12_object(object::missing_table::<HEAP, 24>());
     f[0] = ResourceHeap::query_interface as *const ();
     f[2] = ResourceHeap::release as *const ();
-    f[7] = object::parent_device as *const ();
+    f[7] = object::Object::parent_device as *const ();
     f[8] = ResourceHeap::get_desc as *const ();
     Table(f)
 };
@@ -2321,7 +2321,7 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     let mut f = object::d3d12_object(object::missing_table::<RESOURCE, 32>());
     f[0] = GpuResource::query_interface as *const ();
     f[2] = GpuResource::release as *const ();
-    f[7] = object::parent_device as *const ();
+    f[7] = object::Object::parent_device as *const ();
     f[8] = GpuResource::map as *const ();
     f[9] = GpuResource::unmap as *const ();
     f[10] = GpuResource::get_desc as *const ();

@@ -290,7 +290,7 @@ unsafe impl ComObject for CommandQueue {
     const INTERFACES: &'static [Iid] = &QUEUE_IIDS;
 
     extern "system" fn release(this: This) -> u32 {
-        let left = object::release_boxed::<Self>(this);
+        let left = object::Object::release_boxed::<Self>(this);
         #[cfg(windows)]
         if left == 0 {
             Scheduler::forget(this as usize);
@@ -979,7 +979,7 @@ impl PageBatch {
 const METHODS: [(usize, *const ()); 15] = [
     (0, CommandQueue::query_interface as *const ()),
     (2, <CommandQueue as ComObject>::release as *const ()),
-    (7, object::parent_device as *const ()),
+    (7, object::Object::parent_device as *const ()),
     (10, CommandQueue::execute_command_lists as *const ()),
     (11, CommandQueue::marker as *const ()),
     (12, CommandQueue::marker as *const ()),
