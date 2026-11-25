@@ -5,7 +5,7 @@ use std::sync::{
 
 use crate::descriptor::{
     DescriptorHeap, View,
-    host::{HostHeap, buffer_copy},
+    host::{BufferViews, HostHeap},
 };
 use crate::host::HostList;
 use windows::Win32::Graphics::Direct3D12::D3D12_RANGE;
@@ -199,7 +199,7 @@ pub(crate) fn record(
     else {
         return;
     };
-    let Some((source, address, len)) = buffer_copy(&view) else {
+    let Some((source, address, len)) = BufferViews::buffer_copy(&view) else {
         return;
     };
     let Some((at, bytes)) = byte_range(record, fields, len) else {

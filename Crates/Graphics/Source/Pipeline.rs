@@ -207,7 +207,7 @@ impl ShaderStore {
     #[cfg(windows)]
     fn translate(container: &[u8]) -> Result<Translated, String> {
         use leonida_shader::{Container, FourCC, HwStage};
-        crate::descriptor::host::probe_view_limit();
+        crate::descriptor::host::HeapDiagnostics::probe_view_limit();
         let c = Container::parse(container).map_err(|e| e.to_string())?;
         let programs = match c.part(FourCC::DXIL) {
             Some(part) => leonida_shader::native_programs(part.data).map_err(|e| e.to_string())?,

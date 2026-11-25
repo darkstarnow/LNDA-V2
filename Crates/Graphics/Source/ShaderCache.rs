@@ -34,7 +34,7 @@ fn build() -> &'static [u8; 32] {
                 "LEONIDA_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        crate::descriptor::host::probe_view_limit();
+        crate::descriptor::host::HeapDiagnostics::probe_view_limit();
         let mut hash = blake3::Hasher::new();
         for source in leonida_shader::sources()
             .iter()

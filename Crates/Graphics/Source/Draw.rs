@@ -500,9 +500,11 @@ impl ViewInspector {
 
     fn readable(list: &HostList, kind: ResourceType, view: &View) {
         const UNORDERED_ACCESS: u32 = 0x8;
-        let placed = crate::descriptor::host::placed_texture(view);
+        let placed = crate::descriptor::host::PlacedTexture::of(view);
         let view = placed.as_ref().map_or(view, |p| &p.view);
-        if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+        if let Some((shadow, address, len)) =
+            crate::descriptor::host::BufferViews::buffer_copy(view)
+        {
             shadow.refresh(list, address, len);
             if kind == ResourceType::Uav {
                 if STORES.get() || !DrawSwitches::write_skip() {
@@ -690,13 +692,16 @@ impl ViewInspector {
         match view {
             None => "no view".into(),
             Some(v @ View::Shader(r, _)) => texture(*r as This).unwrap_or_else(|| {
-                format!("buffer {:?}", crate::descriptor::host::buffer_range(v))
+                format!(
+                    "buffer {:?}",
+                    crate::descriptor::host::BufferViews::buffer_range(v)
+                )
             }),
             Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
                 Some(t) => format!("uav texture {t}"),
                 None => format!(
                     "uav resource {r:#x} buffer {:?}",
-                    crate::descriptor::host::buffer_range(v)
+                    crate::descriptor::host::BufferViews::buffer_range(v)
                 ),
             },
             Some(View::Placed(u, r, d)) => format!(
@@ -1050,7 +1055,7 @@ impl State {
         if kind == USER_VIEW_RECORDS {
             return table_view()
                 .as_ref()
-                .and_then(crate::descriptor::host::structured_srv_records)
+                .and_then(crate::descriptor::host::BufferViews::structured_srv_records)
                 .unwrap_or(0);
         }
         if kind != USER_VIEW_ADDRESS && kind != USER_VIEW_ADDRESS + 1 {
@@ -1059,7 +1064,7 @@ impl State {
         }
         let address = table_view()
             .as_ref()
-            .and_then(crate::descriptor::host::guest_srv_address)
+            .and_then(crate::descriptor::host::BufferViews::guest_srv_address)
             .unwrap_or(0);
         if address == 0 {
             once!(
@@ -1102,7 +1107,7 @@ impl State {
                 && crate::texture::TitleMemoryMap::committed(handle as *const u8, 12)
                 && let Some(address) = crate::descriptor::Descriptors::view(handle)
                     .as_ref()
-                    .and_then(crate::descriptor::host::guest_srv_address)
+                    .and_then(crate::descriptor::host::BufferViews::guest_srv_address)
             {
                 addresses.push(address);
             }
@@ -1669,8 +1674,8 @@ impl State {
         };
         *passes += 1;
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let mut alive =
-            !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let mut alive = !GONE.load(Ordering::Relaxed)
+            && crate::descriptor::host::HeapDiagnostics::device_removed().is_none();
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1681,7 +1686,7 @@ impl State {
             };
             if alive
                 && n % 64 == 63
-                && let Some(why) = crate::descriptor::host::device_removed()
+                && let Some(why) = crate::descriptor::host::HeapDiagnostics::device_removed()
             {
                 alive = false;
                 GONE.store(true, Ordering::Relaxed);
@@ -1700,7 +1705,9 @@ impl State {
                 );
                 crate::host::HostTrail::log_removal_context();
             }
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            let Some((shadow, address, len)) =
+                crate::descriptor::host::BufferViews::buffer_copy(&view)
+            else {
                 continue;
             };
             #[cfg(feature = "diagnostics")]
@@ -2071,7 +2078,7 @@ impl State {
             }
             let placed = view
                 .as_ref()
-                .and_then(crate::descriptor::host::placed_texture);
+                .and_then(crate::descriptor::host::PlacedTexture::of);
             let resource = match placed.as_ref().map(|p| &p.view).or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
@@ -2094,7 +2101,7 @@ impl State {
             }
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !GONE.load(Ordering::Relaxed)
-                && let Some(why) = crate::descriptor::host::device_removed()
+                && let Some(why) = crate::descriptor::host::HeapDiagnostics::device_removed()
             {
                 GONE.store(true, Ordering::Relaxed);
                 let text: String = format!("{view:?}").chars().take(300).collect();
@@ -2341,7 +2348,7 @@ impl State {
         let handle = table.checked_add(u64::from(selector.dword) * 4)?;
         self.heap_of(handle)?;
         let view = crate::descriptor::Descriptors::view(handle)?;
-        let placed = crate::descriptor::host::placed_texture(&view);
+        let placed = crate::descriptor::host::PlacedTexture::of(&view);
         let View::Shader(resource, desc) = placed.as_ref().map_or(&view, |p| &p.view) else {
             return None;
         };
@@ -2474,7 +2481,7 @@ impl State {
             };
             let range = match &view {
                 View::Constant(address, size) => Some((*address, u64::from(*size))),
-                other => crate::descriptor::host::buffer_range(other),
+                other => crate::descriptor::host::BufferViews::buffer_range(other),
             };
             match range {
                 Some((address, len)) if len <= 2048 => {
@@ -2522,7 +2529,7 @@ impl State {
             && uses(0, MATERIALS)
             && let Some((base, len)) = entry(0, MATERIALS)
                 .as_ref()
-                .and_then(crate::descriptor::host::buffer_range)
+                .and_then(crate::descriptor::host::BufferViews::buffer_range)
         {
             let at = u64::from(at);
             let _ = write!(
@@ -2546,7 +2553,7 @@ impl State {
             && let Some(&at) = words.get(1)
             && let Some((base, len)) = entry(0, GLOBAL)
                 .as_ref()
-                .and_then(crate::descriptor::host::buffer_range)
+                .and_then(crate::descriptor::host::BufferViews::buffer_range)
         {
             let at = u64::from(at);
             let _ = write!(
@@ -2592,7 +2599,7 @@ impl State {
                     .handle(index)
                     .and_then(crate::descriptor::Descriptors::view)
                     .as_ref()
-                    .is_some_and(crate::descriptor::host::is_texture_view);
+                    .is_some_and(crate::descriptor::host::BufferViews::is_texture_view);
             if names {
                 text.push_str(&Self::slot_line(heap, label, i * 4, index));
             }
@@ -2761,7 +2768,7 @@ impl State {
         };
         if let Some(view) = host.mirror(index, handle, true) {
             ViewInspector::readable(list, u.kind, &view);
-            if crate::descriptor::host::is_texture_view(&view) {
+            if crate::descriptor::host::BufferViews::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
             }
         }
@@ -2924,7 +2931,7 @@ impl State {
                             ViewInspector::readable(list, kind, &view);
                         }
                         if let Some(title) = title_first
-                            && crate::descriptor::host::is_texture_view(&view)
+                            && crate::descriptor::host::BufferViews::is_texture_view(&view)
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
                             if kind.is_some() {
@@ -3649,7 +3656,7 @@ mod tests {
     #[test]
     fn placed_texture_uav_writes_the_mip_sampled_by_a_separate_srv() {
         use crate::descriptor::Descriptors;
-        use crate::descriptor::host::{HostHeap, placed_texture};
+        use crate::descriptor::host::{HostHeap, PlacedTexture};
         use windows::core::{IUnknown, s};
         let Some(host) = crate::host::Host::instance() else {
             assert!(
@@ -3732,10 +3739,10 @@ mod tests {
             Descriptors::create_placed_srv(std::ptr::null(), &resource, &srv, handle + 32);
             let writer = crate::descriptor::Descriptors::view(handle).unwrap();
             let reader = crate::descriptor::Descriptors::view(handle + 32).unwrap();
-            let View::Unordered(target, 0, _) = placed_texture(&writer).unwrap().view else {
+            let View::Unordered(target, 0, _) = PlacedTexture::of(&writer).unwrap().view else {
                 panic!("missing writer")
             };
-            let View::Shader(source, _) = placed_texture(&reader).unwrap().view else {
+            let View::Shader(source, _) = PlacedTexture::of(&reader).unwrap().view else {
                 panic!("missing reader")
             };
             assert_eq!(target, source);
@@ -3747,7 +3754,7 @@ mod tests {
                 );
                 let mut incompatible = resource;
                 incompatible[4] *= 2;
-                assert!(placed_texture(&View::Placed(true, incompatible, uav)).is_none());
+                assert!(PlacedTexture::of(&View::Placed(true, incompatible, uav)).is_none());
             }
             let output = host.uav_buffer(64).unwrap();
             let readback = host.read_back_buffer(64).unwrap();

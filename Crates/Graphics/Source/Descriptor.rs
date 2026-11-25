@@ -1034,7 +1034,7 @@ mod tests {
         assert!(host.material_upload_allowed(1, revived.1, addr, small, small));
         assert!(!host.material_upload_allowed(1, revived.1, addr, small, small - 1));
         let srv = host.mirror(1, heap.handle(1).unwrap(), true).unwrap();
-        let live = host::placed_texture(&srv).unwrap();
+        let live = host::PlacedTexture::of(&srv).unwrap();
         let View::Shader(texture, _) = live.view else {
             panic!("no sampled texture")
         };
@@ -1157,7 +1157,7 @@ mod tests {
         let handle = heap.handle(source_slot).unwrap();
         Descriptors::create_placed_srv(null, &resource, &view, handle);
         let material = host.mirror(source_slot, handle, true).unwrap();
-        let (shadow, address, _) = host::buffer_copy(&material).unwrap();
+        let (shadow, address, _) = host::BufferViews::buffer_copy(&material).unwrap();
         let backing = vec![0u8; 1 << 20];
         let addr = backing.as_ptr() as u64;
         let tex = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];

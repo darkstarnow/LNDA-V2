@@ -595,12 +595,12 @@ impl PageGuards {
 impl TitleMemory {
     pub fn will_write(at: usize, len: usize) {
         PageGuards::open(&mut PageGuards::lock(), at, at.saturating_add(len));
-        crate::descriptor::host::remapped(at, len);
+        crate::descriptor::host::RemapLog::remapped(at, len);
     }
 
     pub fn bytes_written(bytes: &[u8]) {
         if !bytes.is_empty() {
-            crate::descriptor::host::remapped(bytes.as_ptr() as usize, bytes.len());
+            crate::descriptor::host::RemapLog::remapped(bytes.as_ptr() as usize, bytes.len());
         }
     }
 
@@ -666,7 +666,7 @@ impl TitleMemory {
     }
 
     pub fn remapped(at: usize, len: usize) {
-        crate::descriptor::host::remapped(at, len);
+        crate::descriptor::host::RemapLog::remapped(at, len);
         crate::inplace::SectionViews::gone(at, len);
         crate::inplace::TitleSections::freeing(at, len);
         let mut g = PageGuards::lock();

@@ -221,37 +221,6 @@ struct TextureSweep {
 
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
-fn record_remap(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, limit: usize) -> bool {
-    if start >= end {
-        return false;
-    }
-    if let Some(last) = ranges.last_mut()
-        && last.0 <= end
-        && start <= last.1
-    {
-        last.0 = last.0.min(start);
-        last.1 = last.1.max(end);
-    } else if ranges.len() >= limit {
-        ranges.clear();
-        ranges.push((0, u64::MAX));
-        return true;
-    } else {
-        ranges.push((start, end));
-    }
-    false
-}
-
-fn merge_remaps(ranges: &mut Vec<(u64, u64)>) {
-    ranges.sort_unstable();
-    ranges.dedup_by(|next, previous| {
-        if next.0 > previous.1 {
-            return false;
-        }
-        previous.1 = previous.1.max(next.1);
-        true
-    });
-}
-
 static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(u64::MAX),
     std::sync::atomic::AtomicU64::new(0),
@@ -259,25 +228,6 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
-
-fn stale_out() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_STALE_TEXTURES").is_none_or(|v| v != "0"))
-}
-
-pub(crate) fn remapped(at: usize, len: usize) {
-    use std::sync::atomic::Ordering::Relaxed;
-    const MOST: usize = 1 << 18;
-    let (start, end) = (at as u64, at.saturating_add(len) as u64);
-    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
-        return;
-    }
-    let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
-    STALE[1].fetch_add(1, Relaxed);
-    if record_remap(&mut ranges, start, end, MOST) {
-        STALE[2].fetch_add(1, Relaxed);
-    }
-}
 
 const TABLED_FRAMES: u64 = 240;
 
@@ -287,11 +237,6 @@ const TABLED_READ: u32 = 1 << 31;
 
 pub(crate) static TABLED_WRITES: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-
-fn tabled_out() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_TABLED_TEXTURES").is_none_or(|v| v != "1"))
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -496,124 +441,19 @@ impl TextureQueue {
     }
 }
 
-pub(crate) fn is_texture_view(view: &View) -> bool {
-    match view {
-        View::Placed(false, resource, _) => resource[0] != 1,
-        View::Shader(r, _) => {
-            crate::resource::GpuResource::buffer_bytes(*r as crate::object::This).is_none()
-        }
-        _ => false,
-    }
-}
-
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-
-pub(crate) fn device_removed() -> Option<String> {
-    let host = Host::instance()?;
-    let reason = unsafe { host.device.GetDeviceRemovedReason() };
-    reason.err().map(|e| e.to_string())
-}
 
 pub(crate) static PLACED_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-fn view_stride(view: &View) -> Option<u32> {
-    const BUFFER: u32 = 1;
-    let (words, unordered): (&[u32; 10], bool) = match view {
-        View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
-        View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
-        View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
-            (d[..10].try_into().ok()?, *unordered)
-        }
-        _ => return None,
-    };
-    let (stride, raw, format) = unsafe {
-        if unordered {
-            let d = uav_desc(words);
-            let b = d.Anonymous.Buffer;
-            (
-                b.StructureByteStride,
-                b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0,
-                d.Format,
-            )
-        } else {
-            let d = srv_desc(words);
-            let b = d.Anonymous.Buffer;
-            (
-                b.StructureByteStride,
-                b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0,
-                d.Format,
-            )
-        }
-    };
-    Some(if stride > 0 {
-        stride
-    } else if raw {
-        1
-    } else {
-        crate::resource::ResourceFormat::element(format.0 as u32)
-            .map_or(0, |(bytes, _)| bytes as u32)
-    })
-}
-
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
-
-pub(crate) fn near_heaps(va: u64) -> String {
-    let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    let mut text = String::new();
-    for &(start, bytes, step, sampler) in ranges.iter() {
-        let kind = if sampler { "sampler" } else { "view" };
-        let place = if va < start {
-            format!("{:#x} below", start - va)
-        } else if va < start + bytes {
-            format!("inside, slot {}", (va - start) / step)
-        } else {
-            format!(
-                "{:#x} past its end (slot {})",
-                va - start - bytes,
-                (va - start) / step
-            )
-        };
-        text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
-    }
-    text
-}
 
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
 const UNCAPPED_VIEWS: u32 = 1 << 21;
-
-pub(crate) fn probe_view_limit() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let Some(host) = Host::instance() else { return };
-        let fits = |count: u32| {
-            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-                host.device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: count,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
-            };
-            made.is_ok()
-        };
-        let views = if fits(UNCAPPED_VIEWS) {
-            UNCAPPED_VIEWS
-        } else {
-            PORTABLE_VIEWS
-        };
-        tracing::info!(
-            views,
-            "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
-        );
-        leonida_shader::emit::set_view_heap_limit(views - 1);
-    });
-}
 
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 const NULL_BLOCK: u32 = 1 << 16;
@@ -639,7 +479,7 @@ impl HostHeap {
         };
         let extra = if sampler { 0 } else { DYNAMIC };
         if !sampler {
-            probe_view_limit();
+            HeapDiagnostics::probe_view_limit();
         }
         let null = if sampler {
             0
@@ -765,9 +605,9 @@ impl HostHeap {
                 ptr: start.ptr + (i * self.step) as usize,
             };
             if self.sampler {
-                null_sampler(start);
+                ViewMaker::null_sampler(start);
             } else {
-                null_view(start);
+                ViewMaker::null_view(start);
             }
             let mut filled = 1;
             while filled < NULL_BLOCK {
@@ -804,22 +644,8 @@ impl HostHeap {
     }
 
     fn null_sampler(&self, index: u32) {
-        null_sampler(self.cpu(index));
+        ViewMaker::null_sampler(self.cpu(index));
     }
-}
-
-fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = Host::instance() else { return };
-    let desc = D3D12_SAMPLER_DESC {
-        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        MaxAnisotropy: 1,
-        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
-        ..Default::default()
-    };
-    unsafe { host.device.CreateSampler(&desc, at) };
 }
 
 impl HostHeap {
@@ -941,7 +767,7 @@ impl HostHeap {
                     .handle(slot)
                     .and_then(super::Descriptors::view)
                     .as_ref()
-                    .and_then(guest_srv_address)
+                    .and_then(BufferViews::guest_srv_address)
                     .unwrap_or(0);
                 unsafe { data.cast::<u64>().add(slot as usize + 2).write(address) };
             }
@@ -1184,7 +1010,7 @@ impl HostHeap {
         if ranges.is_empty() {
             return 0;
         }
-        merge_remaps(&mut ranges);
+        RemapLog::merge(&mut ranges);
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             ranges
@@ -1475,8 +1301,8 @@ impl HostHeap {
             return;
         }
         match Descriptors::view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.cpu(index)),
-            None => null_view(self.cpu(index)),
+            Some(view) => ViewMaker::null_for(&view, self.cpu(index)),
+            None => ViewMaker::null_view(self.cpu(index)),
         }
         self.keep(index, None);
     }
@@ -1500,7 +1326,7 @@ impl HostHeap {
         }
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
-            if tabled_out() {
+            if RemapLog::tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.slots.remove(&index).is_some() {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
@@ -1512,7 +1338,7 @@ impl HostHeap {
     fn tabled_lately(&self, index: u32, frame: u64) -> bool {
         let stamp = self.tabled_stamp(index) & !TABLED_READ;
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
-        tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+        RemapLog::tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
     }
 
     fn tabled_stamp(&self, index: u32) -> u32 {
@@ -1522,7 +1348,7 @@ impl HostHeap {
     }
 
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
-        let stamp = if tabled_out() {
+        let stamp = if RemapLog::tabled_out() {
             self.tabled_stamp(index)
         } else {
             0
@@ -1602,7 +1428,7 @@ impl HostHeap {
                 Some((resource, start, end)) => {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
-                    placed.note(index, start, end, resource, !seen && stale_out())
+                    placed.note(index, start, end, resource, !seen && RemapLog::stale_out())
                 }
                 None => {
                     placed.forget(index);
@@ -1617,9 +1443,9 @@ impl HostHeap {
                 textures.remove(slot);
             }
         }
-        let stride = view.and_then(view_stride);
+        let stride = view.and_then(BufferViews::view_stride);
         if let Some((_, mapping)) = self.addresses.get() {
-            let address = view.and_then(guest_srv_address).unwrap_or(0);
+            let address = view.and_then(BufferViews::guest_srv_address).unwrap_or(0);
             unsafe {
                 (*mapping as *mut u64)
                     .add(index as usize + 2)
@@ -1636,7 +1462,7 @@ impl HostHeap {
             };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        let location = view.and_then(acceleration_location);
+        let location = view.and_then(BufferViews::acceleration_location);
         let previous = if let Some(location) = location {
             buffers.acceleration.insert(index, location)
         } else {
@@ -1691,7 +1517,7 @@ impl HostHeap {
                     );
                 } else {
                     for index in first..first + count {
-                        null_view(self.cpu(index));
+                        ViewMaker::null_view(self.cpu(index));
                     }
                 }
                 let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -1713,9 +1539,9 @@ impl HostHeap {
     }
 
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
+        let kept = ViewMaker::make_view(view, self.cpu(index));
         if kept.is_none() {
-            null_for(view, self.cpu(index));
+            ViewMaker::null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
     }
@@ -1724,7 +1550,7 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
-            null_view(self.cpu(index));
+            ViewMaker::null_view(self.cpu(index));
         }
         self.keep(index, None);
     }
@@ -1762,7 +1588,7 @@ impl HostHeap {
     }
 
     pub(crate) fn null_raw_at(&self, index: u32) {
-        null_buffer_view(self.cpu(index));
+        ViewMaker::null_buffer_view(self.cpu(index));
         self.keep(index, None);
     }
 
@@ -1892,7 +1718,7 @@ impl HostHeap {
         let Some(host) = Host::instance() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: constant_size(size),
+            SizeInBytes: BufferViews::constant_size(size),
         };
         unsafe {
             host.device
@@ -1933,7 +1759,7 @@ impl HostHeap {
             if !resident_only {
                 return true;
             }
-            pin = resident_sampled_texture(view);
+            pin = ViewMaker::resident_sampled_texture(view);
             pin.is_some()
                 || (already_made
                     && matches!(view, View::Placed(false, resource, _) if resource[12] & 7 != 0)
@@ -2051,12 +1877,12 @@ impl HostHeap {
             }
             let later = !for_draw && (view.is_buffer() || waiting.is_some());
             if later
-                && keep_views()
+                && ViewMaker::keep_views()
                 && Descriptors::view_at(
                     made[index as usize] as u32,
                     (made[index as usize] >> 32) as u32,
                 )
-                .is_some_and(|old| same_placed_texture(&old, &view))
+                .is_some_and(|old| ViewMaker::same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(Some(view));
@@ -2065,10 +1891,10 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
-                make(&view, self.cpu(index))
+                ViewMaker::make_view(&view, self.cpu(index))
             };
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+                ViewMaker::null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
         }
@@ -2090,7 +1916,7 @@ impl HostHeap {
         if !buffer {
             return true;
         }
-        let Some((address, width)) = buffer_extent(view) else {
+        let Some((address, width)) = BufferViews::buffer_extent(view) else {
             return true;
         };
         let Some(shadow) = crate::shadow::ShadowRegistry::find(address, width) else {
@@ -2104,13 +1930,13 @@ impl HostHeap {
             View::Placed(false, _, desc) => desc[..10].try_into().unwrap(),
             _ => return true,
         };
-        let mut desc = srv_desc(words);
+        let mut desc = BufferViews::srv_desc(words);
         let host_width = unsafe { shadow.buffer.GetDesc() }.Width;
-        rebase_srv(&mut desc, shadow.offset(address), host_width).is_err()
+        BufferViews::rebase_srv(&mut desc, shadow.offset(address), host_width).is_err()
     }
 
     fn shows_placed_owner(&self, index: u32, view: &View) -> bool {
-        let owner = placed_texture(view);
+        let owner = PlacedTexture::of(view);
         let candidates = match owner.as_ref().map(|p| &p.view) {
             Some(View::Shader(resource, _)) => [
                 crate::resource::HostTextures::host_resource(*resource as _),
@@ -2188,7 +2014,7 @@ impl HostHeap {
         }
         let view = Descriptors::view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
-        if let Some((address, len)) = buffer_range(&view) {
+        if let Some((address, len)) = BufferViews::buffer_range(&view) {
             let host =
                 crate::shadow::ShadowRegistry::find(address, len.max(1)).map(|s| s.gpu(address));
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
@@ -2204,1033 +2030,1246 @@ macro_rules! once {
     }};
 }
 
-fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
-    let mut words = *words;
-    words[0] = crate::resource::ResourceFormat::pc_format(words[0]);
-    unsafe {
-        std::ptr::from_ref(&words)
-            .cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>()
-            .read_unaligned()
-    }
-}
+pub(crate) struct RemapLog;
 
-fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
-    let mut words = *words;
-    words[0] = crate::resource::ResourceFormat::pc_format(words[0]);
-    unsafe {
-        std::ptr::from_ref(&words)
-            .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
-            .read_unaligned()
-    }
-}
+pub(crate) struct HeapDiagnostics;
 
-fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
-    let buffer = unsafe { desc.Anonymous.Buffer };
-    if buffer.StructureByteStride > 0 {
-        u64::from(buffer.StructureByteStride)
-    } else if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 {
-        4
-    } else {
-        crate::resource::ResourceFormat::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-    }
-}
+pub(crate) struct BufferViews;
 
-pub(crate) fn structured_srv_records(view: &View) -> Option<u32> {
-    let words = match view {
-        View::Shader(resource, Some(desc)) if *resource != 0 => desc,
-        View::Placed(false, resource, desc) if resource[0] == 1 && (desc[10] | desc[11]) != 0 => {
-            desc[..10].try_into().ok()?
+pub(crate) struct ViewMaker;
+
+impl RemapLog {
+    fn record(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, limit: usize) -> bool {
+        if start >= end {
+            return false;
         }
-        _ => return None,
-    };
-    let desc = srv_desc(words);
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_UNKNOWN {
-        return None;
-    }
-    let buffer = unsafe { desc.Anonymous.Buffer };
-    (buffer.StructureByteStride != 0).then_some(buffer.NumElements)
-}
-
-fn acceleration_location(view: &View) -> Option<u64> {
-    let View::Shader(0, Some(words)) = view else {
-        return None;
-    };
-    if words[1] != D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32 {
-        return None;
-    }
-    let desc = srv_desc(words);
-    let address = unsafe { desc.Anonymous.RaytracingAccelerationStructure.Location };
-    (address != 0).then_some(address)
-}
-
-pub(crate) fn guest_srv_address(view: &View) -> Option<u64> {
-    acceleration_location(view).or_else(|| {
-        buffer_range(view)
-            .and_then(|(address, bytes)| (address != 0 && bytes != 0).then_some(address))
-    })
-}
-
-pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
-    let (base, words): (u64, &[u32; 10]) = match view {
-        View::Shader(r, Some(desc)) => (
-            crate::resource::GpuResource::buffer_bytes(*r as crate::object::This)?.0 as u64,
-            desc,
-        ),
-        View::Placed(false, resource, desc) if resource[0] == 1 => (
-            u64::from(desc[10]) | u64::from(desc[11]) << 32,
-            desc[..10].try_into().ok()?,
-        ),
-        View::Unordered(r, _, Some(desc)) => {
-            let base =
-                crate::resource::GpuResource::buffer_bytes(*r as crate::object::This)?.0 as u64;
-            return unordered_range(base, desc);
+        if let Some(last) = ranges.last_mut()
+            && last.0 <= end
+            && start <= last.1
+        {
+            last.0 = last.0.min(start);
+            last.1 = last.1.max(end);
+        } else if ranges.len() >= limit {
+            ranges.clear();
+            ranges.push((0, u64::MAX));
+            return true;
+        } else {
+            ranges.push((start, end));
         }
-        View::Placed(true, resource, desc) if resource[0] == 1 => {
-            let base = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            return unordered_range(base, desc[..10].try_into().ok()?);
+        false
+    }
+
+    fn merge(ranges: &mut Vec<(u64, u64)>) {
+        ranges.sort_unstable();
+        ranges.dedup_by(|next, previous| {
+            if next.0 > previous.1 {
+                return false;
+            }
+            previous.1 = previous.1.max(next.1);
+            true
+        });
+    }
+
+    fn stale_out() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_STALE_TEXTURES").is_none_or(|v| v != "0"))
+    }
+
+    pub(crate) fn remapped(at: usize, len: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        const MOST: usize = 1 << 18;
+        let (start, end) = (at as u64, at.saturating_add(len) as u64);
+        if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+            return;
         }
-        _ => return None,
-    };
-    let desc = srv_desc(words);
-    let element = element_size(&desc);
-    let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base.checked_add(buffer.FirstElement.checked_mul(element)?)?,
-        u64::from(buffer.NumElements) * element,
-    ))
-}
-
-pub(crate) fn buffer_extent(view: &View) -> Option<(u64, u64)> {
-    match view {
-        View::Shader(r, Some(_)) | View::Unordered(r, _, Some(_)) => {
-            let (data, len) =
-                crate::resource::GpuResource::buffer_bytes(*r as crate::object::This)?;
-            Some((data as u64, len))
+        let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+        STALE[1].fetch_add(1, Relaxed);
+        if RemapLog::record(&mut ranges, start, end, MOST) {
+            STALE[2].fetch_add(1, Relaxed);
         }
-        View::Placed(_, resource, desc) if resource[0] == 1 => Some((
-            u64::from(desc[10]) | u64::from(desc[11]) << 32,
-            u64::from(resource[4]) | u64::from(resource[5]) << 32,
-        )),
-        _ => None,
+    }
+
+    fn tabled_out() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_TABLED_TEXTURES").is_none_or(|v| v != "1"))
     }
 }
 
-fn view_extent() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_VIEW_EXTENT").is_none_or(|v| v != "0"))
+impl BufferViews {
+    pub(crate) fn is_texture_view(view: &View) -> bool {
+        match view {
+            View::Placed(false, resource, _) => resource[0] != 1,
+            View::Shader(r, _) => {
+                crate::resource::GpuResource::buffer_bytes(*r as crate::object::This).is_none()
+            }
+            _ => false,
+        }
+    }
+
+    fn view_stride(view: &View) -> Option<u32> {
+        const BUFFER: u32 = 1;
+        let (words, unordered): (&[u32; 10], bool) = match view {
+            View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
+            View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
+            View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
+                (d[..10].try_into().ok()?, *unordered)
+            }
+            _ => return None,
+        };
+        let (stride, raw, format) = unsafe {
+            if unordered {
+                let d = BufferViews::uav_desc(words);
+                let b = d.Anonymous.Buffer;
+                (
+                    b.StructureByteStride,
+                    b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0,
+                    d.Format,
+                )
+            } else {
+                let d = BufferViews::srv_desc(words);
+                let b = d.Anonymous.Buffer;
+                (
+                    b.StructureByteStride,
+                    b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0,
+                    d.Format,
+                )
+            }
+        };
+        Some(if stride > 0 {
+            stride
+        } else if raw {
+            1
+        } else {
+            crate::resource::ResourceFormat::element(format.0 as u32)
+                .map_or(0, |(bytes, _)| bytes as u32)
+        })
+    }
+
+    fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+        let mut words = *words;
+        words[0] = crate::resource::ResourceFormat::pc_format(words[0]);
+        unsafe {
+            std::ptr::from_ref(&words)
+                .cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>()
+                .read_unaligned()
+        }
+    }
+
+    fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        let mut words = *words;
+        words[0] = crate::resource::ResourceFormat::pc_format(words[0]);
+        unsafe {
+            std::ptr::from_ref(&words)
+                .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
+                .read_unaligned()
+        }
+    }
+
+    fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        if buffer.StructureByteStride > 0 {
+            u64::from(buffer.StructureByteStride)
+        } else if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::ResourceFormat::element(desc.Format.0 as u32)
+                .map_or(0, |(bytes, _)| bytes)
+        }
+    }
+
+    pub(crate) fn structured_srv_records(view: &View) -> Option<u32> {
+        let words = match view {
+            View::Shader(resource, Some(desc)) if *resource != 0 => desc,
+            View::Placed(false, resource, desc)
+                if resource[0] == 1 && (desc[10] | desc[11]) != 0 =>
+            {
+                desc[..10].try_into().ok()?
+            }
+            _ => return None,
+        };
+        let desc = BufferViews::srv_desc(words);
+        if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_UNKNOWN {
+            return None;
+        }
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        (buffer.StructureByteStride != 0).then_some(buffer.NumElements)
+    }
+
+    fn acceleration_location(view: &View) -> Option<u64> {
+        let View::Shader(0, Some(words)) = view else {
+            return None;
+        };
+        if words[1] != D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32 {
+            return None;
+        }
+        let desc = BufferViews::srv_desc(words);
+        let address = unsafe { desc.Anonymous.RaytracingAccelerationStructure.Location };
+        (address != 0).then_some(address)
+    }
+
+    pub(crate) fn guest_srv_address(view: &View) -> Option<u64> {
+        BufferViews::acceleration_location(view).or_else(|| {
+            BufferViews::buffer_range(view)
+                .and_then(|(address, bytes)| (address != 0 && bytes != 0).then_some(address))
+        })
+    }
+
+    pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
+        let (base, words): (u64, &[u32; 10]) = match view {
+            View::Shader(r, Some(desc)) => (
+                crate::resource::GpuResource::buffer_bytes(*r as crate::object::This)?.0 as u64,
+                desc,
+            ),
+            View::Placed(false, resource, desc) if resource[0] == 1 => (
+                u64::from(desc[10]) | u64::from(desc[11]) << 32,
+                desc[..10].try_into().ok()?,
+            ),
+            View::Unordered(r, _, Some(desc)) => {
+                let base =
+                    crate::resource::GpuResource::buffer_bytes(*r as crate::object::This)?.0 as u64;
+                return BufferViews::unordered_range(base, desc);
+            }
+            View::Placed(true, resource, desc) if resource[0] == 1 => {
+                let base = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                return BufferViews::unordered_range(base, desc[..10].try_into().ok()?);
+            }
+            _ => return None,
+        };
+        let desc = BufferViews::srv_desc(words);
+        let element = BufferViews::element_size(&desc);
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        Some((
+            base.checked_add(buffer.FirstElement.checked_mul(element)?)?,
+            u64::from(buffer.NumElements) * element,
+        ))
+    }
+
+    pub(crate) fn buffer_extent(view: &View) -> Option<(u64, u64)> {
+        match view {
+            View::Shader(r, Some(_)) | View::Unordered(r, _, Some(_)) => {
+                let (data, len) =
+                    crate::resource::GpuResource::buffer_bytes(*r as crate::object::This)?;
+                Some((data as u64, len))
+            }
+            View::Placed(_, resource, desc) if resource[0] == 1 => Some((
+                u64::from(desc[10]) | u64::from(desc[11]) << 32,
+                u64::from(resource[4]) | u64::from(resource[5]) << 32,
+            )),
+            _ => None,
+        }
+    }
+
+    fn view_extent() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_VIEW_EXTENT").is_none_or(|v| v != "0"))
+    }
+
+    pub(crate) fn buffer_copy(
+        view: &View,
+    ) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+        let (address, len) = BufferViews::buffer_range(view)?;
+        if len == 0 {
+            return None;
+        }
+        if BufferViews::view_extent()
+            && let Some((base, width)) = BufferViews::buffer_extent(view)
+            && address >= base
+            && address - base < width.max(1)
+            && let Some(shadow) = crate::shadow::ShadowRegistry::find(base, width)
+        {
+            return Some((shadow, address, len));
+        }
+        crate::shadow::ShadowRegistry::find(address, len).map(|shadow| (shadow, address, len))
+    }
+
+    fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
+        let desc = BufferViews::uav_desc(words);
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        let element = if buffer.StructureByteStride > 0 {
+            u64::from(buffer.StructureByteStride)
+        } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::ResourceFormat::element(desc.Format.0 as u32)?.0
+        };
+        Some((
+            base.checked_add(buffer.FirstElement.checked_mul(element)?)?,
+            u64::from(buffer.NumElements) * element,
+        ))
+    }
+
+    fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, u32)> {
+        if stride == 0 {
+            return None;
+        }
+        let start = first.checked_mul(u64::from(stride))?.checked_add(offset)?;
+        let bytes = u64::from(count) * u64::from(stride);
+        (start % 16 == 0 && bytes % 4 == 0)
+            .then(|| {
+                u32::try_from(bytes / 4)
+                    .ok()
+                    .map(|dwords| (start / 4, dwords))
+            })
+            .flatten()
+    }
+
+    fn buffer_view_ok(
+        format: DXGI_FORMAT,
+        first: u64,
+        count: u32,
+        stride: u32,
+        raw: bool,
+        width: u64,
+    ) -> bool {
+        use crate::resource::ResourceFormat;
+        let f = format.0 as u32;
+        let element = if raw {
+            if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 || !first.is_multiple_of(4) {
+                return false;
+            }
+            4
+        } else if stride > 0 {
+            if format != DXGI_FORMAT_UNKNOWN || stride > 2048 || !stride.is_multiple_of(4) {
+                return false;
+            }
+            u64::from(stride)
+        } else {
+            let typeless = ResourceFormat::family(f) == f && ResourceFormat::family(f + 1) == f;
+            match crate::resource::ResourceFormat::element(f) {
+                Some((bytes, 1)) if f != 0 && !typeless && bytes > 0 => bytes,
+                _ => return false,
+            }
+        };
+        count > 0
+            && first
+                .checked_add(u64::from(count))
+                .and_then(|end| end.checked_mul(element))
+                .is_some_and(|end| end <= width)
+    }
+
+    fn constant_size(size: u32) -> u32 {
+        size.min(64 << 10).next_multiple_of(256)
+    }
+
+    fn elements_inside(first: u64, count: u32, element: u64, width: u64) -> u32 {
+        let room = (width / element.max(1)).saturating_sub(first);
+        match u32::try_from(room) {
+            Ok(0) | Err(_) => count,
+            Ok(room) => count.min(room),
+        }
+    }
+
+    fn left_null(
+        why: &'static str,
+        unordered: bool,
+        address: u64,
+        len: u64,
+        element: u64,
+        first: u64,
+    ) -> bool {
+        if !cfg!(feature = "diagnostics") {
+            return false;
+        }
+        type Seen = std::collections::BTreeMap<
+            (&'static str, bool, u64),
+            std::collections::HashSet<(u64, u64)>,
+        >;
+        static SEEN: Mutex<Seen> = Mutex::new(Seen::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let views = seen.entry((why, unordered, element)).or_default();
+        if views.insert((address, len)) && views.len().is_power_of_two() {
+            tracing::warn!(
+                views = views.len(),
+                unordered,
+                element,
+                first,
+                len,
+                address = format_args!("{address:#x}"),
+                "buffer views left null: {why}"
+            );
+            return true;
+        }
+        false
+    }
+
+    fn rebase_srv(
+        desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
+        offset: u64,
+        width: u64,
+    ) -> Result<(), SrvError> {
+        let structured = unsafe { desc.Anonymous.Buffer };
+        let window = (desc.Format == DXGI_FORMAT_UNKNOWN)
+            .then(|| {
+                BufferViews::raw_window(
+                    offset,
+                    structured.FirstElement,
+                    structured.NumElements,
+                    structured.StructureByteStride,
+                )
+            })
+            .flatten();
+        if let Some((first, count)) = window {
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+            desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                FirstElement: first,
+                NumElements: count,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            };
+        }
+        let element = BufferViews::element_size(desc);
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        if window.is_none() {
+            if element == 0 || !offset.is_multiple_of(element) {
+                return Err(SrvError::Alignment);
+            }
+            buffer.FirstElement = buffer
+                .FirstElement
+                .checked_add(offset / element)
+                .ok_or(SrvError::Layout)?;
+        }
+        let unit = if window.is_some() { 4 } else { element };
+        buffer.NumElements =
+            BufferViews::elements_inside(buffer.FirstElement, buffer.NumElements, unit, width);
+        let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        if BufferViews::buffer_view_ok(
+            desc.Format,
+            buffer.FirstElement,
+            buffer.NumElements,
+            buffer.StructureByteStride,
+            raw,
+            width,
+        ) {
+            Ok(())
+        } else {
+            Err(SrvError::Layout)
+        }
+    }
+
+    fn buffer_srv(
+        address: u64,
+        len: u64,
+        mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+        at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) -> Option<Kept> {
+        let shadow = crate::shadow::ShadowRegistry::find(address, len)?;
+        let offset = shadow.offset(address);
+        let width = unsafe { shadow.buffer.GetDesc() }.Width;
+        if let Err(reason) = BufferViews::rebase_srv(&mut desc, offset, width) {
+            let element = BufferViews::element_size(&desc);
+            let buffer = unsafe { desc.Anonymous.Buffer };
+            if matches!(reason, SrvError::Alignment) {
+                let sampled = BufferViews::left_null(
+                    "not on an element of their host copy",
+                    false,
+                    address,
+                    len,
+                    element,
+                    buffer.FirstElement,
+                );
+                if sampled && element == 12 {
+                    let (shadow_start, shadow_bytes) = shadow.span();
+                    let bytes = u64::from(buffer.NumElements) * element;
+                    let view_end = buffer
+                        .FirstElement
+                        .checked_mul(element)
+                        .and_then(|first| first.checked_add(bytes));
+                    tracing::warn!(
+                        format = desc.Format.0,
+                        dimension = desc.ViewDimension.0,
+                        stride = buffer.StructureByteStride,
+                        count = buffer.NumElements,
+                        flags = buffer.Flags.0,
+                        offset,
+                        address = format_args!("{address:#x}"),
+                        shadow_start = format_args!("{shadow_start:#x}"),
+                        shadow_bytes,
+                        within_guest_buffer = view_end.is_some_and(|end| end <= len),
+                        "12-byte SRV could not address the first whole element in its host buffer"
+                    );
+                }
+                return None;
+            }
+            let (first, count, stride) = (
+                buffer.FirstElement,
+                buffer.NumElements,
+                buffer.StructureByteStride,
+            );
+            let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+            REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let why = if raw {
+                "raw, refused by the host"
+            } else {
+                "refused by the host"
+            };
+            BufferViews::left_null(why, false, address, len, element, first);
+            once!(
+                format = desc.Format.0,
+                first,
+                count,
+                stride,
+                raw,
+                width,
+                "buffer view the host would refuse left null"
+            );
+            return None;
+        }
+        if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
+            desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        }
+        let host = Host::instance()?;
+        unsafe {
+            host.device
+                .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+        };
+        Some(Some(shadow.buffer.clone()))
+    }
+
+    fn buffer_uav(
+        address: u64,
+        len: u64,
+        mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+        at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) -> Option<Kept> {
+        let shadow = crate::shadow::ShadowRegistry::find(address, len)?;
+        let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            once!("unordered access to a buffer whose host copy shaders cannot write");
+            return None;
+        }
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        let element = if buffer.StructureByteStride > 0 {
+            u64::from(buffer.StructureByteStride)
+        } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::ResourceFormat::element(desc.Format.0 as u32)
+                .map_or(0, |(bytes, _)| bytes)
+        };
+        let offset = shadow.offset(address);
+        let window = (desc.Format == DXGI_FORMAT_UNKNOWN)
+            .then(|| {
+                BufferViews::raw_window(
+                    offset,
+                    buffer.FirstElement,
+                    buffer.NumElements,
+                    buffer.StructureByteStride,
+                )
+            })
+            .flatten();
+        if let Some((first, count)) = window {
+            buffer.FirstElement = first;
+            buffer.NumElements = count;
+            buffer.StructureByteStride = 0;
+            buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        } else {
+            if element == 0 || !offset.is_multiple_of(element) {
+                BufferViews::left_null(
+                    "not on an element of their host copy",
+                    true,
+                    address,
+                    len,
+                    element,
+                    buffer.FirstElement,
+                );
+                return None;
+            }
+            buffer.FirstElement += offset / element;
+        }
+        buffer.CounterOffsetInBytes = 0;
+        let width = unsafe { shadow.buffer.GetDesc() }.Width;
+        let unit = if window.is_some() { 4 } else { element };
+        buffer.NumElements =
+            BufferViews::elements_inside(buffer.FirstElement, buffer.NumElements, unit, width);
+        let (first, count, stride) = (
+            buffer.FirstElement,
+            buffer.NumElements,
+            buffer.StructureByteStride,
+        );
+        let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        if window.is_some() {
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        }
+        if !BufferViews::buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+            REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let why = if raw {
+                "raw, refused by the host"
+            } else {
+                "refused by the host"
+            };
+            BufferViews::left_null(why, true, address, len, element, first);
+            once!(
+                format = desc.Format.0,
+                first,
+                count,
+                stride,
+                raw,
+                width,
+                "unordered buffer view the host would refuse left null"
+            );
+            return None;
+        }
+        let host = Host::instance()?;
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                &shadow.buffer,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                at,
+            )
+        };
+        Some(Some(shadow.buffer.clone()))
+    }
 }
 
-pub(crate) fn buffer_copy(
-    view: &View,
-) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
-    let (address, len) = buffer_range(view)?;
-    if len == 0 {
-        return None;
+impl HeapDiagnostics {
+    pub(crate) fn device_removed() -> Option<String> {
+        let host = Host::instance()?;
+        let reason = unsafe { host.device.GetDeviceRemovedReason() };
+        reason.err().map(|e| e.to_string())
     }
-    if view_extent()
-        && let Some((base, width)) = buffer_extent(view)
-        && address >= base
-        && address - base < width.max(1)
-        && let Some(shadow) = crate::shadow::ShadowRegistry::find(base, width)
-    {
-        return Some((shadow, address, len));
+
+    pub(crate) fn near_heaps(va: u64) -> String {
+        let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut text = String::new();
+        for &(start, bytes, step, sampler) in ranges.iter() {
+            let kind = if sampler { "sampler" } else { "view" };
+            let place = if va < start {
+                format!("{:#x} below", start - va)
+            } else if va < start + bytes {
+                format!("inside, slot {}", (va - start) / step)
+            } else {
+                format!(
+                    "{:#x} past its end (slot {})",
+                    va - start - bytes,
+                    (va - start) / step
+                )
+            };
+            text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
+        }
+        text
     }
-    crate::shadow::ShadowRegistry::find(address, len).map(|shadow| (shadow, address, len))
+
+    pub(crate) fn probe_view_limit() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let Some(host) = Host::instance() else { return };
+            let fits = |count: u32| {
+                let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+                    host.device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            NumDescriptors: count,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                            NodeMask: 0,
+                        })
+                };
+                made.is_ok()
+            };
+            let views = if fits(UNCAPPED_VIEWS) {
+                UNCAPPED_VIEWS
+            } else {
+                PORTABLE_VIEWS
+            };
+            tracing::info!(
+                views,
+                "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
+            );
+            leonida_shader::emit::set_view_heap_limit(views - 1);
+        });
+    }
 }
 
-fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
-    let desc = uav_desc(words);
-    let buffer = unsafe { desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
-        u64::from(buffer.StructureByteStride)
-    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-        4
-    } else {
-        crate::resource::ResourceFormat::element(desc.Format.0 as u32)?.0
-    };
-    Some((
-        base.checked_add(buffer.FirstElement.checked_mul(element)?)?,
-        u64::from(buffer.NumElements) * element,
-    ))
+impl ViewMaker {
+    fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        let Some(host) = Host::instance() else { return };
+        let desc = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+            ..Default::default()
+        };
+        unsafe { host.device.CreateSampler(&desc, at) };
+    }
+
+    fn fits(
+        texture: &ID3D12Resource,
+        mut format: Option<&mut DXGI_FORMAT>,
+        unordered: bool,
+    ) -> bool {
+        use crate::resource::{DEPTH_FORMATS, ResourceFormat};
+        let d = unsafe { texture.GetDesc() };
+        let allowed = if unordered {
+            d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
+        } else {
+            d.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
+        };
+        let own = d.Format.0 as u32;
+        if !allowed || DEPTH_FORMATS.iter().any(|&(typed, _)| typed == own) {
+            if unordered {
+                crate::resource::DEPTH_UNORDERED[3]
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            once!(
+                unordered,
+                format = own,
+                flags = d.Flags.0,
+                "view the host does not allow"
+            );
+            return false;
+        }
+        let typeless = ResourceFormat::family(own) == own && ResourceFormat::family(own + 1) == own;
+        if let Some(format) = format.as_deref_mut()
+            && unordered
+            && let Some(&(_, linear)) = crate::resource::SRGB
+                .iter()
+                .find(|&&(s, _)| s == format.0 as u32)
+        {
+            format.0 = linear as i32;
+        }
+        let view = format.as_ref().map_or(0, |f| f.0 as u32);
+        if view == 0 {
+            return !typeless;
+        }
+        if view != own && crate::resource::ResourceFormat::target_format(view) == own {
+            if let Some(format) = format {
+                *format = d.Format;
+            }
+            return true;
+        }
+        if ResourceFormat::family(view) != ResourceFormat::family(own) {
+            once!(view, own, "view format of another family");
+            return false;
+        }
+        if let Some(format) = format
+            && !typeless
+        {
+            *format = d.Format;
+        }
+        true
+    }
+
+    fn twin_uav(
+        twin: &ID3D12Resource,
+        desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    ) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+        let d = unsafe { twin.GetDesc() };
+        let mut desc = desc.cloned().unwrap_or_else(|| {
+            let mut all = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            if d.DepthOrArraySize > 1 {
+                all.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                all.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                    ArraySize: u32::from(d.DepthOrArraySize),
+                    ..Default::default()
+                };
+            }
+            all
+        });
+        if d.Format.0 == 60 {
+            let mut plane = 0;
+            match desc.ViewDimension {
+                D3D12_UAV_DIMENSION_TEXTURE2D => {
+                    let mut view = unsafe { desc.Anonymous.Texture2D };
+                    plane = std::mem::take(&mut view.PlaneSlice);
+                    desc.Anonymous.Texture2D = view;
+                }
+                D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                    let mut view = unsafe { desc.Anonymous.Texture2DArray };
+                    plane = std::mem::take(&mut view.PlaneSlice);
+                    desc.Anonymous.Texture2DArray = view;
+                }
+                _ => {}
+            }
+            if plane != 1 && !matches!(desc.Format.0, 22 | 47) {
+                return None;
+            }
+            desc.Format.0 = 62;
+            return Some(desc);
+        }
+        desc.Format.0 = match (desc.Format.0, d.Format.0) {
+            (0 | 53 | 55 | 19..=21 | 44..=46, 53) => 56,
+            (0 | 39 | 40 | 19..=21 | 44..=46, 39) => 41,
+            (other, _) => other,
+        };
+        Some(desc)
+    }
+
+    fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+        let host = Host::instance()?;
+        let device = &host.device;
+        match view {
+            &View::Constant(address, size) => {
+                let shadow = crate::shadow::ShadowRegistry::find(address, u64::from(size))?;
+                let gpu = shadow.gpu(address);
+                if gpu % 256 != 0 {
+                    once!(
+                        address = format_args!("{address:#x}"),
+                        "constant buffer not 256-byte aligned on the host"
+                    );
+                    return None;
+                }
+                let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                    BufferLocation: gpu,
+                    SizeInBytes: BufferViews::constant_size(size),
+                };
+                unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+                Some(Some(shadow.buffer.clone()))
+            }
+            View::Shader(resource, desc) => {
+                let resource = *resource as crate::object::This;
+                if let Some(texture) = crate::resource::HostTextures::host_resource(resource) {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        let own = unsafe { texture.GetDesc() }.Format.0;
+                        if matches!(own, 19..=22 | 44..=47) {
+                            static SEEN: Mutex<Vec<(i32, Option<[u32; 10]>)>> =
+                                Mutex::new(Vec::new());
+                            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                            if seen.len() < 64 && !seen.contains(&(own, *desc)) {
+                                seen.push((own, *desc));
+                                tracing::info!(
+                                    ?resource,
+                                    texture_format = own,
+                                    view = ?desc,
+                                    "shader view of a depth-stencil texture"
+                                );
+                            }
+                        }
+                    }
+                    let mut desc = desc.as_ref().map(BufferViews::srv_desc);
+                    if !ViewMaker::fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                        return None;
+                    }
+                    unsafe {
+                        device.CreateShaderResourceView(
+                            texture,
+                            desc.as_ref().map(std::ptr::from_ref),
+                            at,
+                        )
+                    };
+                    Some(Some(texture.clone()))
+                } else if let (Some((data, len)), Some(desc)) =
+                    (crate::resource::GpuResource::buffer_bytes(resource), desc)
+                {
+                    BufferViews::buffer_srv(data as u64, len, BufferViews::srv_desc(desc), at)
+                } else {
+                    None
+                }
+            }
+            View::Unordered(resource, _counter, desc) => {
+                let resource = *resource as crate::object::This;
+                let Some(texture) = crate::resource::HostTextures::host_resource(resource) else {
+                    return match (crate::resource::GpuResource::buffer_bytes(resource), desc) {
+                        (Some((data, len)), Some(desc)) => BufferViews::buffer_uav(
+                            data as u64,
+                            len,
+                            BufferViews::uav_desc(desc),
+                            at,
+                        ),
+                        _ => None,
+                    };
+                };
+                if crate::resource::GpuResource::depth_and_unordered(resource) {
+                    static LOGGED: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 512 {
+                        tracing::info!(
+                            ?resource,
+                            view = ?desc,
+                            "unordered access view of a depth texture"
+                        );
+                    }
+                }
+                let mut desc = desc.as_ref().map(BufferViews::uav_desc);
+                let twin = crate::resource::Twin::resource_of(resource)
+                    .and_then(|twin| Some((twin, ViewMaker::twin_uav(twin, desc.as_ref())?)))
+                    .or_else(|| {
+                        let twin = crate::resource::Twin::plane_resource_of(resource)?;
+                        Some((twin, ViewMaker::twin_uav(twin, desc.as_ref())?))
+                    });
+                let texture = match twin {
+                    Some((twin, view)) => {
+                        desc = Some(view);
+                        twin
+                    }
+                    None => texture,
+                };
+                if !ViewMaker::fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+                    return None;
+                }
+                unsafe {
+                    device.CreateUnorderedAccessView(
+                        texture,
+                        None::<&ID3D12Resource>,
+                        desc.as_ref().map(std::ptr::from_ref),
+                        at,
+                    )
+                };
+                Some(Some(texture.clone()))
+            }
+            View::Sampler(words) => {
+                let desc = unsafe {
+                    std::ptr::from_ref(words)
+                        .cast::<D3D12_SAMPLER_DESC>()
+                        .read_unaligned()
+                };
+                unsafe { device.CreateSampler(&desc, at) };
+                Some(None)
+            }
+            View::ConsoleSampler(words) => {
+                let desc = crate::sampler::ConsoleSampler::from_words(words).host_desc();
+                unsafe { device.CreateSampler(&desc, at) };
+                Some(None)
+            }
+            View::Placed(unordered, resource, desc) => {
+                if let Some(view) = PlacedTexture::of(view) {
+                    let made = ViewMaker::make_view(&view.view, at);
+                    #[cfg(feature = "diagnostics")]
+                    if *unordered && made.as_ref().is_some_and(Option::is_some) {
+                        static FIRST: std::sync::Once = std::sync::Once::new();
+                        FIRST.call_once(|| {
+                            tracing::info!(
+                                dimension = resource[0],
+                                resource_format = resource[8],
+                                view_format = desc[0],
+                                flags = resource[12],
+                                address = format_args!(
+                                    "{:#x}",
+                                    u64::from(desc[10]) | u64::from(desc[11]) << 32
+                                ),
+                                "mirrored a placed texture UAV"
+                            )
+                        });
+                    }
+                    return made;
+                }
+                const BUFFER: u32 = 1;
+                if resource[0] != BUFFER {
+                    static FIRST: [std::sync::Once; 2] =
+                        [std::sync::Once::new(), std::sync::Once::new()];
+                    FIRST[usize::from(*unordered)].call_once(|| {
+                        tracing::warn!(
+                            unordered,
+                            dimension = resource[0],
+                            format = resource[8],
+                            flags = resource[12],
+                            address = format_args!(
+                                "{:#x}",
+                                u64::from(desc[10]) | u64::from(desc[11]) << 32
+                            ),
+                            "could not resolve the placed texture view"
+                        )
+                    });
+                    return None;
+                }
+                let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
+                if *unordered {
+                    BufferViews::buffer_uav(address, len, BufferViews::uav_desc(words), at)
+                } else {
+                    BufferViews::buffer_srv(address, len, BufferViews::srv_desc(words), at)
+                }
+            }
+        }
+    }
+
+    fn keep_views() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LEONIDA_KEEP_VIEWS").is_none_or(|v| v != "0"))
+    }
+
+    fn same_placed_texture(a: &View, b: &View) -> bool {
+        match (a, b) {
+            (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
+                resource[0] != 1
+                    && desc[10..12] == other_desc[10..12]
+                    && crate::resource::PlacedTextures::placed_key(*resource)
+                        == crate::resource::PlacedTextures::placed_key(*other)
+            }
+            _ => false,
+        }
+    }
+
+    fn resident_sampled_texture(view: &View) -> Option<crate::resource::ResidentTexture> {
+        let texture = match view {
+            View::Shader(object, _) => *object as crate::object::This,
+            View::Placed(false, resource, desc) if resource[0] != 1 && resource[12] & 7 == 0 => {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                crate::resource::PlacedTextures::placed_known(address, resource)?
+            }
+            _ => return None,
+        };
+        crate::resource::GpuResource::resident_copy(texture)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("LEONIDA_NULL_MAGENTA").is_some_and(|v| v == "1")) {
+            return false;
+        }
+        let colour = matches!(desc[0], 27..=29 | 70..=78 | 87..=91 | 97..=99);
+        if desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 || !colour {
+            return false;
+        }
+        let (Some(host), Some(texture)) = (Host::instance(), ViewMaker::magenta()) else {
+            return false;
+        };
+        unsafe { host.device.CreateShaderResourceView(texture, None, at) };
+        true
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn magenta() -> Option<&'static ID3D12Resource> {
+        static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+        TEXTURE
+            .get_or_init(|| {
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                    MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                    ..Default::default()
+                };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 1,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    ..Default::default()
+                };
+                let mut texture: Option<ID3D12Resource> = None;
+                unsafe {
+                    Host::instance()?
+                        .device
+                        .CreateCommittedResource(
+                            &heap,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            None,
+                            &mut texture,
+                        )
+                        .ok()?;
+                    let texture = texture?;
+                    texture.Map(0, None, None).ok()?;
+                    let texel = [255u8, 0, 255, 255];
+                    texture
+                        .WriteToSubresource(0, None, texel.as_ptr().cast(), 4, 4)
+                        .ok()?;
+                    texture.Unmap(0, None);
+                    Some(texture)
+                }
+            })
+            .as_ref()
+    }
+
+    fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        let Some(host) = Host::instance() else { return };
+        let is_buffer = |r: &usize| {
+            crate::resource::GpuResource::buffer_bytes(*r as crate::object::This).is_some()
+        };
+        let (buffer, dimension) = match view {
+            View::Unordered(r, _, desc) => (
+                is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
+                desc.map(|d| d[1]),
+            ),
+            View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
+            View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => {
+                return ViewMaker::null_buffer_view(at);
+            }
+            View::Placed(false, resource, _) if resource[0] == 1 => {
+                return ViewMaker::null_buffer_view(at);
+            }
+            View::Shader(_, Some(desc)) => return ViewMaker::null_like(desc, at),
+            View::Placed(false, _, desc) => {
+                #[cfg(feature = "diagnostics")]
+                if ViewMaker::magenta_for(desc, at) {
+                    return;
+                }
+                return ViewMaker::null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
+            }
+            View::Constant(..) => {
+                let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            }
+            _ => return ViewMaker::null_view(at),
+        };
+        let desc = if buffer {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                ..Default::default()
+            }
+        } else {
+            ViewMaker::null_uav_desc(dimension)
+        };
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                None::<&ID3D12Resource>,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                at,
+            )
+        };
+    }
+
+    fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        match dimension.map(|d| D3D12_UAV_DIMENSION(d as i32)) {
+            Some(D3D12_UAV_DIMENSION_TEXTURE1D) => {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+            }
+            Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+                desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                    ArraySize: 1,
+                    ..Default::default()
+                };
+            }
+            Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                    ArraySize: 1,
+                    ..Default::default()
+                };
+            }
+            Some(D3D12_UAV_DIMENSION_TEXTURE3D) => {
+                desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                    WSize: u32::MAX,
+                    ..Default::default()
+                };
+            }
+            _ => {}
+        }
+        desc
+    }
+
+    fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        let Some(host) = Host::instance() else { return };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: 1,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        unsafe {
+            host.device
+                .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        };
+    }
+
+    fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        const TEXTURES: std::ops::RangeInclusive<u32> = 2..=10;
+        if !TEXTURES.contains(&words[1]) {
+            return ViewMaker::null_view(at);
+        }
+        let Some(host) = Host::instance() else { return };
+        let mut w = [0u32; 10];
+        w[1] = words[1];
+        match words[1] {
+            6 => {}
+            7 => w[5] = 1,
+            3 | 5 | 10 => (w[5], w[7]) = (1, 1),
+            _ => w[5] = 1,
+        }
+        let mut desc = BufferViews::srv_desc(&w);
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        unsafe {
+            host.device
+                .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        };
+    }
+
+    fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        let Some(host) = Host::instance() else { return };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        unsafe {
+            host.device
+                .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        };
+    }
+}
+
+impl PlacedTexture {
+    pub(crate) fn of(view: &View) -> Option<PlacedTexture> {
+        const BUFFER: u32 = 1;
+        let View::Placed(unordered, resource, desc) = view else {
+            return None;
+        };
+        if resource[0] == BUFFER || (*unordered && resource[12] & 4 == 0) {
+            return None;
+        }
+        let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+        let owner = if resource[12] & 4 != 0 {
+            crate::resource::PlacedTextures::writable_texture_at(address, resource)
+        } else {
+            None
+        };
+        let texture = match &owner {
+            Some(owner) => owner.as_ptr(),
+            None if *unordered => return None,
+            None => crate::resource::PlacedTextures::texture_at(address, resource)?,
+        };
+        let words = desc[..10].try_into().ok();
+        let view = if *unordered {
+            View::Unordered(texture as usize, 0, words)
+        } else {
+            View::Shader(texture as usize, words)
+        };
+        Some(PlacedTexture {
+            view,
+            _owner: owner,
+        })
+    }
 }
 
 type Kept = Option<ID3D12Resource>;
-
-fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, u32)> {
-    if stride == 0 {
-        return None;
-    }
-    let start = first.checked_mul(u64::from(stride))?.checked_add(offset)?;
-    let bytes = u64::from(count) * u64::from(stride);
-    (start % 16 == 0 && bytes % 4 == 0)
-        .then(|| {
-            u32::try_from(bytes / 4)
-                .ok()
-                .map(|dwords| (start / 4, dwords))
-        })
-        .flatten()
-}
-
-fn buffer_view_ok(
-    format: DXGI_FORMAT,
-    first: u64,
-    count: u32,
-    stride: u32,
-    raw: bool,
-    width: u64,
-) -> bool {
-    use crate::resource::ResourceFormat;
-    let f = format.0 as u32;
-    let element = if raw {
-        if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 || !first.is_multiple_of(4) {
-            return false;
-        }
-        4
-    } else if stride > 0 {
-        if format != DXGI_FORMAT_UNKNOWN || stride > 2048 || !stride.is_multiple_of(4) {
-            return false;
-        }
-        u64::from(stride)
-    } else {
-        let typeless = ResourceFormat::family(f) == f && ResourceFormat::family(f + 1) == f;
-        match crate::resource::ResourceFormat::element(f) {
-            Some((bytes, 1)) if f != 0 && !typeless && bytes > 0 => bytes,
-            _ => return false,
-        }
-    };
-    count > 0
-        && first
-            .checked_add(u64::from(count))
-            .and_then(|end| end.checked_mul(element))
-            .is_some_and(|end| end <= width)
-}
-
-fn constant_size(size: u32) -> u32 {
-    size.min(64 << 10).next_multiple_of(256)
-}
-
-fn elements_inside(first: u64, count: u32, element: u64, width: u64) -> u32 {
-    let room = (width / element.max(1)).saturating_sub(first);
-    match u32::try_from(room) {
-        Ok(0) | Err(_) => count,
-        Ok(room) => count.min(room),
-    }
-}
-
-fn left_null(
-    why: &'static str,
-    unordered: bool,
-    address: u64,
-    len: u64,
-    element: u64,
-    first: u64,
-) -> bool {
-    if !cfg!(feature = "diagnostics") {
-        return false;
-    }
-    type Seen = std::collections::BTreeMap<
-        (&'static str, bool, u64),
-        std::collections::HashSet<(u64, u64)>,
-    >;
-    static SEEN: Mutex<Seen> = Mutex::new(Seen::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let views = seen.entry((why, unordered, element)).or_default();
-    if views.insert((address, len)) && views.len().is_power_of_two() {
-        tracing::warn!(
-            views = views.len(),
-            unordered,
-            element,
-            first,
-            len,
-            address = format_args!("{address:#x}"),
-            "buffer views left null: {why}"
-        );
-        return true;
-    }
-    false
-}
 
 enum SrvError {
     Alignment,
     Layout,
 }
 
-fn rebase_srv(
-    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
-    offset: u64,
-    width: u64,
-) -> Result<(), SrvError> {
-    let structured = unsafe { desc.Anonymous.Buffer };
-    let window = (desc.Format == DXGI_FORMAT_UNKNOWN)
-        .then(|| {
-            raw_window(
-                offset,
-                structured.FirstElement,
-                structured.NumElements,
-                structured.StructureByteStride,
-            )
-        })
-        .flatten();
-    if let Some((first, count)) = window {
-        desc.Format = DXGI_FORMAT_R32_TYPELESS;
-        desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
-            FirstElement: first,
-            NumElements: count,
-            StructureByteStride: 0,
-            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-        };
-    }
-    let element = element_size(desc);
-    let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    if window.is_none() {
-        if element == 0 || !offset.is_multiple_of(element) {
-            return Err(SrvError::Alignment);
-        }
-        buffer.FirstElement = buffer
-            .FirstElement
-            .checked_add(offset / element)
-            .ok_or(SrvError::Layout)?;
-    }
-    let unit = if window.is_some() { 4 } else { element };
-    buffer.NumElements = elements_inside(buffer.FirstElement, buffer.NumElements, unit, width);
-    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-    if buffer_view_ok(
-        desc.Format,
-        buffer.FirstElement,
-        buffer.NumElements,
-        buffer.StructureByteStride,
-        raw,
-        width,
-    ) {
-        Ok(())
-    } else {
-        Err(SrvError::Layout)
-    }
-}
-
-fn buffer_srv(
-    address: u64,
-    len: u64,
-    mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
-    at: D3D12_CPU_DESCRIPTOR_HANDLE,
-) -> Option<Kept> {
-    let shadow = crate::shadow::ShadowRegistry::find(address, len)?;
-    let offset = shadow.offset(address);
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
-    if let Err(reason) = rebase_srv(&mut desc, offset, width) {
-        let element = element_size(&desc);
-        let buffer = unsafe { desc.Anonymous.Buffer };
-        if matches!(reason, SrvError::Alignment) {
-            let sampled = left_null(
-                "not on an element of their host copy",
-                false,
-                address,
-                len,
-                element,
-                buffer.FirstElement,
-            );
-            if sampled && element == 12 {
-                let (shadow_start, shadow_bytes) = shadow.span();
-                let bytes = u64::from(buffer.NumElements) * element;
-                let view_end = buffer
-                    .FirstElement
-                    .checked_mul(element)
-                    .and_then(|first| first.checked_add(bytes));
-                tracing::warn!(
-                    format = desc.Format.0,
-                    dimension = desc.ViewDimension.0,
-                    stride = buffer.StructureByteStride,
-                    count = buffer.NumElements,
-                    flags = buffer.Flags.0,
-                    offset,
-                    address = format_args!("{address:#x}"),
-                    shadow_start = format_args!("{shadow_start:#x}"),
-                    shadow_bytes,
-                    within_guest_buffer = view_end.is_some_and(|end| end <= len),
-                    "12-byte SRV could not address the first whole element in its host buffer"
-                );
-            }
-            return None;
-        }
-        let (first, count, stride) = (
-            buffer.FirstElement,
-            buffer.NumElements,
-            buffer.StructureByteStride,
-        );
-        let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let why = if raw {
-            "raw, refused by the host"
-        } else {
-            "refused by the host"
-        };
-        left_null(why, false, address, len, element, first);
-        once!(
-            format = desc.Format.0,
-            first,
-            count,
-            stride,
-            raw,
-            width,
-            "buffer view the host would refuse left null"
-        );
-        return None;
-    }
-    if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
-        desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    }
-    let host = Host::instance()?;
-    unsafe {
-        host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
-    };
-    Some(Some(shadow.buffer.clone()))
-}
-
-fn buffer_uav(
-    address: u64,
-    len: u64,
-    mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
-    at: D3D12_CPU_DESCRIPTOR_HANDLE,
-) -> Option<Kept> {
-    let shadow = crate::shadow::ShadowRegistry::find(address, len)?;
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-        once!("unordered access to a buffer whose host copy shaders cannot write");
-        return None;
-    }
-    let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
-        u64::from(buffer.StructureByteStride)
-    } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
-        4
-    } else {
-        crate::resource::ResourceFormat::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-    };
-    let offset = shadow.offset(address);
-    let window = (desc.Format == DXGI_FORMAT_UNKNOWN)
-        .then(|| {
-            raw_window(
-                offset,
-                buffer.FirstElement,
-                buffer.NumElements,
-                buffer.StructureByteStride,
-            )
-        })
-        .flatten();
-    if let Some((first, count)) = window {
-        buffer.FirstElement = first;
-        buffer.NumElements = count;
-        buffer.StructureByteStride = 0;
-        buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-    } else {
-        if element == 0 || !offset.is_multiple_of(element) {
-            left_null(
-                "not on an element of their host copy",
-                true,
-                address,
-                len,
-                element,
-                buffer.FirstElement,
-            );
-            return None;
-        }
-        buffer.FirstElement += offset / element;
-    }
-    buffer.CounterOffsetInBytes = 0;
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
-    let unit = if window.is_some() { 4 } else { element };
-    buffer.NumElements = elements_inside(buffer.FirstElement, buffer.NumElements, unit, width);
-    let (first, count, stride) = (
-        buffer.FirstElement,
-        buffer.NumElements,
-        buffer.StructureByteStride,
-    );
-    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-    if window.is_some() {
-        desc.Format = DXGI_FORMAT_R32_TYPELESS;
-    }
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
-        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let why = if raw {
-            "raw, refused by the host"
-        } else {
-            "refused by the host"
-        };
-        left_null(why, true, address, len, element, first);
-        once!(
-            format = desc.Format.0,
-            first,
-            count,
-            stride,
-            raw,
-            width,
-            "unordered buffer view the host would refuse left null"
-        );
-        return None;
-    }
-    let host = Host::instance()?;
-    unsafe {
-        host.device.CreateUnorderedAccessView(
-            &shadow.buffer,
-            None::<&ID3D12Resource>,
-            Some(&desc),
-            at,
-        )
-    };
-    Some(Some(shadow.buffer.clone()))
-}
-
-fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
-    use crate::resource::{DEPTH_FORMATS, ResourceFormat};
-    let d = unsafe { texture.GetDesc() };
-    let allowed = if unordered {
-        d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
-    } else {
-        d.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
-    };
-    let own = d.Format.0 as u32;
-    if !allowed || DEPTH_FORMATS.iter().any(|&(typed, _)| typed == own) {
-        if unordered {
-            crate::resource::DEPTH_UNORDERED[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        once!(
-            unordered,
-            format = own,
-            flags = d.Flags.0,
-            "view the host does not allow"
-        );
-        return false;
-    }
-    let typeless = ResourceFormat::family(own) == own && ResourceFormat::family(own + 1) == own;
-    if let Some(format) = format.as_deref_mut()
-        && unordered
-        && let Some(&(_, linear)) = crate::resource::SRGB
-            .iter()
-            .find(|&&(s, _)| s == format.0 as u32)
-    {
-        format.0 = linear as i32;
-    }
-    let view = format.as_ref().map_or(0, |f| f.0 as u32);
-    if view == 0 {
-        return !typeless;
-    }
-    if view != own && crate::resource::ResourceFormat::target_format(view) == own {
-        if let Some(format) = format {
-            *format = d.Format;
-        }
-        return true;
-    }
-    if ResourceFormat::family(view) != ResourceFormat::family(own) {
-        once!(view, own, "view format of another family");
-        return false;
-    }
-    if let Some(format) = format
-        && !typeless
-    {
-        *format = d.Format;
-    }
-    true
-}
-
-fn twin_uav(
-    twin: &ID3D12Resource,
-    desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
-) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
-    let d = unsafe { twin.GetDesc() };
-    let mut desc = desc.cloned().unwrap_or_else(|| {
-        let mut all = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
-            ..Default::default()
-        };
-        if d.DepthOrArraySize > 1 {
-            all.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-            all.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
-                ArraySize: u32::from(d.DepthOrArraySize),
-                ..Default::default()
-            };
-        }
-        all
-    });
-    if d.Format.0 == 60 {
-        let mut plane = 0;
-        match desc.ViewDimension {
-            D3D12_UAV_DIMENSION_TEXTURE2D => {
-                let mut view = unsafe { desc.Anonymous.Texture2D };
-                plane = std::mem::take(&mut view.PlaneSlice);
-                desc.Anonymous.Texture2D = view;
-            }
-            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
-                let mut view = unsafe { desc.Anonymous.Texture2DArray };
-                plane = std::mem::take(&mut view.PlaneSlice);
-                desc.Anonymous.Texture2DArray = view;
-            }
-            _ => {}
-        }
-        if plane != 1 && !matches!(desc.Format.0, 22 | 47) {
-            return None;
-        }
-        desc.Format.0 = 62;
-        return Some(desc);
-    }
-    desc.Format.0 = match (desc.Format.0, d.Format.0) {
-        (0 | 53 | 55 | 19..=21 | 44..=46, 53) => 56,
-        (0 | 39 | 40 | 19..=21 | 44..=46, 39) => 41,
-        (other, _) => other,
-    };
-    Some(desc)
-}
-
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
-    let host = Host::instance()?;
-    let device = &host.device;
-    match view {
-        &View::Constant(address, size) => {
-            let shadow = crate::shadow::ShadowRegistry::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return None;
-            }
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
-                SizeInBytes: constant_size(size),
-            };
-            unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Some(shadow.buffer.clone()))
-        }
-        View::Shader(resource, desc) => {
-            let resource = *resource as crate::object::This;
-            if let Some(texture) = crate::resource::HostTextures::host_resource(resource) {
-                #[cfg(feature = "diagnostics")]
-                {
-                    let own = unsafe { texture.GetDesc() }.Format.0;
-                    if matches!(own, 19..=22 | 44..=47) {
-                        static SEEN: Mutex<Vec<(i32, Option<[u32; 10]>)>> = Mutex::new(Vec::new());
-                        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-                        if seen.len() < 64 && !seen.contains(&(own, *desc)) {
-                            seen.push((own, *desc));
-                            tracing::info!(
-                                ?resource,
-                                texture_format = own,
-                                view = ?desc,
-                                "shader view of a depth-stencil texture"
-                            );
-                        }
-                    }
-                }
-                let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
-                    return None;
-                }
-                unsafe {
-                    device.CreateShaderResourceView(
-                        texture,
-                        desc.as_ref().map(std::ptr::from_ref),
-                        at,
-                    )
-                };
-                Some(Some(texture.clone()))
-            } else if let (Some((data, len)), Some(desc)) =
-                (crate::resource::GpuResource::buffer_bytes(resource), desc)
-            {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
-            } else {
-                None
-            }
-        }
-        View::Unordered(resource, _counter, desc) => {
-            let resource = *resource as crate::object::This;
-            let Some(texture) = crate::resource::HostTextures::host_resource(resource) else {
-                return match (crate::resource::GpuResource::buffer_bytes(resource), desc) {
-                    (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at)
-                    }
-                    _ => None,
-                };
-            };
-            if crate::resource::GpuResource::depth_and_unordered(resource) {
-                static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 512 {
-                    tracing::info!(
-                        ?resource,
-                        view = ?desc,
-                        "unordered access view of a depth texture"
-                    );
-                }
-            }
-            let mut desc = desc.as_ref().map(uav_desc);
-            let twin = crate::resource::Twin::resource_of(resource)
-                .and_then(|twin| Some((twin, twin_uav(twin, desc.as_ref())?)))
-                .or_else(|| {
-                    let twin = crate::resource::Twin::plane_resource_of(resource)?;
-                    Some((twin, twin_uav(twin, desc.as_ref())?))
-                });
-            let texture = match twin {
-                Some((twin, view)) => {
-                    desc = Some(view);
-                    twin
-                }
-                None => texture,
-            };
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
-                return None;
-            }
-            unsafe {
-                device.CreateUnorderedAccessView(
-                    texture,
-                    None::<&ID3D12Resource>,
-                    desc.as_ref().map(std::ptr::from_ref),
-                    at,
-                )
-            };
-            Some(Some(texture.clone()))
-        }
-        View::Sampler(words) => {
-            let desc = unsafe {
-                std::ptr::from_ref(words)
-                    .cast::<D3D12_SAMPLER_DESC>()
-                    .read_unaligned()
-            };
-            unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
-        }
-        View::ConsoleSampler(words) => {
-            let desc = crate::sampler::ConsoleSampler::from_words(words).host_desc();
-            unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
-        }
-        View::Placed(unordered, resource, desc) => {
-            if let Some(view) = placed_texture(view) {
-                let made = make(&view.view, at);
-                #[cfg(feature = "diagnostics")]
-                if *unordered && made.as_ref().is_some_and(Option::is_some) {
-                    static FIRST: std::sync::Once = std::sync::Once::new();
-                    FIRST.call_once(|| {
-                        tracing::info!(
-                            dimension = resource[0],
-                            resource_format = resource[8],
-                            view_format = desc[0],
-                            flags = resource[12],
-                            address = format_args!(
-                                "{:#x}",
-                                u64::from(desc[10]) | u64::from(desc[11]) << 32
-                            ),
-                            "mirrored a placed texture UAV"
-                        )
-                    });
-                }
-                return made;
-            }
-            const BUFFER: u32 = 1;
-            if resource[0] != BUFFER {
-                static FIRST: [std::sync::Once; 2] =
-                    [std::sync::Once::new(), std::sync::Once::new()];
-                FIRST[usize::from(*unordered)].call_once(|| {
-                    tracing::warn!(
-                        unordered,
-                        dimension = resource[0],
-                        format = resource[8],
-                        flags = resource[12],
-                        address =
-                            format_args!("{:#x}", u64::from(desc[10]) | u64::from(desc[11]) << 32),
-                        "could not resolve the placed texture view"
-                    )
-                });
-                return None;
-            }
-            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
-            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
-            if *unordered {
-                buffer_uav(address, len, uav_desc(words), at)
-            } else {
-                buffer_srv(address, len, srv_desc(words), at)
-            }
-        }
-    }
-}
-
 pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn keep_views() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LEONIDA_KEEP_VIEWS").is_none_or(|v| v != "0"))
-}
-
-fn same_placed_texture(a: &View, b: &View) -> bool {
-    match (a, b) {
-        (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
-            resource[0] != 1
-                && desc[10..12] == other_desc[10..12]
-                && crate::resource::PlacedTextures::placed_key(*resource)
-                    == crate::resource::PlacedTextures::placed_key(*other)
-        }
-        _ => false,
-    }
-}
-
-fn resident_sampled_texture(view: &View) -> Option<crate::resource::ResidentTexture> {
-    let texture = match view {
-        View::Shader(object, _) => *object as crate::object::This,
-        View::Placed(false, resource, desc) if resource[0] != 1 && resource[12] & 7 == 0 => {
-            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            crate::resource::PlacedTextures::placed_known(address, resource)?
-        }
-        _ => return None,
-    };
-    crate::resource::GpuResource::resident_copy(texture)
-}
 
 pub(crate) struct PlacedTexture {
     pub(crate) view: View,
     _owner: Option<crate::resource::ResourceRef>,
-}
-
-pub(crate) fn placed_texture(view: &View) -> Option<PlacedTexture> {
-    const BUFFER: u32 = 1;
-    let View::Placed(unordered, resource, desc) = view else {
-        return None;
-    };
-    if resource[0] == BUFFER || (*unordered && resource[12] & 4 == 0) {
-        return None;
-    }
-    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let owner = if resource[12] & 4 != 0 {
-        crate::resource::PlacedTextures::writable_texture_at(address, resource)
-    } else {
-        None
-    };
-    let texture = match &owner {
-        Some(owner) => owner.as_ptr(),
-        None if *unordered => return None,
-        None => crate::resource::PlacedTextures::texture_at(address, resource)?,
-    };
-    let words = desc[..10].try_into().ok();
-    let view = if *unordered {
-        View::Unordered(texture as usize, 0, words)
-    } else {
-        View::Shader(texture as usize, words)
-    };
-    Some(PlacedTexture {
-        view,
-        _owner: owner,
-    })
-}
-
-#[cfg(feature = "diagnostics")]
-fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("LEONIDA_NULL_MAGENTA").is_some_and(|v| v == "1")) {
-        return false;
-    }
-    let colour = matches!(desc[0], 27..=29 | 70..=78 | 87..=91 | 97..=99);
-    if desc[1] != D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32 || !colour {
-        return false;
-    }
-    let (Some(host), Some(texture)) = (Host::instance(), magenta()) else {
-        return false;
-    };
-    unsafe { host.device.CreateShaderResourceView(texture, None, at) };
-    true
-}
-
-#[cfg(feature = "diagnostics")]
-fn magenta() -> Option<&'static ID3D12Resource> {
-    static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
-    TEXTURE
-        .get_or_init(|| {
-            let heap = D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_CUSTOM,
-                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-                ..Default::default()
-            };
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                Width: 1,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                ..Default::default()
-            };
-            let mut texture: Option<ID3D12Resource> = None;
-            unsafe {
-                Host::instance()?
-                    .device
-                    .CreateCommittedResource(
-                        &heap,
-                        D3D12_HEAP_FLAG_NONE,
-                        &desc,
-                        D3D12_RESOURCE_STATE_COMMON,
-                        None,
-                        &mut texture,
-                    )
-                    .ok()?;
-                let texture = texture?;
-                texture.Map(0, None, None).ok()?;
-                let texel = [255u8, 0, 255, 255];
-                texture
-                    .WriteToSubresource(0, None, texel.as_ptr().cast(), 4, 4)
-                    .ok()?;
-                texture.Unmap(0, None);
-                Some(texture)
-            }
-        })
-        .as_ref()
-}
-
-fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = Host::instance() else { return };
-    let is_buffer =
-        |r: &usize| crate::resource::GpuResource::buffer_bytes(*r as crate::object::This).is_some();
-    let (buffer, dimension) = match view {
-        View::Unordered(r, _, desc) => (
-            is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
-            desc.map(|d| d[1]),
-        ),
-        View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
-        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => {
-            return null_buffer_view(at);
-        }
-        View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
-        View::Shader(_, Some(desc)) => return null_like(desc, at),
-        View::Placed(false, _, desc) => {
-            #[cfg(feature = "diagnostics")]
-            if magenta_for(desc, at) {
-                return;
-            }
-            return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
-        }
-        View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
-        }
-        _ => return null_view(at),
-    };
-    let desc = if buffer {
-        D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_UINT,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            ..Default::default()
-        }
-    } else {
-        null_uav_desc(dimension)
-    };
-    unsafe {
-        host.device.CreateUnorderedAccessView(
-            None::<&ID3D12Resource>,
-            None::<&ID3D12Resource>,
-            Some(&desc),
-            at,
-        )
-    };
-}
-
-fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
-    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-        Format: DXGI_FORMAT_R32_UINT,
-        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
-        ..Default::default()
-    };
-    match dimension.map(|d| D3D12_UAV_DIMENSION(d as i32)) {
-        Some(D3D12_UAV_DIMENSION_TEXTURE1D) => {
-            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
-        }
-        Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => {
-            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
-            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
-                ArraySize: 1,
-                ..Default::default()
-            };
-        }
-        Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => {
-            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
-                ArraySize: 1,
-                ..Default::default()
-            };
-        }
-        Some(D3D12_UAV_DIMENSION_TEXTURE3D) => {
-            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
-            desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
-                WSize: u32::MAX,
-                ..Default::default()
-            };
-        }
-        _ => {}
-    }
-    desc
-}
-
-fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = Host::instance() else { return };
-    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-        Format: DXGI_FORMAT_R32_TYPELESS,
-        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-            Buffer: D3D12_BUFFER_SRV {
-                NumElements: 1,
-                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                ..Default::default()
-            },
-        },
-    };
-    unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
-}
-
-fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    const TEXTURES: std::ops::RangeInclusive<u32> = 2..=10;
-    if !TEXTURES.contains(&words[1]) {
-        return null_view(at);
-    }
-    let Some(host) = Host::instance() else { return };
-    let mut w = [0u32; 10];
-    w[1] = words[1];
-    match words[1] {
-        6 => {}
-        7 => w[5] = 1,
-        3 | 5 | 10 => (w[5], w[7]) = (1, 1),
-        _ => w[5] = 1,
-    }
-    let mut desc = srv_desc(&w);
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
-}
-
-fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = Host::instance() else { return };
-    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-            Texture2D: D3D12_TEX2D_SRV {
-                MipLevels: 1,
-                ..Default::default()
-            },
-        },
-    };
-    unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
 }
 
 #[cfg(test)]
@@ -3249,12 +3288,12 @@ mod tests {
             (60, 61),
             (1, 1),
         ] {
-            assert!(!record_remap(&mut ranges, from, to, 3));
+            assert!(!RemapLog::record(&mut ranges, from, to, 3));
         }
-        merge_remaps(&mut ranges);
+        RemapLog::merge(&mut ranges);
         assert_eq!(ranges, [(10, 20), (30, 61)]);
-        assert!(record_remap(&mut ranges, 90, 99, 2));
-        assert!(!record_remap(&mut ranges, 120, 160, 2));
+        assert!(RemapLog::record(&mut ranges, 90, 99, 2));
+        assert!(!RemapLog::record(&mut ranges, 120, 160, 2));
         assert_eq!(ranges, [(0, u64::MAX)]);
     }
 
@@ -3348,13 +3387,13 @@ mod tests {
 
     #[test]
     fn null_uavs_keep_the_titles_dimension() {
-        let d = null_uav_desc(Some(8));
+        let d = ViewMaker::null_uav_desc(Some(8));
         assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE3D);
         assert_eq!(unsafe { d.Anonymous.Texture3D.WSize }, u32::MAX);
-        let d = null_uav_desc(Some(5));
+        let d = ViewMaker::null_uav_desc(Some(5));
         assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2DARRAY);
         assert_eq!(unsafe { d.Anonymous.Texture2DArray.ArraySize }, 1);
-        let dimension = |d| null_uav_desc(d).ViewDimension;
+        let dimension = |d| ViewMaker::null_uav_desc(d).ViewDimension;
         assert_eq!(dimension(Some(2)), D3D12_UAV_DIMENSION_TEXTURE1D);
         assert_eq!(dimension(Some(4)), D3D12_UAV_DIMENSION_TEXTURE2D);
         assert_eq!(dimension(None), D3D12_UAV_DIMENSION_TEXTURE2D);
@@ -3372,42 +3411,42 @@ mod tests {
         desc[7] = 16;
         desc[10] = 0x1000;
         assert_eq!(
-            structured_srv_records(&View::Placed(false, resource, desc)),
+            BufferViews::structured_srv_records(&View::Placed(false, resource, desc)),
             Some(7)
         );
         let object_desc = desc[..10].try_into().unwrap();
         assert_eq!(
-            structured_srv_records(&View::Shader(1, Some(object_desc))),
+            BufferViews::structured_srv_records(&View::Shader(1, Some(object_desc))),
             Some(7)
         );
         assert_eq!(
-            structured_srv_records(&View::Shader(0, Some(object_desc))),
+            BufferViews::structured_srv_records(&View::Shader(0, Some(object_desc))),
             None
         );
         assert_eq!(
-            structured_srv_records(&View::Placed(true, resource, desc)),
+            BufferViews::structured_srv_records(&View::Placed(true, resource, desc)),
             None
         );
         desc[10] = 0;
         assert_eq!(
-            structured_srv_records(&View::Placed(false, resource, desc)),
+            BufferViews::structured_srv_records(&View::Placed(false, resource, desc)),
             None
         );
         desc[10] = 0x1000;
         desc[6] = 0;
         assert_eq!(
-            structured_srv_records(&View::Placed(false, resource, desc)),
+            BufferViews::structured_srv_records(&View::Placed(false, resource, desc)),
             Some(0)
         );
         desc[7] = 0;
         assert_eq!(
-            structured_srv_records(&View::Placed(false, resource, desc)),
+            BufferViews::structured_srv_records(&View::Placed(false, resource, desc)),
             None
         );
         desc[7] = 16;
         desc[1] = 4;
         assert_eq!(
-            structured_srv_records(&View::Placed(false, resource, desc)),
+            BufferViews::structured_srv_records(&View::Placed(false, resource, desc)),
             None
         );
     }
@@ -3422,11 +3461,17 @@ mod tests {
             View::Placed(false, resource, desc)
         };
         let low = view(texture, 3, 0x1000_0000);
-        assert!(same_placed_texture(&low, &view(texture, 0, 0x1000_0000)));
+        assert!(ViewMaker::same_placed_texture(
+            &low,
+            &view(texture, 0, 0x1000_0000)
+        ));
         let mut padded = texture;
         padded[1] = 0x1234;
         padded[13] = 0x7ffa;
-        assert!(same_placed_texture(&low, &view(padded, 0, 0x1000_0000)));
+        assert!(ViewMaker::same_placed_texture(
+            &low,
+            &view(padded, 0, 0x1000_0000)
+        ));
         let mut spans = Spans::default();
         let start = 0xb_1000_0000;
         let small = start + spans.bytes(&texture, 3).unwrap();
@@ -3435,24 +3480,33 @@ mod tests {
         assert!(spans.note(1, start, small, &texture, true).is_empty());
         assert!(spans.note(2, start, full, &padded, true).is_empty());
         assert_eq!(spans.claim(1, start, small, &texture), (Claim::Own, None));
-        assert!(!same_placed_texture(&low, &view(texture, 3, 0x2000_0000)));
+        assert!(!ViewMaker::same_placed_texture(
+            &low,
+            &view(texture, 3, 0x2000_0000)
+        ));
         let mut wider = texture;
         wider[4] = 1024;
-        assert!(!same_placed_texture(&low, &view(wider, 3, 0x1000_0000)));
+        assert!(!ViewMaker::same_placed_texture(
+            &low,
+            &view(wider, 3, 0x1000_0000)
+        ));
         let mut buffer = texture;
         buffer[0] = 1;
-        assert!(!same_placed_texture(
+        assert!(!ViewMaker::same_placed_texture(
             &view(buffer, 3, 0x1000_0000),
             &view(buffer, 3, 0x1000_0000)
         ));
         let View::Placed(_, resource, desc) = low.clone() else {
             unreachable!()
         };
-        assert!(!same_placed_texture(
+        assert!(!ViewMaker::same_placed_texture(
             &low,
             &View::Placed(true, resource, desc)
         ));
-        assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+        assert!(!ViewMaker::same_placed_texture(
+            &low,
+            &View::Shader(0, None)
+        ));
     }
 
     #[cfg(feature = "diagnostics")]
@@ -3464,7 +3518,7 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return;
         };
-        let texture = magenta().expect("the texture");
+        let texture = ViewMaker::magenta().expect("the texture");
         unsafe {
             host.device
                 .CreateShaderResourceView(texture, None, heap.cpu(0))
@@ -3481,15 +3535,15 @@ mod tests {
             return;
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
-        null_for(&view, heap.cpu(0));
+        ViewMaker::null_for(&view, heap.cpu(0));
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     #[test]
     fn a_structured_view_made_raw_passes_the_host_check() {
-        let (first, count) = raw_window(32, 8, 100, 20).unwrap();
+        let (first, count) = BufferViews::raw_window(32, 8, 100, 20).unwrap();
         assert_eq!((first, count), (48, 500));
-        assert!(buffer_view_ok(
+        assert!(BufferViews::buffer_view_ok(
             DXGI_FORMAT_R32_TYPELESS,
             first,
             count,
@@ -3497,7 +3551,7 @@ mod tests {
             true,
             4096
         ));
-        assert!(!buffer_view_ok(
+        assert!(!BufferViews::buffer_view_ok(
             DXGI_FORMAT_UNKNOWN,
             first,
             count,
@@ -3505,7 +3559,7 @@ mod tests {
             true,
             4096
         ));
-        assert!(!buffer_view_ok(
+        assert!(!BufferViews::buffer_view_ok(
             DXGI_FORMAT_R32_TYPELESS,
             first,
             count,
@@ -3513,8 +3567,8 @@ mod tests {
             true,
             2000
         ));
-        assert!(raw_window(4, 0, 100, 20).is_none());
-        assert!(!buffer_view_ok(
+        assert!(BufferViews::raw_window(4, 0, 100, 20).is_none());
+        assert!(!BufferViews::buffer_view_ok(
             DXGI_FORMAT_R32_TYPELESS,
             0,
             0,
@@ -3522,25 +3576,32 @@ mod tests {
             true,
             4096
         ));
-        assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+        assert!(BufferViews::buffer_view_ok(
+            DXGI_FORMAT_UNKNOWN,
+            1,
+            10,
+            12,
+            false,
+            4096
+        ));
     }
 
     #[test]
     fn constant_views_are_whole_and_at_most_64_kib() {
-        assert_eq!(constant_size(1), 256);
-        assert_eq!(constant_size(256), 256);
-        assert_eq!(constant_size(65_536), 65_536);
-        assert_eq!(constant_size(969_472), 65_536);
-        assert_eq!(constant_size(u32::MAX), 65_536);
+        assert_eq!(BufferViews::constant_size(1), 256);
+        assert_eq!(BufferViews::constant_size(256), 256);
+        assert_eq!(BufferViews::constant_size(65_536), 65_536);
+        assert_eq!(BufferViews::constant_size(969_472), 65_536);
+        assert_eq!(BufferViews::constant_size(u32::MAX), 65_536);
     }
 
     #[test]
     fn views_past_the_end_are_cut_to_the_elements_inside() {
-        assert_eq!(elements_inside(0, 10, 16, 160), 10);
-        assert_eq!(elements_inside(4, 10, 16, 160), 6);
-        assert_eq!(elements_inside(4, 10, 16, 167), 6);
-        assert_eq!(elements_inside(10, 10, 16, 160), 10);
-        assert_eq!(elements_inside(0, 7, 4, 1 << 40), 7);
+        assert_eq!(BufferViews::elements_inside(0, 10, 16, 160), 10);
+        assert_eq!(BufferViews::elements_inside(4, 10, 16, 160), 6);
+        assert_eq!(BufferViews::elements_inside(4, 10, 16, 167), 6);
+        assert_eq!(BufferViews::elements_inside(10, 10, 16, 160), 10);
+        assert_eq!(BufferViews::elements_inside(0, 7, 4, 1 << 40), 7);
     }
 
     #[test]
@@ -3986,7 +4047,7 @@ mod tests {
         assert_eq!(recover(45), 0);
         assert!(heap.placed.lock().unwrap().displaced.is_empty());
         assert!(heap.kept.lock().unwrap()[1..=2].iter().all(Option::is_some));
-        assert!(device_removed().is_none());
+        assert!(HeapDiagnostics::device_removed().is_none());
     }
 
     #[test]
@@ -4020,8 +4081,8 @@ mod tests {
         assert_eq!(queued, 1);
         heap.texture_slot_done(1, write, None);
         assert_eq!(slots(u64::MAX), []);
-        remapped((at + 2 * len) as usize, 0x1000);
-        remapped(at as usize, 0x1000);
+        RemapLog::remapped((at + 2 * len) as usize, 0x1000);
+        RemapLog::remapped(at as usize, 0x1000);
         assert_eq!(heap.texture_slots_remapped(50), 1);
         assert_eq!(slots(50), []);
         assert_eq!(slots(51), [1]);
@@ -4047,7 +4108,7 @@ mod tests {
             [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0],
             [0; 16],
         );
-        assert!(is_texture_view(&texture));
+        assert!(BufferViews::is_texture_view(&texture));
         heap.queue_texture(2, true, false, frame);
         heap.queue_texture(3, true, false, frame);
         assert_eq!(slots(frame), [3, 2]);
@@ -4129,7 +4190,9 @@ mod tests {
         desc[5] = 1;
         desc[10] = address as u32;
         desc[11] = (address >> 32) as u32;
-        assert!(resident_sampled_texture(&View::Placed(false, resource, desc)).is_none());
+        assert!(
+            ViewMaker::resident_sampled_texture(&View::Placed(false, resource, desc)).is_none()
+        );
         assert!(crate::resource::PlacedTextures::placed_known(address, &resource).is_none());
         let texture = crate::resource::PlacedTextures::texture_at(address, &resource).unwrap();
         let heap = HostHeap::new(false, 4).unwrap();
@@ -4139,8 +4202,10 @@ mod tests {
         };
         let original = crate::resource::HostTextures::host_copy(texture).unwrap();
         desc[4] = 1;
-        let placed = resident_sampled_texture(&View::Placed(false, resource, desc)).unwrap();
-        let object = resident_sampled_texture(&View::Shader(texture as usize, None)).unwrap();
+        let placed =
+            ViewMaker::resident_sampled_texture(&View::Placed(false, resource, desc)).unwrap();
+        let object =
+            ViewMaker::resident_sampled_texture(&View::Shader(texture as usize, None)).unwrap();
         assert!(std::sync::Arc::ptr_eq(&original, &placed._gpu));
         assert!(std::sync::Arc::ptr_eq(&original, &object._gpu));
         let view = View::Placed(false, resource, desc);
@@ -4160,7 +4225,7 @@ mod tests {
                 .is_err()
         );
         assert!(crate::resource::PlacedTextures::placed_known(address, &other).is_none());
-        assert!(device_removed().is_none());
+        assert!(HeapDiagnostics::device_removed().is_none());
     }
 
     #[test]

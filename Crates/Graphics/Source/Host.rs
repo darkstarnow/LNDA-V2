@@ -4779,7 +4779,7 @@ impl Host {
                     }
                 }
                 text.push_str(&crate::shadow::ShadowRegistry::near(va));
-                text.push_str(&crate::descriptor::host::near_heaps(va));
+                text.push_str(&crate::descriptor::host::HeapDiagnostics::near_heaps(va));
             }
             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
