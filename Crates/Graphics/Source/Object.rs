@@ -115,6 +115,32 @@ pub(crate) fn hand_out<T>(
     answer(kind, iid, Some(Box::into_raw(object).cast()), out)
 }
 
+pub(crate) unsafe trait ComObject: Sized + 'static {
+    const KIND: usize;
+    const INTERFACES: &'static [Iid];
+
+    fn from_this<'a>(this: This) -> &'a Self {
+        unsafe { &*this.cast::<Self>() }
+    }
+
+    fn hand_out(self: Box<Self>, iid: *const Iid, out: *mut This) -> HRESULT {
+        hand_out(Self::KIND, self, iid, Self::INTERFACES, out)
+    }
+
+    extern "system" fn query_interface(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+        answer(
+            Self::KIND,
+            iid,
+            is(iid, Self::INTERFACES).then_some(this),
+            out,
+        )
+    }
+
+    extern "system" fn release(this: This) -> u32 {
+        release_boxed::<Self>(this)
+    }
+}
+
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
     let refs = &unsafe { &*this }.refs;
     match refs.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
@@ -183,6 +209,16 @@ pub(crate) const fn d3d12_object<const N: usize>(mut f: [*const (); N]) -> [*con
     f[3] = get_private_data as *const ();
     f[4] = set_private_data as *const ();
     f[6] = set_name as *const ();
+    f
+}
+
+pub(crate) const fn pageable_table<T: ComObject, const KIND: usize, const N: usize>()
+-> [*const (); N] {
+    assert!(KIND == T::KIND);
+    let mut f = d3d12_object(missing_table::<KIND, N>());
+    f[0] = T::query_interface as *const ();
+    f[2] = T::release as *const ();
+    f[7] = parent_device as *const ();
     f
 }
 

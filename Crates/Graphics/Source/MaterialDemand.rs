@@ -119,7 +119,7 @@ pub(crate) fn wants(heap: &Heap, offset: u32, fields: &'static [u32]) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     sampler.select(
-        crate::frame::current(),
+        crate::frame::FramePacer::frame(),
         (heap as *const Heap as usize, offset, fields),
     )
 }
@@ -190,7 +190,7 @@ pub(crate) fn record(
     if heap.handle(slot) != Some(handle) || !table.is_multiple_of(SLOT_BYTES) {
         return;
     }
-    let frame = crate::frame::current();
+    let frame = crate::frame::FramePacer::frame();
     let Some(ticket) = Ticket::take() else { return };
     let Some(host) = heap.host() else { return };
     let stamp = host.material_write_stamp();
@@ -229,7 +229,7 @@ pub(crate) fn record(
     list.keep(&source.buffer);
     RECORDED.fetch_add(1, Ordering::Relaxed);
     list.defer_after(move || {
-        if !ticket.finish() || frame.abs_diff(crate::frame::current()) > MAX_AGE {
+        if !ticket.finish() || frame.abs_diff(crate::frame::FramePacer::frame()) > MAX_AGE {
             return;
         }
         let Some(mailbox) = mailbox.upgrade() else {

@@ -1287,7 +1287,7 @@ impl State {
             return Some(gpu);
         }
         list.keep(strides);
-        let frame = crate::frame::current();
+        let frame = crate::frame::FramePacer::frame();
         let mut pass = host.buffer_pass.lock().unwrap_or_else(|e| e.into_inner());
         if pass.frame == Some(frame) {
             return Some(gpu);
@@ -1411,7 +1411,7 @@ impl State {
                 .any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static BAKED_MS: AtomicU64 = AtomicU64::new(0);
-        let frame = crate::frame::current();
+        let frame = crate::frame::FramePacer::frame();
         let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
             BAKED_MS.store(0, Ordering::Relaxed);
@@ -1544,7 +1544,7 @@ impl State {
         }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
-        let frame = crate::frame::current();
+        let frame = crate::frame::FramePacer::frame();
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
         }
@@ -2227,7 +2227,9 @@ impl State {
             .take(90)
             .collect();
         let queue = match heap.host() {
-            Some(h) => h.texture_slot_state(index, crate::frame::current(), title.as_ref()),
+            Some(h) => {
+                h.texture_slot_state(index, crate::frame::FramePacer::frame(), title.as_ref())
+            }
             None => "no host heap".into(),
         };
         format!(
@@ -2300,7 +2302,7 @@ impl State {
         type Census = (u64, std::collections::BTreeMap<[i32; 4], u32>, [u32; 9]);
         static CENSUS: std::sync::Mutex<Census> =
             std::sync::Mutex::new((u64::MAX, std::collections::BTreeMap::new(), [0; 9]));
-        let frame = crate::frame::current();
+        let frame = crate::frame::FramePacer::frame();
         let mut census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
         if census.0 != frame {
             let draws: u32 = census.1.values().sum();

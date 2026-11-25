@@ -59,7 +59,7 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    (crate::frame::FramePacer::frame() << 32) | ((now_ms() / 100) & 0xffff_ffff)
 }
 
 pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
@@ -2426,7 +2426,7 @@ fn read_backs(list: &HostList) {
                         *row & !3,
                     );
                     tracing::info!(
-                        frame = crate::frame::current(),
+                        frame = crate::frame::FramePacer::frame(),
                         to = format_args!("{:#x}", *at),
                         bytes = *row,
                         values = ?&values[..*row / 4],
@@ -2472,7 +2472,7 @@ pub(crate) fn walls_landed(
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(Landings::default)
         .add(
-            crate::frame::current(),
+            crate::frame::FramePacer::frame(),
             kind,
             at,
             len,
@@ -3370,7 +3370,7 @@ impl Host {
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                 Late::Signal(fence, value) => {
-                    crate::fence::set(fence as crate::object::This, value)
+                    crate::fence::Fence::advance(fence as crate::object::This, value)
                 }
             }
         }
@@ -3786,7 +3786,7 @@ impl Host {
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                     Late::Signal(fence, value) => {
-                        crate::fence::set(fence as crate::object::This, value)
+                        crate::fence::Fence::advance(fence as crate::object::This, value)
                     }
                 }
             }
@@ -4903,7 +4903,7 @@ impl HostList {
         [row, rows, pitch]: [usize; 3],
         source: crate::object::This,
     ) {
-        let recorded = crate::frame::current();
+        let recorded = crate::frame::FramePacer::frame();
         self.deferred().backs.push((
             buffer,
             dst as usize,
@@ -5818,7 +5818,7 @@ impl Meter {
 
     fn frame(&mut self, hwnd: HWND) {
         #[cfg(feature = "diagnostics")]
-        tracing::debug!(target: "leonida_graphics::frame", token = crate::frame::current(), "present");
+        tracing::debug!(target: "leonida_graphics::frame", token = crate::frame::FramePacer::frame(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
@@ -6322,7 +6322,7 @@ impl Host {
                 "the system changed the budget of the card's memory from {} MB to {} MB (frame {}); at the last look {} MB of the card's and {} MB of the PC's shared memory were in use",
                 last[0] >> 20,
                 own.Budget >> 20,
-                crate::frame::current(),
+                crate::frame::FramePacer::frame(),
                 last[1] >> 20,
                 last[2] >> 20
             );

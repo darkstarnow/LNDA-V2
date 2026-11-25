@@ -576,7 +576,7 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let frame = crate::frame::current();
+            let frame = crate::frame::FramePacer::frame();
             let turn = frame
                 .wrapping_add((start >> 16) as u64)
                 .is_multiple_of(HASH_EVERY);
@@ -596,7 +596,7 @@ impl Staging {
             waited(2, || crate::watch::title_memory_reading_range(start..end))
         };
         if !committed(self.memory, size) {
-            let frame = crate::frame::current();
+            let frame = crate::frame::FramePacer::frame();
             if last.partial.is_some_and(|at| frame < at + 30) {
                 return 0;
             }
@@ -659,7 +659,7 @@ impl Staging {
     }
 
     fn unseen_write(&self, last: &mut Last) {
-        let frame = crate::frame::current();
+        let frame = crate::frame::FramePacer::frame();
         let more = if frame < last.unguarded { 120 } else { 16 };
         #[cfg(feature = "diagnostics")]
         {

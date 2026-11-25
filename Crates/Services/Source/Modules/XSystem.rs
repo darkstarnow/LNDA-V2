@@ -92,7 +92,7 @@ extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut Anal
         os: OS,
         hosting_os: OS,
         family: text("Xbox"),
-        form: text(leonida_graphics::console::current().name()),
+        form: text(leonida_graphics::console::Console::current().name()),
     };
     unsafe { out.write(info) };
     out
@@ -120,7 +120,7 @@ mod device_type {
 
     use std::ffi::c_void;
 
-    use leonida_graphics::console::{self, Console};
+    use leonida_graphics::console::Console;
 
     use crate::modules::files::host;
     use crate::{ServiceModule, service_export};
@@ -226,9 +226,9 @@ mod device_type {
                 return MORE_DATA;
             }
             data.cast::<u32>()
-                .write_unaligned(console_mode(console::current()));
+                .write_unaligned(console_mode(Console::current()));
         }
-        tracing::debug!(console = console::current().name(), "device type read");
+        tracing::debug!(console = Console::current().name(), "device type read");
         SUCCESS
     }
 
@@ -281,7 +281,7 @@ mod device_type {
             };
             assert_eq!(query(&mut value, &mut size, &mut kind), SUCCESS);
             assert_eq!((kind, size), (DWORD, 4));
-            assert_eq!(value, console_mode(console::current()));
+            assert_eq!(value, console_mode(Console::current()));
             let mut small = 2;
             assert_eq!(query(&mut value, &mut small, &mut kind), MORE_DATA);
             assert_eq!(small, 4);

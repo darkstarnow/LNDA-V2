@@ -361,7 +361,7 @@ pub(crate) fn bound(this: This) {
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let frame = crate::frame::current();
+    let frame = crate::frame::FramePacer::frame();
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }

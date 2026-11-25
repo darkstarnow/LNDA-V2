@@ -59,13 +59,14 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     leonida_services::modules::files::mount_at('T', &temp);
     leonida_services::runtime::set_title(leonida_services::runtime::Title { storage, ..title });
-    leonida_services::console::set(match console {
+    match console {
         Console::SeriesX => leonida_services::console::Console::SeriesX,
         Console::SeriesS => leonida_services::console::Console::SeriesS,
-    });
+    }
+    .activate();
     println!(
         "console        {}",
-        leonida_services::console::current().name()
+        leonida_services::console::Console::current().name()
     );
     let dlls = leonida_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {

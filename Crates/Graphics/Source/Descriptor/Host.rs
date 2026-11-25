@@ -1459,7 +1459,7 @@ impl HostHeap {
     }
 
     pub(crate) fn texture_slot_tabled(&self, index: u32, read: bool) {
-        self.tabled_in(index, read, crate::frame::current());
+        self.tabled_in(index, read, crate::frame::FramePacer::frame());
     }
 
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
@@ -1549,10 +1549,11 @@ impl HostHeap {
             }
             _ => false,
         };
-        self.queue_texture(index, texture, seen, crate::frame::current());
+        self.queue_texture(index, texture, seen, crate::frame::FramePacer::frame());
         let placed_view = match view {
             Some(View::Placed(false, resource, desc))
-                if resource[0] != 1 && !self.tabled_lately(index, crate::frame::current()) =>
+                if resource[0] != 1
+                    && !self.tabled_lately(index, crate::frame::FramePacer::frame()) =>
             {
                 let first = crate::resource::first_mip(desc);
                 Some((

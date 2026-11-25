@@ -1,6 +1,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
+use crate::object::{
+    self, ComObject, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid,
+};
 use crate::resource::PAGEABLE_IIDS;
 
 const HEAP_IIDS: [Iid; 4] = [
@@ -24,44 +26,36 @@ pub(crate) struct Desc {
 }
 
 #[repr(C)]
-struct Heap {
+pub(crate) struct QueryHeap {
     object: Object,
     desc: Desc,
 }
 
-pub(crate) extern "system" fn create(
-    _: This,
-    desc: *const Desc,
-    iid: *const Iid,
-    out: *mut This,
-) -> HRESULT {
-    let Some(&desc) = (unsafe { desc.as_ref() }) else {
-        return E_INVALIDARG;
-    };
-    tracing::debug!(?desc, "query heap");
-    let heap = Box::new(Heap {
-        object: Object::new(&FUNCTIONS),
-        desc,
-    });
-    object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out)
+unsafe impl ComObject for QueryHeap {
+    const KIND: usize = QUERY_HEAP;
+    const INTERFACES: &'static [Iid] = &HEAP_IIDS;
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    object::answer(
-        QUERY_HEAP,
-        iid,
-        object::is(iid, &HEAP_IIDS).then_some(this),
-        out,
-    )
-}
-extern "system" fn release(this: This) -> u32 {
-    object::release_boxed::<Heap>(this)
+impl QueryHeap {
+    fn new(desc: Desc) -> Box<Self> {
+        Box::new(Self {
+            object: Object::new(&FUNCTIONS),
+            desc,
+        })
+    }
+
+    pub(crate) extern "system" fn create(
+        _: This,
+        desc: *const Desc,
+        iid: *const Iid,
+        out: *mut This,
+    ) -> HRESULT {
+        let Some(&desc) = (unsafe { desc.as_ref() }) else {
+            return E_INVALIDARG;
+        };
+        tracing::debug!(?desc, "query heap");
+        Self::new(desc).hand_out(iid, out)
+    }
 }
 
-static FUNCTIONS: Table<24> = {
-    let mut f = object::d3d12_object(object::missing_table::<QUERY_HEAP, 24>());
-    f[0] = query as *const ();
-    f[2] = release as *const ();
-    f[7] = object::parent_device as *const ();
-    Table(f)
-};
+static FUNCTIONS: Table<24> = Table(object::pageable_table::<QueryHeap, QUERY_HEAP, 24>());

@@ -4,7 +4,8 @@ use std::ffi::{CStr, c_void};
 use std::sync::OnceLock;
 
 use crate::object::{
-    self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, ROOT_SIGNATURE, Table, This, guid,
+    self, ComObject, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, ROOT_SIGNATURE, Table, This,
+    guid,
 };
 use crate::resource::PAGEABLE_IIDS;
 
@@ -42,155 +43,172 @@ type Serialize =
     unsafe extern "system" fn(*const Desc, u32, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
 type SerializeVersioned =
     unsafe extern "system" fn(*const VersionedDesc, *mut *mut c_void, *mut *mut c_void) -> HRESULT;
-
-fn host_export(cache: &OnceLock<Option<usize>>, name: &CStr) -> Option<usize> {
-    *cache.get_or_init(|| {
-        #[cfg(windows)]
-        {
-            use windows_sys::Win32::System::LibraryLoader::{
-                GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
-            };
-            let dll: Vec<u16> = "d3d12.dll".encode_utf16().chain([0]).collect();
-            let module = unsafe {
-                LoadLibraryExW(
-                    dll.as_ptr(),
-                    std::ptr::null_mut(),
-                    LOAD_LIBRARY_SEARCH_SYSTEM32,
-                )
-            };
-            if module.is_null() {
-                return None;
-            }
-            unsafe { GetProcAddress(module, name.as_ptr().cast()) }.map(|f| f as usize)
-        }
-        #[cfg(not(windows))]
-        None
-    })
-}
-
-fn without_console_flags(desc: Desc) -> Desc {
-    if desc.flags & CONSOLE_FLAGS != 0 {
-        tracing::debug!(
-            flags = format_args!("{:#x}", desc.flags),
-            "console root signature flags dropped"
-        );
-    }
-    Desc {
-        flags: desc.flags & !CONSOLE_FLAGS,
-        ..desc
-    }
-}
-
-pub extern "system" fn serialize(
-    desc: *const Desc,
-    version: u32,
-    blob: *mut *mut c_void,
-    error: *mut *mut c_void,
-) -> HRESULT {
-    let Some(&desc) = (unsafe { desc.as_ref() }) else {
-        return E_INVALIDARG;
-    };
-    static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
-    let Some(address) = host_export(&FUNCTION, c"D3D12SerializeRootSignature") else {
-        tracing::warn!("no host d3d12.dll to serialize root signatures");
-        return E_NOTIMPL;
-    };
-    unsafe {
-        std::mem::transmute::<usize, Serialize>(address)(
-            &without_console_flags(desc),
-            version,
-            blob,
-            error,
-        )
-    }
-}
-
-pub extern "system" fn serialize_versioned(
-    desc: *const VersionedDesc,
-    blob: *mut *mut c_void,
-    error: *mut *mut c_void,
-) -> HRESULT {
-    let Some(&desc) = (unsafe { desc.as_ref() }) else {
-        return E_INVALIDARG;
-    };
-    static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
-    let Some(address) = host_export(&FUNCTION, c"D3D12SerializeVersionedRootSignature") else {
-        tracing::warn!("no host d3d12.dll to serialize root signatures");
-        return E_NOTIMPL;
-    };
-    let desc = VersionedDesc {
-        desc: without_console_flags(desc.desc),
-        ..desc
-    };
-    unsafe { std::mem::transmute::<usize, SerializeVersioned>(address)(&desc, blob, error) }
-}
-
 type Deserialize =
     unsafe extern "system" fn(*const u8, usize, *const Iid, *mut *mut c_void) -> HRESULT;
 
-pub extern "system" fn create_deserializer(
-    blob: *const u8,
-    size: usize,
-    iid: *const Iid,
-    out: *mut *mut c_void,
-) -> HRESULT {
-    if blob.is_null() || out.is_null() {
-        return E_INVALIDARG;
+impl Desc {
+    fn without_console_flags(self) -> Self {
+        if self.flags & CONSOLE_FLAGS != 0 {
+            tracing::debug!(
+                flags = format_args!("{:#x}", self.flags),
+                "console root signature flags dropped"
+            );
+        }
+        Self {
+            flags: self.flags & !CONSOLE_FLAGS,
+            ..self
+        }
     }
-    static FUNCTION: OnceLock<Option<usize>> = OnceLock::new();
-    let Some(address) = host_export(&FUNCTION, c"D3D12CreateRootSignatureDeserializer") else {
-        tracing::warn!("no host d3d12.dll to deserialize root signatures");
-        return E_NOTIMPL;
-    };
-    unsafe { std::mem::transmute::<usize, Deserialize>(address)(blob, size, iid, out) }
+}
+
+struct HostExport {
+    name: &'static CStr,
+    address: OnceLock<Option<usize>>,
+}
+
+impl HostExport {
+    const fn new(name: &'static CStr) -> Self {
+        Self {
+            name,
+            address: OnceLock::new(),
+        }
+    }
+
+    fn address(&self) -> Option<usize> {
+        let address = *self.address.get_or_init(|| self.resolve());
+        if address.is_none() {
+            tracing::warn!(export = ?self.name, "no host d3d12.dll for root signatures");
+        }
+        address
+    }
+
+    #[cfg(windows)]
+    fn resolve(&self) -> Option<usize> {
+        use windows_sys::Win32::System::LibraryLoader::{
+            GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+        };
+        let dll: Vec<u16> = "d3d12.dll".encode_utf16().chain([0]).collect();
+        let module = unsafe {
+            LoadLibraryExW(
+                dll.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if module.is_null() {
+            return None;
+        }
+        unsafe { GetProcAddress(module, self.name.as_ptr().cast()) }.map(|f| f as usize)
+    }
+
+    #[cfg(not(windows))]
+    fn resolve(&self) -> Option<usize> {
+        None
+    }
+}
+
+static SERIALIZE: HostExport = HostExport::new(c"D3D12SerializeRootSignature");
+static SERIALIZE_VERSIONED: HostExport = HostExport::new(c"D3D12SerializeVersionedRootSignature");
+static DESERIALIZE: HostExport = HostExport::new(c"D3D12CreateRootSignatureDeserializer");
+
+pub struct RootSerializer;
+
+impl RootSerializer {
+    pub extern "system" fn serialize(
+        desc: *const Desc,
+        version: u32,
+        blob: *mut *mut c_void,
+        error: *mut *mut c_void,
+    ) -> HRESULT {
+        let Some(&desc) = (unsafe { desc.as_ref() }) else {
+            return E_INVALIDARG;
+        };
+        let Some(address) = SERIALIZE.address() else {
+            return E_NOTIMPL;
+        };
+        let host = unsafe { std::mem::transmute::<usize, Serialize>(address) };
+        unsafe { host(&desc.without_console_flags(), version, blob, error) }
+    }
+
+    pub extern "system" fn serialize_versioned(
+        desc: *const VersionedDesc,
+        blob: *mut *mut c_void,
+        error: *mut *mut c_void,
+    ) -> HRESULT {
+        let Some(&desc) = (unsafe { desc.as_ref() }) else {
+            return E_INVALIDARG;
+        };
+        let Some(address) = SERIALIZE_VERSIONED.address() else {
+            return E_NOTIMPL;
+        };
+        let desc = VersionedDesc {
+            desc: desc.desc.without_console_flags(),
+            ..desc
+        };
+        let host = unsafe { std::mem::transmute::<usize, SerializeVersioned>(address) };
+        unsafe { host(&desc, blob, error) }
+    }
+
+    pub extern "system" fn create_deserializer(
+        blob: *const u8,
+        size: usize,
+        iid: *const Iid,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
+        if blob.is_null() || out.is_null() {
+            return E_INVALIDARG;
+        }
+        let Some(address) = DESERIALIZE.address() else {
+            return E_NOTIMPL;
+        };
+        let host = unsafe { std::mem::transmute::<usize, Deserialize>(address) };
+        unsafe { host(blob, size, iid, out) }
+    }
 }
 
 #[repr(C)]
-struct RootSignature {
+pub(crate) struct RootSignature {
     object: Object,
     blob: Vec<u8>,
 }
 
-pub(crate) extern "system" fn create(
-    _: This,
-    _nodes: u32,
-    blob: *const u8,
-    size: usize,
-    iid: *const Iid,
-    out: *mut This,
-) -> HRESULT {
-    if blob.is_null() || size == 0 {
-        return E_INVALIDARG;
+unsafe impl ComObject for RootSignature {
+    const KIND: usize = ROOT_SIGNATURE;
+    const INTERFACES: &'static [Iid] = &ROOT_SIGNATURE_IIDS;
+}
+
+impl RootSignature {
+    fn new(blob: Vec<u8>) -> Box<Self> {
+        Box::new(Self {
+            object: Object::new(&FUNCTIONS),
+            blob,
+        })
     }
-    let blob = unsafe { std::slice::from_raw_parts(blob, size) }.to_vec();
-    tracing::debug!(size, "root signature");
-    let root = Box::new(RootSignature {
-        object: Object::new(&FUNCTIONS),
-        blob,
-    });
-    object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
+
+    pub(crate) extern "system" fn create(
+        _: This,
+        _nodes: u32,
+        blob: *const u8,
+        size: usize,
+        iid: *const Iid,
+        out: *mut This,
+    ) -> HRESULT {
+        if blob.is_null() || size == 0 {
+            return E_INVALIDARG;
+        }
+        tracing::debug!(size, "root signature");
+        Self::new(unsafe { std::slice::from_raw_parts(blob, size) }.to_vec()).hand_out(iid, out)
+    }
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    let found = object::is(iid, &ROOT_SIGNATURE_IIDS).then_some(this);
-    object::answer(ROOT_SIGNATURE, iid, found, out)
-}
-extern "system" fn release(this: This) -> u32 {
-    object::release_boxed::<RootSignature>(this)
-}
-
-static FUNCTIONS: Table<24> = {
-    let mut f = object::d3d12_object(object::missing_table::<ROOT_SIGNATURE, 24>());
-    f[0] = query as *const ();
-    f[2] = release as *const ();
-    f[7] = object::parent_device as *const ();
-    Table(f)
-};
+static FUNCTIONS: Table<24> = Table(object::pageable_table::<RootSignature, ROOT_SIGNATURE, 24>());
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    use RootSerializer as Host;
 
     #[cfg(windows)]
     #[test]
@@ -218,7 +236,7 @@ mod tests {
             flags: 0x0100_0001,
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(serialize(&desc, 1, &mut blob, &mut error), S_OK);
+        assert_eq!(Host::serialize(&desc, 1, &mut blob, &mut error), S_OK);
         let blob = blob.cast_const().cast::<Object>();
         let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
         let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
@@ -226,7 +244,7 @@ mod tests {
         let null = std::ptr::null();
         let mut root = null;
         assert_eq!(
-            create(null, 0, data, size, &ROOT_SIGNATURE_IIDS[0], &mut root),
+            RootSignature::create(null, 0, data, size, &ROOT_SIGNATURE_IIDS[0], &mut root),
             S_OK
         );
         assert_eq!(slot::<extern "system" fn(This) -> u32>(root, 0x10)(root), 0);
@@ -249,7 +267,10 @@ mod tests {
             },
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(serialize_versioned(&desc, &mut blob, &mut error), S_OK);
+        assert_eq!(
+            Host::serialize_versioned(&desc, &mut blob, &mut error),
+            S_OK
+        );
         let blob = blob.cast_const().cast::<Object>();
         let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
         let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
@@ -261,7 +282,7 @@ mod tests {
             iid[8..16].try_into().unwrap(),
         );
         let mut out = std::ptr::null_mut();
-        assert_eq!(create_deserializer(data, size, &iid, &mut out), S_OK);
+        assert_eq!(Host::create_deserializer(data, size, &iid, &mut out), S_OK);
         let deserializer = unsafe { ID3D12RootSignatureDeserializer::from_raw(out) };
         let read = unsafe { &*deserializer.GetRootSignatureDesc() };
         assert_eq!((read.NumParameters, read.Flags.0), (0, 1));
@@ -282,12 +303,15 @@ mod tests {
             },
         };
         let (mut blob, mut error) = (std::ptr::null_mut(), std::ptr::null_mut());
-        assert_eq!(serialize_versioned(&desc, &mut blob, &mut error), S_OK);
+        assert_eq!(
+            Host::serialize_versioned(&desc, &mut blob, &mut error),
+            S_OK
+        );
         let blob = blob.cast_const().cast::<Object>();
         assert!(slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob) > 0);
         slot::<extern "system" fn(This) -> u32>(blob, 0x10)(blob);
         assert_eq!(
-            serialize_versioned(std::ptr::null(), &mut blob.cast_mut().cast(), &mut error),
+            Host::serialize_versioned(std::ptr::null(), &mut blob.cast_mut().cast(), &mut error),
             E_INVALIDARG
         );
     }

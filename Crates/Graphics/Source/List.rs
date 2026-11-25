@@ -1471,7 +1471,7 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
-    let Some((stride, args)) = crate::signature::layout(signature) else {
+    let Some((stride, args)) = crate::signature::CommandSignature::layout(signature) else {
         #[cfg(windows)]
         if max != 0 {
             with_state(this, |_, state| state.invalid_indirect());

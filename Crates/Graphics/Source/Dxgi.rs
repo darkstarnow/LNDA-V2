@@ -135,7 +135,7 @@ extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) ->
     for (slot, unit) in name.iter_mut().zip("Leonida console GPU".encode_utf16()) {
         *slot = unit;
     }
-    let (gpu_optimal, standard) = crate::console::current().title_memory();
+    let (gpu_optimal, standard) = crate::console::Console::current().title_memory();
     let description = AdapterDescription {
         name,
         vendor: AMD,

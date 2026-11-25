@@ -2240,7 +2240,7 @@ impl Shadow {
         }
         static SEEN: Mutex<(u64, BTreeMap<u64, (u64, u32, u64, u64)>)> =
             Mutex::new((0, BTreeMap::new()));
-        let frame = crate::frame::current();
+        let frame = crate::frame::FramePacer::frame();
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if seen.0 != frame {
             let buffers: Vec<String> = seen

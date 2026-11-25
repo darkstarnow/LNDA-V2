@@ -196,7 +196,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        wait(p, crate::frame::FramePacer::frame());
     }
     p.made.get()?.as_ref()
 }

@@ -248,7 +248,7 @@ pub(crate) fn release_held(all: bool) {
                 match held.first() {
                     None => break,
                     Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                        if !all && crate::fence::Fence::completed(fence as This) < value =>
                     {
                         break;
                     }
@@ -325,7 +325,7 @@ pub(crate) fn release_held(all: bool) {
                     }
                     Held::Signal(fence, value) => {
                         if !crate::host::late_signal(fence, value) {
-                            crate::fence::set(fence as This, value);
+                            crate::fence::Fence::advance(fence as This, value);
                         }
                     }
                 }
@@ -519,7 +519,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return S_OK;
     }
     let _ = this;
-    crate::fence::signal(fence, value)
+    crate::fence::Fence::signal(fence, value)
 }
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
@@ -527,7 +527,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(windows)]
     if !this.is_null() {
-        let now = crate::fence::completed(fence);
+        let now = crate::fence::Fence::completed(fence);
         {
             static CALLS: AtomicU64 = AtomicU64::new(0);
             if CALLS.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -875,7 +875,7 @@ mod tests {
         let mut fence = null;
         let fence_iid = &crate::fence::FENCE_IIDS[0];
         assert_eq!(
-            crate::fence::create(null, 0, 0, fence_iid, &mut fence),
+            crate::fence::Fence::create(null, 0, 0, fence_iid, &mut fence),
             S_OK
         );
         let signal = slot::<extern "system" fn(This, This, u64) -> HRESULT>(q, signal_slot(q));

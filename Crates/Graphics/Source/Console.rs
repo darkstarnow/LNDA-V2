@@ -27,15 +27,17 @@ impl Console {
 
 static SERIES_S: AtomicBool = AtomicBool::new(false);
 
-pub fn set(console: Console) {
-    leonida_formats::texture::set_series_s_tiling(console == Console::SeriesS);
-    SERIES_S.store(console == Console::SeriesS, Ordering::Relaxed);
-}
+impl Console {
+    pub fn activate(self) {
+        leonida_formats::texture::set_series_s_tiling(self == Console::SeriesS);
+        SERIES_S.store(self == Console::SeriesS, Ordering::Relaxed);
+    }
 
-pub fn current() -> Console {
-    if SERIES_S.load(Ordering::Relaxed) {
-        Console::SeriesS
-    } else {
-        Console::SeriesX
+    pub fn current() -> Self {
+        if SERIES_S.load(Ordering::Relaxed) {
+            Console::SeriesS
+        } else {
+            Console::SeriesX
+        }
     }
 }

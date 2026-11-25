@@ -1,7 +1,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{
-    self, COMMAND_SIGNATURE, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid,
+    self, COMMAND_SIGNATURE, ComObject, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid,
 };
 use crate::resource::PAGEABLE_IIDS;
 
@@ -25,60 +25,67 @@ pub(crate) struct Desc {
     nodes: u32,
 }
 
+impl Desc {
+    fn arguments(&self) -> Option<Vec<[u32; 4]>> {
+        match (self.count, self.arguments.is_null()) {
+            (0, _) => Some(Vec::new()),
+            (_, true) => None,
+            (count, false) => {
+                Some(unsafe { std::slice::from_raw_parts(self.arguments, count as usize) }.to_vec())
+            }
+        }
+    }
+}
+
 #[repr(C)]
-struct Signature {
+pub(crate) struct CommandSignature {
     object: Object,
     stride: u32,
     arguments: Vec<[u32; 4]>,
 }
 
-pub(crate) extern "system" fn create(
-    _: This,
-    desc: *const Desc,
-    _root: This,
-    iid: *const Iid,
-    out: *mut This,
-) -> HRESULT {
-    let Some(desc) = (unsafe { desc.as_ref() }) else {
-        return E_INVALIDARG;
-    };
-    if desc.arguments.is_null() && desc.count > 0 {
-        return E_INVALIDARG;
+unsafe impl ComObject for CommandSignature {
+    const KIND: usize = COMMAND_SIGNATURE;
+    const INTERFACES: &'static [Iid] = &SIGNATURE_IIDS;
+}
+
+impl CommandSignature {
+    fn new(stride: u32, arguments: Vec<[u32; 4]>) -> Box<Self> {
+        Box::new(Self {
+            object: Object::new(&FUNCTIONS),
+            stride,
+            arguments,
+        })
     }
-    let arguments = if desc.count == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(desc.arguments, desc.count as usize) }.to_vec()
-    };
-    tracing::debug!(stride = desc.stride, ?arguments, "command signature");
-    let signature = Box::new(Signature {
-        object: Object::new(&FUNCTIONS),
-        stride: desc.stride,
-        arguments,
-    });
-    object::hand_out(COMMAND_SIGNATURE, signature, iid, &SIGNATURE_IIDS, out)
-}
 
-pub(crate) fn layout<'a>(this: This) -> Option<(u32, &'a [[u32; 4]])> {
-    if this.is_null() {
-        return None;
+    pub(crate) fn layout<'a>(this: This) -> Option<(u32, &'a [[u32; 4]])> {
+        if this.is_null() {
+            return None;
+        }
+        let signature = Self::from_this(this);
+        Some((signature.stride, &signature.arguments))
     }
-    let s = unsafe { &*this.cast::<Signature>() };
-    Some((s.stride, &s.arguments))
+
+    pub(crate) extern "system" fn create(
+        _: This,
+        desc: *const Desc,
+        _root: This,
+        iid: *const Iid,
+        out: *mut This,
+    ) -> HRESULT {
+        let Some(desc) = (unsafe { desc.as_ref() }) else {
+            return E_INVALIDARG;
+        };
+        let Some(arguments) = desc.arguments() else {
+            return E_INVALIDARG;
+        };
+        tracing::debug!(stride = desc.stride, ?arguments, "command signature");
+        Self::new(desc.stride, arguments).hand_out(iid, out)
+    }
 }
 
-extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    let found = object::is(iid, &SIGNATURE_IIDS).then_some(this);
-    object::answer(COMMAND_SIGNATURE, iid, found, out)
-}
-extern "system" fn release(this: This) -> u32 {
-    object::release_boxed::<Signature>(this)
-}
-
-static FUNCTIONS: Table<24> = {
-    let mut f = object::d3d12_object(object::missing_table::<COMMAND_SIGNATURE, 24>());
-    f[0] = query as *const ();
-    f[2] = release as *const ();
-    f[7] = object::parent_device as *const ();
-    Table(f)
-};
+static FUNCTIONS: Table<24> = Table(object::pageable_table::<
+    CommandSignature,
+    COMMAND_SIGNATURE,
+    24,
+>());

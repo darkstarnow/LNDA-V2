@@ -978,7 +978,7 @@ mod tests {
         let _frame_guard = crate::frame::TEST_FRAME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let frame = crate::frame::current();
+        let frame = crate::frame::FramePacer::frame();
         let clear = |s| create_cbv(null, &[0x400, 6, 256, 0], heap.handle(s).unwrap());
         put(1, addr, 4);
         let stamp = host.material_write_stamp();
@@ -1130,7 +1130,7 @@ mod tests {
         let _frame_guard = crate::frame::TEST_FRAME_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let frame = crate::frame::current();
+        let frame = crate::frame::FramePacer::frame();
         let stamp = host.material_write_stamp();
         let write = host.demand_material_texture(heap, 3, stamp, frame).unwrap();
         let list = device.new_list().unwrap();

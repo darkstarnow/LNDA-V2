@@ -423,7 +423,7 @@ pub(crate) fn ready(
     let before = m.copies.len();
     let skipped_before = m.speculative_skips;
     m.reconcile()?;
-    let frame = crate::frame::current();
+    let frame = crate::frame::FramePacer::frame();
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();

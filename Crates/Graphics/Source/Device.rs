@@ -326,7 +326,7 @@ static FUNCTIONS: Table<160> = {
     f[13] = check_feature_support as *const ();
     f[14] = descriptor::create_heap as *const ();
     f[15] = descriptor::increment_size as *const ();
-    f[16] = root::create as *const ();
+    f[16] = root::RootSignature::create as *const ();
     f[17] = descriptor::create_cbv as *const ();
     f[18] = descriptor::create_srv as *const ();
     f[19] = descriptor::create_uav as *const ();
@@ -340,10 +340,10 @@ static FUNCTIONS: Table<160> = {
     f[27] = resource::create_committed as *const ();
     f[28] = resource::create_heap as *const ();
     f[29] = resource::create_placed as *const ();
-    f[36] = fence::create as *const ();
+    f[36] = fence::Fence::create as *const ();
     f[38] = resource::copyable_footprints as *const ();
-    f[39] = query::create as *const ();
-    f[41] = signature::create as *const ();
+    f[39] = query::QueryHeap::create as *const ();
+    f[41] = signature::CommandSignature::create as *const ();
     f[48] = queue::create_x as *const ();
     f[57] = unknown_pipeline::<0x1c8> as *const ();
     f[61] = descriptor::create_sampler_x as *const ();
@@ -356,10 +356,10 @@ static FUNCTIONS: Table<160> = {
     f[74] = resource::register_page_pool as *const ();
     f[75] = resource::unregister_page_pool as *const ();
     f[76] = resource::create_committed as *const ();
-    f[78] = frame::set_interval as *const ();
-    f[79] = frame::schedule as *const ();
-    f[80] = frame::wait as *const ();
-    f[81] = frame::statistics as *const ();
+    f[78] = frame::FramePacer::set_interval as *const ();
+    f[79] = frame::FramePacer::schedule as *const ();
+    f[80] = frame::FramePacer::wait as *const ();
+    f[81] = frame::FramePacer::statistics as *const ();
     f[86] = pipeline::create_stream as *const ();
     f[108] = resource::allocation_info2 as *const ();
     f[127] = resource::create_committed3 as *const ();
@@ -411,7 +411,7 @@ mod tests {
         let fence_iid = &crate::fence::FENCE_IIDS[0];
         let mut fence = std::ptr::null();
         assert_eq!(
-            crate::fence::create(std::ptr::null(), 0, 0, fence_iid, &mut fence),
+            crate::fence::Fence::create(std::ptr::null(), 0, 0, fence_iid, &mut fence),
             S_OK
         );
         let get_device = slot::<Get>(fence, 0x38);

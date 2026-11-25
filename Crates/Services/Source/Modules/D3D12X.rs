@@ -55,15 +55,17 @@ pub(crate) fn module() -> ServiceModule {
             },
             ServiceExport {
                 name: "D3D12SerializeRootSignature",
-                address: leonida_graphics::root::serialize as *const () as usize,
+                address: leonida_graphics::root::RootSerializer::serialize as *const () as usize,
             },
             ServiceExport {
                 name: "D3D12SerializeVersionedRootSignature",
-                address: leonida_graphics::root::serialize_versioned as *const () as usize,
+                address: leonida_graphics::root::RootSerializer::serialize_versioned as *const ()
+                    as usize,
             },
             ServiceExport {
                 name: "D3D12CreateRootSignatureDeserializer",
-                address: leonida_graphics::root::create_deserializer as *const () as usize,
+                address: leonida_graphics::root::RootSerializer::create_deserializer as *const ()
+                    as usize,
             },
             ServiceExport {
                 name: "IID_ID3D12Device",
