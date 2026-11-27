@@ -49,7 +49,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
-pub use lower::{host_max_wave, set_host_max_wave};
+pub use lower::{host_max_wave, host_min_wave, set_host_max_wave, set_host_wave_range};
 pub use sampler::StaticSampler;
 
 pub use rect::rect_list_gs;

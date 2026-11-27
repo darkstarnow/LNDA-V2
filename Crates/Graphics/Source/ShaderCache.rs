@@ -58,6 +58,7 @@ impl ShaderCache {
                 limit,
                 leonida_shader::emit::view_heap_limit(),
                 leonida_shader::emit::host_max_wave(),
+                leonida_shader::emit::host_min_wave(),
                 u32::from(leonida_shader::emit::group_sync()),
                 leonida_shader::emit::shader_opt(),
             ] {

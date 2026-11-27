@@ -584,6 +584,65 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
 }
 
 #[test]
+fn wave32_small_groups_preserve_lane_masks_on_a_wave64_only_device() {
+    let words = [
+        0x7D88_0000,
+        0xBE94_036A,
+        0xBF06_8001,
+        0xBF85_0001,
+        0xBE94_0385,
+        0x7E00_0214,
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16,
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hardware_wave64 = wave_lanes() == Some(64);
+    for (minimum, threads, expected_wave) in [
+        (64, 1, 64),
+        (64, 16, 64),
+        (64, 32, 64),
+        (64, 64, 0),
+        (32, 32, 32),
+        (0, 32, 32),
+    ] {
+        let mut native = native_of(&words, false, threads);
+        if let StageIo::Cs(ref mut cs) = native.io {
+            cs.rsrc2 |= 1 << 15;
+        }
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let previous = lower::TEST_HOST_MIN_WAVE.replace(Some(minimum));
+        let shader = lowered_for_width(&native, &p, &HashSet::new(), 64);
+        lower::TEST_HOST_MIN_WAVE.set(previous);
+        let shader = shader.unwrap();
+        let container = crate::dxbc::Container::parse(&shader.dxil).unwrap();
+        let psv = container.part(crate::dxbc::FourCC::PSV0).unwrap().data;
+        let width = u32::from_le_bytes(psv[20..24].try_into().unwrap());
+        assert_eq!(width, expected_wave, "minimum {minimum}, group {threads}");
+        let mut validator =
+            validator::Validator::load(validator::Validator::default_path().as_deref()).unwrap();
+        validator.validate(&mut shader.dxil.clone()).unwrap();
+        if minimum == 64 && threads <= 32 && hardware_wave64 {
+            for below in [0u32, 1, 10, 32] {
+                let active = below.min(threads);
+                let expected = if active == 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << active) - 1
+                };
+                let actual = on_the_card(&shader, [below, 0])
+                    .expect("wave64-only device must accept the lifted single-wave shader");
+                assert_eq!(actual, expected, "group {threads}, active {below}");
+            }
+        }
+    }
+    if hardware_wave64 {
+        eprintln!("executed 12 small-group lane-mask cases on the wave64-only hardware device");
+    }
+}
+
+#[test]
 fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() {
     let words = [
         0x7D88_0000,

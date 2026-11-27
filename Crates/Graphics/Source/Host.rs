@@ -648,7 +648,7 @@ impl HostSetup {
                     max = o1.WaveLaneCountMax,
                     "host wave lanes"
                 );
-                leonida_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+                leonida_shader::emit::set_host_wave_range(o1.WaveLaneCountMin, o1.WaveLaneCountMax);
             }
             let messages = debug
                 .then(|| device.cast::<ID3D12InfoQueue>().ok())

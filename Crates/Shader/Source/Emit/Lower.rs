@@ -842,6 +842,25 @@ fn lane_constant_masks(st: &Structured) -> bool {
 }
 
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static HOST_MIN_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_host_wave_range(min: u32, max: u32) {
+    HOST_MIN_WAVE.store(min, std::sync::atomic::Ordering::Relaxed);
+    set_host_max_wave(max);
+}
+
+pub fn host_min_wave() -> u32 {
+    #[cfg(test)]
+    {
+        if let Some(lanes) = TEST_HOST_MIN_WAVE.get() {
+            return lanes;
+        }
+        if TEST_HOST_WAVE.get().is_some() {
+            return 0;
+        }
+    }
+    HOST_MIN_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 pub fn set_host_max_wave(lanes: u32) {
     HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
@@ -897,6 +916,7 @@ pub fn host_max_wave() -> u32 {
 #[cfg(test)]
 thread_local! {
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    pub(super) static TEST_HOST_MIN_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -1107,6 +1127,9 @@ impl<'a> Lower<'a> {
             let mut wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
+            if wave == 32 && group <= 32 && host_min_wave() == 64 {
+                wave = 64;
+            }
             if !partial
                 && wave == 64
                 && host_max_wave() == 32
