@@ -16,10 +16,22 @@ impl Command {
     fn parse(line: &str) -> Option<Self> {
         let mut words = line.split_ascii_whitespace();
         let sequence = words.next()?.parse().ok()?;
-        let [key @ (b'W' | b'A' | b'S' | b'D' | b'I' | b'J' | b'K' | b'L')] =
-            *words.next()?.as_bytes()
-        else {
-            return None;
+        let key = match words.next()? {
+            "Enter" => 0x0D,
+            "Back" => 0x08,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            word => match *word.as_bytes() {
+                [
+                    key @ (b'W' | b'A' | b'S' | b'D' | b'I' | b'J' | b'K' | b'L' | b'X' | b'Y'
+                    | b'Q' | b'E' | b'F' | b'H' | b'Z' | b'C'),
+                ] => key,
+                _ => return None,
+            },
         };
         let hold_ms = words.next()?.parse().ok()?;
         (words.next().is_none() && (1..=10_000).contains(&hold_ms)).then_some(Command {
@@ -53,7 +65,16 @@ impl HeldMovement {
             b'K' => (&mut pad.right_y, -1.0),
             b'J' => (&mut pad.right_x, -1.0),
             b'L' => (&mut pad.right_x, 1.0),
-            _ => unreachable!("parsed movement key"),
+            b'Z' => (&mut pad.left_trigger, 1.0),
+            b'C' => (&mut pad.right_trigger, 1.0),
+            key => {
+                let (_, button) = super::FALLBACK_BUTTONS.iter().find(|(vk, _)| *vk == key)?;
+                if pad.buttons & button != 0 {
+                    return None;
+                }
+                pad.buttons |= button;
+                return Some(pad);
+            }
         };
         if *axis != 0.0 {
             return None;
@@ -64,9 +85,18 @@ impl HeldMovement {
 
     pub(super) fn confirm_read(&self, state: &PadState) {
         if !self.read.load(Ordering::Relaxed) && !self.read.swap(true, Ordering::Relaxed) {
-            tracing::info!(sequence = self.command.sequence, key = %char::from(self.command.key),
-                left_x = state.left_x, left_y = state.left_y, right_x = state.right_x,
-                right_y = state.right_y, "GetGamepadState returned movement");
+            tracing::info!(
+                sequence = self.command.sequence,
+                virtual_key = self.command.key,
+                left_x = state.left_x,
+                left_y = state.left_y,
+                right_x = state.right_x,
+                right_y = state.right_y,
+                buttons = state.buttons,
+                left_trigger = state.left_trigger,
+                right_trigger = state.right_trigger,
+                "GetGamepadState returned scripted input"
+            );
         }
     }
 }
@@ -107,8 +137,12 @@ impl MovementFile {
                 self.end();
                 if available {
                     let until = now + Duration::from_millis(command.hold_ms);
-                    tracing::info!(sequence = command.sequence, key = %char::from(command.key),
-                        hold_ms = command.hold_ms, "stand-in movement started");
+                    tracing::info!(
+                        sequence = command.sequence,
+                        virtual_key = command.key,
+                        hold_ms = command.hold_ms,
+                        "stand-in input started"
+                    );
                     self.active = Some(Arc::new(HeldMovement {
                         command,
                         until,
@@ -122,8 +156,11 @@ impl MovementFile {
 
     fn end(&mut self) {
         if let Some(cue) = self.active.take() {
-            tracing::info!(sequence = cue.command.sequence, key = %char::from(cue.command.key),
-                "stand-in movement ended");
+            tracing::info!(
+                sequence = cue.command.sequence,
+                virtual_key = cue.command.key,
+                "stand-in input ended"
+            );
         }
     }
 }
@@ -131,6 +168,61 @@ impl MovementFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_buttons_and_triggers_preserve_other_controls() {
+        for (word, key) in [
+            ("Enter", 0x0D),
+            ("Back", 0x08),
+            ("Esc", 0x1B),
+            ("Tab", 0x09),
+            ("Up", 0x26),
+            ("Down", 0x28),
+            ("Left", 0x25),
+            ("Right", 0x27),
+            ("X", b'X'),
+            ("Y", b'Y'),
+            ("Q", b'Q'),
+            ("E", b'E'),
+            ("F", b'F'),
+            ("H", b'H'),
+            ("Z", b'Z'),
+            ("C", b'C'),
+        ] {
+            let held = HeldMovement {
+                command: Command::parse(&format!("1 {word} 500")).unwrap(),
+                until: Instant::now(),
+                read: false.into(),
+            };
+            let base = PadState {
+                left_x: 0.25,
+                ..Default::default()
+            };
+            let expected = super::super::fallback(&[super::super::KeyState {
+                virtual_key: key,
+                ..Default::default()
+            }]);
+            let actual = held.apply(base).unwrap();
+            assert_eq!(
+                actual,
+                PadState {
+                    left_x: 0.25,
+                    ..expected
+                },
+                "{word}"
+            );
+            assert!(held.apply(actual).is_none(), "{word}");
+        }
+        for line in [
+            "1 Space 500",
+            "1 enter 500",
+            "1 Enter 0",
+            "1 Enter 10001",
+            "1 Enter 500 extra",
+        ] {
+            assert!(Command::parse(line).is_none(), "{line}");
+        }
+    }
 
     #[test]
     fn movements_accept_only_one_direction_and_a_bounded_hold() {
@@ -152,7 +244,7 @@ mod tests {
             "1 W 0",
             "1 W -1",
             "1 W 10001",
-            "1 Q 1",
+            "1 P 1",
             "1 WA 1",
             "1 W 1 extra",
             "x W 1",
