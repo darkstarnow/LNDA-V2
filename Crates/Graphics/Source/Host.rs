@@ -2224,17 +2224,21 @@ impl HostWindow {
                 ..Default::default()
             };
             RegisterClassExW(&class);
-            let mut area = RECT::default();
-            SystemParametersInfoW(
-                SPI_GETWORKAREA,
-                0,
-                Some((&raw mut area).cast()),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-            )?;
+            let [left, top, right, bottom] = crate::WindowArea::current()?;
+            let area = RECT {
+                left,
+                top,
+                right,
+                bottom,
+            };
             let width = 1280.min(area.right - area.left);
             let height = 720.min(area.bottom - area.top);
             CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                if crate::WindowArea::background() {
+                    WS_EX_NOACTIVATE
+                } else {
+                    WINDOW_EX_STYLE(0)
+                },
                 CLASS,
                 w!("Leonida"),
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,

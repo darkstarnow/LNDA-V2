@@ -66,7 +66,15 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let ex_style = ex_style
+        | if leonida_graphics::WindowArea::background() {
+            wm::WS_EX_NOACTIVATE
+        } else {
+            0
+        };
+    let Some((x, y, width, height)) = fit(parent, x, y, width, height) else {
+        return std::ptr::null_mut();
+    };
     let hwnd = unsafe {
         wm::CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -91,7 +99,15 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let ex_style = ex_style
+        | if leonida_graphics::WindowArea::background() {
+            wm::WS_EX_NOACTIVATE
+        } else {
+            0
+        };
+    let Some((x, y, width, height)) = fit(parent, x, y, width, height) else {
+        return std::ptr::null_mut();
+    };
     let hwnd = unsafe {
         wm::CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
@@ -102,30 +118,74 @@ pub extern "system" fn CreateWindowExA(
     hwnd
 }
 
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
-    let mut area = RECT::default();
-    let known =
-        unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
-    if parent.is_null() && known != 0 && width >= 640 && height >= 360 {
-        return WindowLayout::load()
-            .unwrap_or(WindowLayout {
-                x: area.left + (area.right - area.left - 1280) / 2,
-                y: area.top + (area.bottom - area.top - 720) / 2,
-                width: 1280,
-                height: 720,
-            })
-            .fit(&area)
-            .tuple();
+pub extern "system" fn SetForegroundWindow(hwnd: HWND) -> i32 {
+    if leonida_graphics::WindowArea::background() {
+        return 0;
+    }
+    unsafe { wm::SetForegroundWindow(hwnd) }
+}
+
+fn show_command(command: i32) -> i32 {
+    if leonida_graphics::WindowArea::background()
+        && matches!(
+            command,
+            wm::SW_SHOW
+                | wm::SW_SHOWNORMAL
+                | wm::SW_SHOWMAXIMIZED
+                | wm::SW_RESTORE
+                | wm::SW_SHOWDEFAULT
+        )
+    {
+        wm::SW_SHOWNOACTIVATE
+    } else {
+        command
+    }
+}
+
+pub extern "system" fn ShowWindow(hwnd: HWND, command: i32) -> i32 {
+    unsafe { wm::ShowWindow(hwnd, show_command(command)) }
+}
+
+pub extern "system" fn ShowWindowAsync(hwnd: HWND, command: i32) -> i32 {
+    unsafe { wm::ShowWindowAsync(hwnd, show_command(command)) }
+}
+
+fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> Option<(i32, i32, i32, i32)> {
+    if !parent.is_null() {
+        return Some((x, y, width, height));
+    }
+    let [left, top, right, bottom] = leonida_graphics::WindowArea::current().ok()?;
+    let area = RECT {
+        left,
+        top,
+        right,
+        bottom,
+    };
+    if width >= 640 && height >= 360 {
+        return Some(
+            WindowLayout::load()
+                .filter(|layout| {
+                    layout.x >= left && layout.x < right && layout.y >= top && layout.y < bottom
+                })
+                .unwrap_or(WindowLayout {
+                    x: area.left + (area.right - area.left - 1280) / 2,
+                    y: area.top + (area.bottom - area.top - 720) / 2,
+                    width: 1280,
+                    height: 720,
+                })
+                .fit(&area)
+                .tuple(),
+        );
     }
     let fitted = fit_into(&area, width, height);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
-        return (x, y, width, height);
+    if fitted == (width, height) {
+        return Some((x, y, width, height));
     }
     tracing::info!(width, height, to = ?fitted, "title window fitted to the screen");
     let (w, h) = fitted;
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
-    (left, top, w, h)
+    Some((left, top, w, h))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,6 +491,9 @@ pub(crate) fn module() -> ServiceModule {
             service_export!(UnregisterAppStateChangeNotification),
             service_export!(CreateWindowExW),
             service_export!(CreateWindowExA),
+            service_export!(SetForegroundWindow),
+            service_export!(ShowWindow),
+            service_export!(ShowWindowAsync),
         ],
     }
 }

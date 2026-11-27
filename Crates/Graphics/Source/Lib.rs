@@ -81,6 +81,11 @@ mod writeback;
 #[cfg(windows)]
 pub use host::HostSetup;
 #[cfg(windows)]
+#[path = "WindowArea.rs"]
+mod window_area;
+#[cfg(windows)]
 pub use inplace::TitleSections;
 #[cfg(windows)]
 pub use watch::TitleMemory;
+#[cfg(windows)]
+pub use window_area::WindowArea;
