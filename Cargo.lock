@@ -391,6 +391,7 @@ name = "leonida-services"
 version = "0.1.0"
 dependencies = [
  "hidapi",
+ "leonida-core",
  "leonida-formats",
  "leonida-graphics",
  "leonida-image",

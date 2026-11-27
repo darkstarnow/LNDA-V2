@@ -19,6 +19,7 @@ name = "no_dll_planting"
 path = "Tests/NoDllPlanting.rs"
 
 [dependencies]
+leonida-core.workspace = true
 leonida-graphics.workspace = true
 leonida-loader.workspace = true
 leonida-image.workspace = true

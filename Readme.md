@@ -25,6 +25,10 @@ Saves go to `State`, shader caches to `Cache` and per-run diagnostics to `Logs` 
 
 `LeonidaWarm.exe` warms the shader cache ahead of play.
 
+The window starts at 1280×720, centered on the primary monitor. Moving or resizing the title window saves its bounds under `State\Window\Placement.txt`; the next launch keeps them inside the primary work area. The renderer's fallback window also starts at 1280×720. Window size does not change the title's render resolution or remove GPU work.
+
+The launcher reports Series X by default. The manual `--console series-s` option changes console memory and texture tiling; it is not a low-end GPU preset. Use the console mode appropriate to the title's assets. A frame counter alone does not confirm correct rendering or playable gameplay.
+
 ## Manual build
 
 ```powershell
