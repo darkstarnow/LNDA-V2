@@ -49,6 +49,8 @@ pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize)
 }
 
 const TITLE_PROC: PCWSTR = w!("leonida.wndproc");
+const TITLE_LAYOUT: PCWSTR = w!("leonida.layout");
+const TITLE_MOVING: PCWSTR = w!("leonida.moving");
 
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
@@ -64,13 +66,22 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let ex_style = ex_style
+        | if leonida_graphics::WindowArea::background() {
+            wm::WS_EX_NOACTIVATE
+        } else {
+            0
+        };
+    let Some((x, y, width, height)) = fit(parent, x, y, width, height) else {
+        return std::ptr::null_mut();
+    };
     let hwnd = unsafe {
         wm::CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
     hook(hwnd);
+    track_layout(hwnd, parent, width, height);
     hwnd
 }
 
@@ -88,29 +99,224 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let ex_style = ex_style
+        | if leonida_graphics::WindowArea::background() {
+            wm::WS_EX_NOACTIVATE
+        } else {
+            0
+        };
+    let Some((x, y, width, height)) = fit(parent, x, y, width, height) else {
+        return std::ptr::null_mut();
+    };
     let hwnd = unsafe {
         wm::CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
     hook(hwnd);
+    track_layout(hwnd, parent, width, height);
     hwnd
 }
 
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
-    let mut area = RECT::default();
-    let known =
-        unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
+pub extern "system" fn SetForegroundWindow(hwnd: HWND) -> i32 {
+    if leonida_graphics::WindowArea::background() {
+        return 0;
+    }
+    unsafe { wm::SetForegroundWindow(hwnd) }
+}
+
+fn show_command(command: i32) -> i32 {
+    if leonida_graphics::WindowArea::background()
+        && matches!(
+            command,
+            wm::SW_SHOW
+                | wm::SW_SHOWNORMAL
+                | wm::SW_SHOWMAXIMIZED
+                | wm::SW_RESTORE
+                | wm::SW_SHOWDEFAULT
+        )
+    {
+        wm::SW_SHOWNOACTIVATE
+    } else {
+        command
+    }
+}
+
+pub extern "system" fn ShowWindow(hwnd: HWND, command: i32) -> i32 {
+    unsafe { wm::ShowWindow(hwnd, show_command(command)) }
+}
+
+pub extern "system" fn ShowWindowAsync(hwnd: HWND, command: i32) -> i32 {
+    unsafe { wm::ShowWindowAsync(hwnd, show_command(command)) }
+}
+
+fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> Option<(i32, i32, i32, i32)> {
+    if !parent.is_null() {
+        return Some((x, y, width, height));
+    }
+    let [left, top, right, bottom] = leonida_graphics::WindowArea::current().ok()?;
+    let area = RECT {
+        left,
+        top,
+        right,
+        bottom,
+    };
+    if width >= 640 && height >= 360 {
+        return Some(
+            WindowLayout::load()
+                .filter(|layout| {
+                    layout.x >= left && layout.x < right && layout.y >= top && layout.y < bottom
+                })
+                .unwrap_or(WindowLayout {
+                    x: area.left + (area.right - area.left - 1280) / 2,
+                    y: area.top + (area.bottom - area.top - 720) / 2,
+                    width: 1280,
+                    height: 720,
+                })
+                .fit(&area)
+                .tuple(),
+        );
+    }
     let fitted = fit_into(&area, width, height);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
-        return (x, y, width, height);
+    if fitted == (width, height) {
+        return Some((x, y, width, height));
     }
     tracing::info!(width, height, to = ?fitted, "title window fitted to the screen");
     let (w, h) = fitted;
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
-    (left, top, w, h)
+    Some((left, top, w, h))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowLayout {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl WindowLayout {
+    fn parse(text: &str) -> Option<Self> {
+        let values: Vec<i32> = text
+            .split_ascii_whitespace()
+            .map(str::parse)
+            .collect::<Result<_, _>>()
+            .ok()?;
+        let [x, y, width, height] = *values.as_slice() else {
+            return None;
+        };
+        (width > 0 && height > 0).then_some(Self {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    fn fit(self, area: &RECT) -> Self {
+        let (width, height) = fit_into(area, self.width, self.height);
+        Self {
+            x: self
+                .x
+                .clamp(area.left, area.right.saturating_sub(width).max(area.left)),
+            y: self
+                .y
+                .clamp(area.top, area.bottom.saturating_sub(height).max(area.top)),
+            width,
+            height,
+        }
+    }
+
+    fn tuple(self) -> (i32, i32, i32, i32) {
+        (self.x, self.y, self.width, self.height)
+    }
+
+    fn path() -> Option<std::path::PathBuf> {
+        leonida_core::Config::load()
+            .ok()?
+            .data_subdir("Window")
+            .ok()
+            .map(|p| p.join("Placement.txt"))
+    }
+
+    fn load() -> Option<Self> {
+        Self::parse(&std::fs::read_to_string(Self::path()?).ok()?)
+    }
+
+    fn save(hwnd: HWND) {
+        let stored = unsafe { wm::GetPropW(hwnd, TITLE_LAYOUT) }.cast::<Self>();
+        if stored.is_null() {
+            return;
+        }
+        let mut rect = RECT::default();
+        if unsafe { wm::GetWindowRect(hwnd, &raw mut rect) } == 0 {
+            return;
+        }
+        let layout = Self {
+            x: rect.left,
+            y: rect.top,
+            width: rect.right - rect.left,
+            height: rect.bottom - rect.top,
+        };
+        unsafe {
+            stored.write(layout);
+        }
+        if let Some(path) = Self::path()
+            && let Err(error) = std::fs::write(
+                path,
+                format!(
+                    "{} {} {} {}",
+                    layout.x, layout.y, layout.width, layout.height
+                ),
+            )
+        {
+            tracing::warn!(%error, "could not save window placement");
+        }
+    }
+
+    fn constrain(hwnd: HWND, position: *mut wm::WINDOWPOS) {
+        unsafe {
+            if !wm::GetPropW(hwnd, TITLE_MOVING).is_null() || wm::IsIconic(hwnd) != 0 {
+                return;
+            }
+            let stored = wm::GetPropW(hwnd, TITLE_LAYOUT).cast::<Self>();
+            if stored.is_null() || position.is_null() {
+                return;
+            }
+            let layout = *stored;
+            let position = &mut *position;
+            if position.flags & wm::SWP_NOSIZE == 0 {
+                position.cx = layout.width;
+                position.cy = layout.height;
+            }
+            if position.flags & wm::SWP_NOMOVE == 0 {
+                position.x = layout.x;
+                position.y = layout.y;
+            }
+        }
+    }
+}
+
+fn track_layout(hwnd: HWND, parent: HWND, width: i32, height: i32) {
+    if !hwnd.is_null() && parent.is_null() && width >= 640 && height >= 360 {
+        let mut rect = RECT::default();
+        unsafe {
+            if wm::GetWindowRect(hwnd, &raw mut rect) == 0 {
+                return;
+            }
+            let layout = Box::new(WindowLayout {
+                x: rect.left,
+                y: rect.top,
+                width: rect.right - rect.left,
+                height: rect.bottom - rect.top,
+            });
+            let stored = Box::into_raw(layout);
+            if wm::SetPropW(hwnd, TITLE_LAYOUT, stored.cast()) == 0 {
+                drop(Box::from_raw(stored));
+            }
+        }
+    }
 }
 
 fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
@@ -145,7 +351,22 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == wm::WM_ENTERSIZEMOVE {
+        unsafe {
+            wm::SetPropW(hwnd, TITLE_MOVING, 1usize as *mut c_void);
+        }
+    }
+    if message == wm::WM_WINDOWPOSCHANGING {
+        WindowLayout::constrain(hwnd, lparam as *mut wm::WINDOWPOS);
+    }
+    if message == wm::WM_EXITSIZEMOVE {
+        WindowLayout::save(hwnd);
+        unsafe {
+            wm::RemovePropW(hwnd, TITLE_MOVING);
+        }
+    }
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
+        WindowLayout::save(hwnd);
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
@@ -154,11 +375,25 @@ extern "system" fn window_proc(
     }
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);
+        let system_layout = message == wm::WM_SYSCOMMAND
+            && matches!(wparam & 0xFFF0, command if command == wm::SC_MAXIMIZE as usize || command == wm::SC_MINIMIZE as usize || command == wm::SC_RESTORE as usize);
+        if system_layout {
+            wm::SetPropW(hwnd, TITLE_MOVING, 1usize as *mut c_void);
+        }
         if message == wm::WM_NCDESTROY {
             wm::RemovePropW(hwnd, TITLE_PROC);
+            let stored = wm::RemovePropW(hwnd, TITLE_LAYOUT).cast::<WindowLayout>();
+            if !stored.is_null() {
+                drop(Box::from_raw(stored));
+            }
+            wm::RemovePropW(hwnd, TITLE_MOVING);
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
-        wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
+        let result = wm::CallWindowProcW(title, hwnd, message, wparam, lparam);
+        if system_layout {
+            wm::RemovePropW(hwnd, TITLE_MOVING);
+        }
+        result
     }
 }
 
@@ -256,6 +491,9 @@ pub(crate) fn module() -> ServiceModule {
             service_export!(UnregisterAppStateChangeNotification),
             service_export!(CreateWindowExW),
             service_export!(CreateWindowExA),
+            service_export!(SetForegroundWindow),
+            service_export!(ShowWindow),
+            service_export!(ShowWindowAsync),
         ],
     }
 }
@@ -263,6 +501,95 @@ pub(crate) fn module() -> ServiceModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_layout_restores_size_and_stays_on_the_primary_work_area() {
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let saved = WindowLayout::parse("120 80 1280 720\n").unwrap();
+        assert_eq!(saved.fit(&area), saved);
+        let elsewhere = WindowLayout::parse("-1920 1500 1280 720").unwrap();
+        assert_eq!(elsewhere.fit(&area).tuple(), (0, 320, 1280, 720));
+        let spanning = WindowLayout::parse("0 0 3840 2160").unwrap().fit(&area);
+        assert_eq!(spanning.tuple(), (0, 0, 1848, 1040));
+        let extreme = WindowLayout::parse("2147483647 -2147483648 1280 720")
+            .unwrap()
+            .fit(&area);
+        assert_eq!(extreme.tuple(), (640, 0, 1280, 720));
+        for text in [
+            "",
+            "0 0 0 720",
+            "0 0 1280 -1",
+            "0 0 1280 720 extra",
+            "a 0 1280 720",
+        ] {
+            assert!(WindowLayout::parse(text).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_later_title_resize_preserves_the_initial_window_layout() {
+        let null = std::ptr::null_mut();
+        let hwnd = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("layout test"),
+            0,
+            0,
+            0,
+            3840,
+            2160,
+            null,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        assert!(!hwnd.is_null());
+        let mut before = RECT::default();
+        let mut after = RECT::default();
+        unsafe {
+            assert_ne!(wm::GetWindowRect(hwnd, &raw mut before), 0);
+            wm::SetWindowPos(
+                hwnd,
+                null,
+                -1000,
+                -1000,
+                3840,
+                2160,
+                wm::SWP_NOACTIVATE | wm::SWP_NOZORDER,
+            );
+            assert_ne!(wm::GetWindowRect(hwnd, &raw mut after), 0);
+            assert_eq!(
+                (after.left, after.top, after.right, after.bottom),
+                (before.left, before.top, before.right, before.bottom)
+            );
+            wm::SendMessageW(hwnd, wm::WM_ENTERSIZEMOVE, 0, 0);
+            wm::SetWindowPos(
+                hwnd,
+                null,
+                120,
+                80,
+                640,
+                360,
+                wm::SWP_NOACTIVATE | wm::SWP_NOZORDER,
+            );
+            assert_ne!(wm::GetWindowRect(hwnd, &raw mut after), 0);
+            assert_eq!(
+                (
+                    after.left,
+                    after.top,
+                    after.right - after.left,
+                    after.bottom - after.top
+                ),
+                (120, 80, 640, 360)
+            );
+            wm::DestroyWindow(hwnd);
+        }
+    }
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
 

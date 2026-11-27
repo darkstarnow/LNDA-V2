@@ -2211,7 +2211,7 @@ impl HostWindow {
         unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
     }
 
-    fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
+    fn make_window(_width: u32, _height: u32) -> windows::core::Result<HWND> {
         const CLASS: PCWSTR = w!("Leonida");
         unsafe {
             let instance = GetModuleHandleW(None)?;
@@ -2224,22 +2224,28 @@ impl HostWindow {
                 ..Default::default()
             };
             RegisterClassExW(&class);
-            let mut rect = RECT {
-                left: 0,
-                top: 0,
-                right: width as i32,
-                bottom: height as i32,
+            let [left, top, right, bottom] = crate::WindowArea::current()?;
+            let area = RECT {
+                left,
+                top,
+                right,
+                bottom,
             };
-            AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+            let width = 1280.min(area.right - area.left);
+            let height = 720.min(area.bottom - area.top);
             CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                if crate::WindowArea::background() {
+                    WS_EX_NOACTIVATE
+                } else {
+                    WINDOW_EX_STYLE(0)
+                },
                 CLASS,
                 w!("Leonida"),
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
+                area.left + (area.right - area.left - width) / 2,
+                area.top + (area.bottom - area.top - height) / 2,
+                width,
+                height,
                 None,
                 None,
                 Some(instance.into()),

@@ -25,6 +25,14 @@ Saves go to `State`, shader caches to `Cache` and per-run diagnostics to `Logs` 
 
 `LeonidaWarm.exe` warms the shader cache ahead of play.
 
+The window starts at 1280×720, centered on the primary monitor. Moving or resizing the title window saves its bounds under `State\Window\Placement.txt`; the next launch keeps them inside the primary work area. The renderer's fallback window also starts at 1280×720. Window size does not change the title's render resolution or remove GPU work.
+
+Set `LEONIDA_DISPLAY` to a Windows display device name such as `\\.\DISPLAY3` to target another monitor for both window paths. Use the actual device name; a display's position in a list may differ from its number. If the requested display is unavailable, window creation fails rather than opening on another monitor. Unset the variable to use the primary monitor again.
+
+For background tests, `LEONIDA_BACKGROUND_WINDOW=1` creates windows without activation and suppresses the title's foreground/show activation requests. This keeps keyboard focus available to other apps; it does not isolate CPU or GPU usage.
+
+The launcher reports Series X by default. The manual `--console series-s` option changes console memory and texture tiling; it is not a low-end GPU preset. Use the console mode appropriate to the title's assets. A frame counter alone does not confirm correct rendering or playable gameplay.
+
 ## Manual build
 
 ```powershell
