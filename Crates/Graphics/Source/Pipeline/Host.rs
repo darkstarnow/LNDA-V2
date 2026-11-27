@@ -1103,6 +1103,58 @@ mod tests {
         }";
     const PS: &str = "float4 main() : SV_Target { return 1; }";
 
+    #[test]
+    fn diagnostic_compute_profiles_report_driver_acceptance() {
+        if std::env::var("LEONIDA_GPU_PROBE").as_deref() != Ok("1") {
+            return;
+        }
+        let host = Host::instance().expect("a D3D12 device is required for the requested probe");
+        let dxc = dxc().expect("the requested probe needs the Windows SDK dxc.exe");
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        let queried = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut model).cast(),
+                size_of_val(&model) as u32,
+            )
+        };
+        eprintln!(
+            "shader model query: {queried:?}; reported {:#x}; mesh {}",
+            model.HighestShaderModel.0,
+            host.mesh_shaders()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (root, _) = PipelineBuild::root_signature(&host.device, &[], &[], true).unwrap();
+        for (label, profile, source) in [
+            ("baseline", "cs_6_0", "[numthreads(1,1,1)] void main() {}"),
+            ("model66", "cs_6_6", "[numthreads(1,1,1)] void main() {}"),
+            (
+                "heap_and_wave",
+                "cs_6_6",
+                "[numthreads(64,1,1)] void main(uint3 id:SV_DispatchThreadID) { RWStructuredBuffer<uint> output = ResourceDescriptorHeap[0]; output[id.x] = WaveActiveSum(id.x); }",
+            ),
+        ] {
+            let bytes = compile(&dxc, dir.path(), source, profile);
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                CS: code(&bytes),
+                ..Default::default()
+            };
+            let made: windows::core::Result<ID3D12PipelineState> =
+                unsafe { host.device.CreateComputePipelineState(&desc) };
+            eprintln!(
+                "compute probe {label} ({profile}): {:?}",
+                made.as_ref().map(|_| "accepted")
+            );
+            host.log_messages();
+            if label == "baseline" {
+                assert!(made.is_ok(), "baseline compute pipeline failed: {made:?}");
+            }
+        }
+    }
+
     fn dxc() -> Option<PathBuf> {
         let dxc = match std::env::var_os("LEONIDA_PC_DXC") {
             Some(p) => PathBuf::from(p),
