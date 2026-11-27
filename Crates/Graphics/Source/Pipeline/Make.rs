@@ -199,16 +199,29 @@ impl PipelineMaker {
                 );
             }
             AVAILABLE.notify_one();
+            if priority == REQUESTED {
+                REQUESTED_AVAILABLE.notify_one();
+            }
         }
     }
 
-    fn next() -> Arc<Pending> {
+    fn next(requested_only: bool) -> Arc<Pending> {
         let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if let Some(p) = queue.pop() {
+            let ready = if requested_only {
+                queue.pop_for(true)
+            } else {
+                queue.pop()
+            };
+            if let Some(p) = ready {
                 return p;
             }
-            queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+            let available = if requested_only {
+                &REQUESTED_AVAILABLE
+            } else {
+                &AVAILABLE
+            };
+            queue = available.wait(queue).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -219,16 +232,17 @@ impl PipelineMaker {
             let workers =
                 std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
             for i in 0..workers {
+                let requested_only = i + 1 == workers && running;
                 let spawned = std::thread::Builder::new()
                     .name(format!("leonida-pipelines-{i}"))
-                    .spawn(|| {
+                    .spawn(move || {
                         unsafe {
                             use windows::Win32::System::Threading::*;
                             let _ =
                                 SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                         }
                         loop {
-                            PipelineMaker::next().make();
+                            PipelineMaker::next(requested_only).make();
                             if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                                 PipelineMaker::drained();
                             } else {
@@ -510,7 +524,14 @@ impl Queue {
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
+        self.pop_for(false)
+    }
+
+    fn pop_for(&mut self, requested_only: bool) -> Option<Arc<Pending>> {
         let p = self.requested.pop_front().or_else(|| {
+            if requested_only {
+                return None;
+            }
             std::iter::from_fn(|| {
                 self.early_depth
                     .pop_front()
@@ -525,6 +546,7 @@ impl Queue {
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
+static REQUESTED_AVAILABLE: Condvar = Condvar::new();
 
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
@@ -684,6 +706,69 @@ mod loading_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_work_progresses_while_speculative_compiles_are_blocked() {
+        struct Release(std::sync::Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                self.0.1.notify_all();
+            }
+        }
+        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        std::thread::scope(|scope| {
+            let _release = Release(released.clone());
+            let mut early = Vec::new();
+            for _ in 0..workers {
+                let p = Arc::new(Pending::new(Vec::new(), None));
+                let held = p.clone();
+                let released = released.clone();
+                let (started, ready) = std::sync::mpsc::channel();
+                scope.spawn(move || {
+                    held.made.get_or_init(|| {
+                        started.send(()).unwrap();
+                        let mut done = released.0.lock().unwrap_or_else(|e| e.into_inner());
+                        while !*done {
+                            done = released.1.wait(done).unwrap_or_else(|e| e.into_inner());
+                        }
+                        None
+                    });
+                });
+                ready.recv_timeout(Duration::from_secs(5)).unwrap();
+                PipelineMaker::start(&p, EARLY);
+                early.push(p);
+            }
+            let started = Instant::now();
+            loop {
+                let claimed = early
+                    .iter()
+                    .filter(|p| p.queue_state.load(Ordering::Relaxed) == MAKING)
+                    .count();
+                if claimed == workers
+                    || claimed >= workers - 1 && started.elapsed() >= Duration::from_millis(100)
+                {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "prewarming workers did not start"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let requested = Arc::new(Pending::new(Vec::new(), None));
+            PipelineMaker::start(&requested, REQUESTED);
+            let started = Instant::now();
+            while requested.made.get().is_none() && started.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                requested.made.get().is_some(),
+                "requested pipeline was blocked behind speculative compiles"
+            );
+        });
+    }
 
     #[test]
     fn first_use_is_made_by_a_worker() {
